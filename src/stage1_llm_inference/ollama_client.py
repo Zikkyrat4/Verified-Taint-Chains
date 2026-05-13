@@ -1,5 +1,6 @@
 """Ollama-specific LLM client implementation for local models."""
 
+import os
 from typing import List
 import asyncio
 
@@ -125,19 +126,26 @@ class OllamaClient(BaseLLMClient):
             await self._verify_connection()
             self._connection_verified = True
 
-        # Ollama uses 'num_predict' instead of 'max_tokens'
+        # Ollama uses 'num_predict' instead of 'max_tokens'.
+        # Qwen3/GPT-OSS often pre-pad with reasoning, so cap at >= 4096 even if
+        # max_tokens is smaller, otherwise the final JSON gets truncated.
+        effective_predict = max(max_tokens, int(os.getenv("OLLAMA_MIN_NUM_PREDICT", "4096")))
         options = {
             "temperature": temperature,
-            "num_predict": max_tokens,
+            "num_predict": effective_predict,
         }
 
+        # Some MoE models (e.g. qwen3-coder-next:q8_0) return empty content
+        # when grammar-constrained via format="json". Allow disabling via env.
+        use_json_format = os.getenv("OLLAMA_JSON_FORMAT", "true").lower() not in (
+            "false", "0", "no", "off"
+        )
+        chat_kwargs = dict(model=self.model, messages=messages, options=options)
+        if use_json_format:
+            chat_kwargs["format"] = "json"
+
         try:
-            response = await self.client.chat(
-                model=self.model,
-                messages=messages,
-                options=options,
-                format="json",
-            )
+            response = await self.client.chat(**chat_kwargs)
 
             # Extract content from response
             content = response.get("message", {}).get("content", "")
