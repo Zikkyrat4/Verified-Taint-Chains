@@ -1,0 +1,156 @@
+{
+  "_comment": "Ground truth for VTC evaluation on Keycloak CVEs. Each file declares true_positives (chains that SHOULD be reported) and false_positive_patterns (specific (source_var, sink_var) pairs that should NOT be reported, based on framework semantics).",
+  "files": {
+    "OIDCLoginProtocol.java": {
+      "cve": "CVE-2024-2419",
+      "vulnerability": "Open Redirect (CWE-601)",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "redirect",
+          "sink_var": "redirectUri",
+          "source_line": 215,
+          "sink_line": 303,
+          "vuln_type": "xss",
+          "description": "authSession.getRedirectUri() -> redirectUri.build() in authenticated()"
+        },
+        {
+          "id": "TP-2",
+          "source_var": "redirect",
+          "sink_var": "redirectUri",
+          "source_line": 321,
+          "sink_line": 345,
+          "vuln_type": "xss",
+          "description": "authSession.getRedirectUri() -> redirectUri.build() in sendError()"
+        },
+        {
+          "id": "TP-3",
+          "source_var": "redirectUri",
+          "sink_var": "finalRedirectUri",
+          "source_line": 392,
+          "sink_line": 400,
+          "vuln_type": "xss",
+          "description": "logoutSession.getAuthNote(LOGOUT_REDIRECT_URI) -> renderLogoutPage()"
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "event\\.detail", "reason": "Event/audit logging is not a dangerous sink"},
+        {"source_pattern": "STATE_PARAM|NONCE_PARAM|ISSUER|KC_ACTION", "reason": "Server-controlled framework values"},
+        {"sink_pattern": "new AuthenticationSessionManager", "reason": "Framework constructor"},
+        {"sink_pattern": "new ResourceAdminManager", "reason": "Framework constructor"},
+        {"sink_pattern": "new OAuth2Code", "reason": "Internal object creation"},
+        {"sink_pattern": "session\\.tokens\\(\\)\\.encode", "reason": "Internal admin API"},
+        {"source_var": "session", "reason": "Framework setter field"},
+        {"source_var": "realm", "reason": "Framework setter field"},
+        {"source_var": "uriInfo", "reason": "Framework setter field"}
+      ]
+    },
+    "SerializedBrokeredIdentityContext.java": {
+      "cve": "internal (Unsafe Deserialization patterns)",
+      "vulnerability": "Deserialization (CWE-502) / Unsafe Reflection (CWE-470)",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "value",
+          "sink_var": "clazz",
+          "source_line": 292,
+          "sink_line": 292,
+          "vuln_type": "deserialization",
+          "description": "value.getClazz() -> Reflections.classForName()"
+        },
+        {
+          "id": "TP-2",
+          "source_var": "value",
+          "sink_var": "ctxData",
+          "source_line": 294,
+          "sink_line": 294,
+          "vuln_type": "deserialization",
+          "description": "value.getData() -> serializer.deserialize()"
+        },
+        {
+          "id": "TP-3",
+          "source_var": "asString",
+          "sink_var": "ctx",
+          "source_line": 344,
+          "sink_line": 349,
+          "vuln_type": "deserialization",
+          "description": "authSession.getAuthNote() -> JsonSerialization.readValue()"
+        },
+        {
+          "id": "TP-4",
+          "source_var": "ctxEntry",
+          "sink_var": "asBytes",
+          "source_line": 244,
+          "sink_line": 246,
+          "vuln_type": "deserialization",
+          "description": "ctxEntry.getData() -> JsonSerialization.readValue()"
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "JsonSerialization\\.writeValueAsBytes", "reason": "Serialization (write), not deserialization"},
+        {"sink_pattern": "Base64Url\\.encode", "reason": "Encoding, not dangerous"},
+        {"sink_pattern": "authSession\\.setAuthNote", "reason": "Writing to session, not executing"},
+        {"sink_pattern": "new BrokeredIdentityContext", "reason": "Constructor with internal ID"},
+        {"sink_pattern": "ctx\\.set\\w+", "reason": "Internal setters on new object"},
+        {"sink_pattern": "new SerializedBrokeredIdentityContext", "reason": "Internal constructor"},
+        {"source_pattern": "getId\\(\\)|getBrokerUsername\\(\\)|getEmail\\(\\)|getFirstAttribute", "reason": "Internal getters"}
+      ]
+    },
+    "CVE-2022-3782/RedirectUtils.java": {
+      "cve": "CVE-2022-3782",
+      "vulnerability": "Path Traversal / URL validation bypass (CWE-22)",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "redirectUri",
+          "sink_var": "redirectUri",
+          "source_line": 90,
+          "sink_line": 144,
+          "vuln_type": "path_traversal",
+          "description": "redirectUri parameter -> URI.create -> normalize -> return (path traversal via double encoding)",
+          "expected_realistic": false,
+          "comment": "Utility function — source comes from caller; tool may not flag parameter as USER_INPUT"
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "session\\.getContext\\(\\)|client\\.get(RedirectUris|RootUrl)", "reason": "Internal context / validated client config"},
+        {"sink_pattern": "logger\\.debug", "reason": "Logging"},
+        {"sink_pattern": "new StringBuilder|sb\\.append", "reason": "Local string assembly"},
+        {"sink_pattern": "Urls\\.realmInstalledAppUrnCallback", "reason": "Internal URL builder"}
+      ]
+    },
+    "CVE-2022-4361/SamlService.java": {
+      "cve": "CVE-2022-4361",
+      "vulnerability": "XSS via AssertionConsumerServiceURL (CWE-79)",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "redirectUri",
+          "sink_var": "redirect",
+          "source_line": 424,
+          "sink_line": 461,
+          "vuln_type": "xss",
+          "description": "getAssertionConsumerServiceURL (deserialized SAML XML) -> authSession.setRedirectUri"
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "new SamlClient", "reason": "Framework constructor"},
+        {"sink_pattern": "validateDestination|getBindingType", "reason": "Validation / type lookup"},
+        {"sink_pattern": "client\\.getAttribute", "reason": "Internal client config"},
+        {"sink_pattern": "event\\.error|event\\.detail", "reason": "Audit logging"},
+        {"sink_pattern": "authSession\\.setClientNote|authSession\\.setProtocol", "reason": "Internal session fields"},
+        {"sink_pattern": "createAuthenticationSession", "reason": "Framework method"}
+      ]
+    }
+  },
+  "metrics": {
+    "total_files": 4,
+    "ideal_true_positives": 9,
+    "realistic_true_positives_min": 1,
+    "realistic_true_positives_max": 4,
+    "expected_fp_baseline_min": 25,
+    "expected_fp_baseline_max": 45,
+    "expected_fp_after_filter_min": 5,
+    "expected_fp_after_filter_max": 15
+  }
+}

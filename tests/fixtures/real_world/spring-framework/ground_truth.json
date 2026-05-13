@@ -1,0 +1,36 @@
+{
+  "_comment": "Ground truth for VTC evaluation on Spring Framework. CVE-2022-22965 (Spring4Shell) — RCE via data binding to class.module.classLoader properties through bean introspection.",
+  "files": {
+    "CVE-2022-22965/CachedIntrospectionResults.java": {
+      "cve": "CVE-2022-22965",
+      "cwe": "CWE-094",
+      "vulnerability": "Code Injection / RCE via Spring data binding (Spring4Shell)",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "beanClass",
+          "sink_var": "beanInfo",
+          "source_line": 269,
+          "sink_line": 274,
+          "vuln_type": "command_injection",
+          "description": "Constructor beanClass parameter (request-derived via data binding) -> getBeanInfo(beanClass) -> Introspector.getBeanInfo, exposing classLoader/protectionDomain getters that can be reached via property paths like class.module.classLoader.URLs[0]"
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "logger\\.trace|logger\\.debug|logger\\.isTraceEnabled|logger\\.isDebugEnabled", "reason": "Logging"},
+        {"sink_pattern": "new LinkedHashMap|new ConcurrentReferenceHashMap|new HashMap", "reason": "Internal collections"},
+        {"sink_pattern": "ClassUtils\\.isCacheSafe|ClassUtils\\.getDefaultClassLoader", "reason": "Internal util check"},
+        {"sink_pattern": "strongClassCache\\.|softClassCache\\.|classCacheToUse\\.", "reason": "Internal cache mutations"},
+        {"sink_pattern": "new FatalBeanException", "reason": "Exception construction"},
+        {"sink_pattern": "getSuperclass|getInterfaces|getBeanClass|getPropertyDescriptors", "reason": "Reflection metadata"},
+        {"source_pattern": "ifc|currClass|existingPd|pd\\.getName", "reason": "Internal iteration variables"}
+      ]
+    }
+  },
+  "metrics": {
+    "total_files": 1,
+    "ideal_true_positives": 1,
+    "realistic_true_positives_min": 0,
+    "realistic_true_positives_max": 1
+  }
+}

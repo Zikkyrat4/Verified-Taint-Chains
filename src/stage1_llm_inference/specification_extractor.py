@@ -1,0 +1,801 @@
+"""Specification extractor using LLM for source and sink detection."""
+
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from src.core.models import (
+    CodeLocation,
+    Source,
+    Sink,
+    Specification,
+    VulnerabilityType,
+)
+from src.core.source_sink_classifier import classify_source, classify_sink
+from src.core.exceptions import ParsingError, LLMError
+from src.stage1_llm_inference.llm_client import SimpleLLMClient
+from src.stage1_llm_inference.ast_parser import JavaASTParser
+from src.stage1_llm_inference.prompt_templates import (
+    build_source_prompt,
+    build_sink_prompt,
+    build_combined_prompt,
+)
+from src.stage1_llm_inference.sanitizer_detector import StaticSanitizerDetector
+from src.utils.logger import get_logger
+
+logger = get_logger()
+
+
+class SimpleSpecificationExtractor:
+    """Extracts security specification (sources, sinks) from Java code using LLM.
+
+    This extractor splits code into functions and analyzes each for sources and sinks
+    using an LLM client.
+
+    Attributes:
+        llm_client: SimpleLLMClient instance for LLM queries.
+        confidence_threshold: Minimum confidence to include sources/sinks (default 0.5).
+    """
+
+    def __init__(
+        self, llm_client: SimpleLLMClient, confidence_threshold: float = 0.5
+    ) -> None:
+        """Initialize the specification extractor.
+
+        Args:
+            llm_client: SimpleLLMClient instance for LLM-based analysis.
+            confidence_threshold: Minimum confidence score (0.0-1.0) to include items.
+
+        Raises:
+            ValueError: If confidence_threshold is not in [0.0, 1.0].
+        """
+        if not 0.0 <= confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be between 0.0 and 1.0")
+
+        self.llm_client = llm_client
+        self.confidence_threshold = confidence_threshold
+        self.ast_parser = JavaASTParser()
+        self.sanitizer_detector = StaticSanitizerDetector()
+
+        logger.info(
+            f"Initialized SimpleSpecificationExtractor with threshold={confidence_threshold}"
+        )
+        logger.debug("AST parser initialized for improved code analysis")
+
+    # Regex to detect security-relevant patterns at function level
+    _FUNC_SECURITY_RE = re.compile(
+        r"getParameter|getHeader|getCookies|getInputStream|getReader|getQueryString"
+        r"|@RequestParam|@PathVariable|@RequestBody|@RequestHeader|@CookieValue"
+        r"|HttpServletRequest|HttpServletResponse"
+        r"|executeQuery|executeUpdate|prepareStatement|createStatement|execute\("
+        r"|createNativeQuery|createQuery"
+        r"|Runtime\.getRuntime|ProcessBuilder|exec\("
+        r"|setAttribute|getRequestDispatcher|sendRedirect|addCookie|\.write\("
+        r"|innerHTML|document\.write|\.html\("
+        r"|new\s+File\(|new\s+FileInputStream|Paths\.get|Files\."
+        r"|DocumentBuilder|SAXParser|XMLReader|TransformerFactory"
+        r"|URL\(|HttpURLConnection|HttpClient|openConnection"
+        r"|ObjectInputStream|readObject|XMLDecoder"
+        r"|getAttribute|RuntimeException|throw\s+new"
+    )
+
+    async def extract(
+        self, source_code: str, file_path: str = "", model: str = "gpt-4-turbo"
+    ) -> Specification:
+        """Extract security specification from Java source code.
+
+        Uses a **single combined prompt** per function (sources + sinks together)
+        to halve the number of LLM calls compared to separate prompts.
+        Functions without security-relevant patterns are skipped entirely.
+
+        Args:
+            source_code: Java source code to analyze.
+            file_path: Optional file path for code location tracking.
+            model: LLM model name to use.
+
+        Returns:
+            Specification object containing extracted sources and sinks.
+
+        Raises:
+            ValueError: If source_code is empty.
+            LLMError: If LLM analysis fails.
+        """
+        if not source_code or not source_code.strip():
+            raise ValueError("source_code cannot be empty")
+
+        logger.info(f"Starting extraction from {file_path or 'inline code'}")
+
+        # Extract global context (imports, classes)
+        imports = self._extract_imports(source_code)
+        classes = self._extract_classes(source_code)
+        logger.debug(f"Extracted {len(imports)} imports and {len(classes)} classes")
+
+        # Split code into functions
+        functions = self._split_into_functions(source_code)
+        logger.debug(f"Split code into {len(functions)} functions")
+
+        all_sources: List[Source] = []
+        all_sinks: List[Sink] = []
+
+        # Analyze each function with context — single combined LLM call
+        skipped_funcs = 0
+        for func_name, func_code, line_offset, func_info in functions:
+            # Function-level pre-filter: skip functions with no security patterns
+            if not self._FUNC_SECURITY_RE.search(func_code):
+                logger.debug(f"Skipping function {func_name}: no security patterns")
+                skipped_funcs += 1
+                continue
+
+            try:
+                logger.debug(f"Analyzing function: {func_name}")
+
+                # Build context for this function
+                class_info = None
+                if classes:
+                    class_info = classes[0]  # Use first class as context
+
+                # Single combined prompt for sources + sinks
+                combined_prompt = build_combined_prompt(
+                    code=func_code,
+                    function_info=func_info,
+                    class_info=class_info,
+                    imports=imports,
+                )
+
+                # Try LLM call with one retry on parse failure
+                response = None
+                for attempt in range(2):
+                    try:
+                        response = await self.llm_client.chat_with_json_prompt(
+                            combined_prompt
+                        )
+                        break
+                    except ParsingError:
+                        if attempt == 0:
+                            logger.warning(
+                                f"JSON parse failed for {func_name}, retrying..."
+                            )
+                        else:
+                            raise
+
+                # Parse sources from combined response
+                if response and "sources" in response:
+                    sources = self._parse_llm_sources(
+                        response, file_path, line_offset,
+                        function_name=func_name,
+                    )
+                    all_sources.extend(sources)
+                    logger.debug(f"Found {len(sources)} sources in {func_name}")
+
+                # Parse sinks from combined response
+                if response and "sinks" in response:
+                    sinks = self._parse_llm_sinks(
+                        response, file_path, line_offset,
+                        function_name=func_name,
+                    )
+                    all_sinks.extend(sinks)
+                    logger.debug(f"Found {len(sinks)} sinks in {func_name}")
+
+            except (ParsingError, LLMError) as e:
+                logger.warning(f"Failed to analyze function {func_name}: {str(e)}")
+                logger.debug(f"Raw error details for {func_name}: {repr(e)}")
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error analyzing {func_name}: {str(e)}")
+                logger.debug(f"Raw error details for {func_name}: {repr(e)}")
+                continue
+
+        if skipped_funcs:
+            logger.info(
+                f"Skipped {skipped_funcs}/{len(functions)} functions "
+                f"(no security patterns)"
+            )
+
+        # Syntactic pre-pass: JSP-tag setter parameters as USER_INPUT sources.
+        # `_FUNC_SECURITY_RE` skips trivial setters, so the LLM never sees them —
+        # but JSP containers populate `setX(String x)` with attacker-controlled
+        # tag attributes. Scoped to JSP tag classes only (suffix `Tag` or
+        # `javax.servlet.jsp.tagext` import) to avoid FP-explosion on Spring/POJO.
+        setter_sources = self._extract_jsp_setter_sources(
+            source_code, file_path, imports, classes
+        )
+        if setter_sources:
+            logger.info(
+                f"JSP-tag setter pre-pass: added {len(setter_sources)} "
+                f"USER_INPUT sources"
+            )
+            all_sources.extend(setter_sources)
+
+        # Populate code_snippet from source code and classify categories.
+        # LLMs often report a slightly-off line number (function header instead
+        # of body, off-by-one, etc.). Scan a small window around the reported
+        # line for the variable name to recover the real declaration site.
+        source_lines = source_code.splitlines()
+
+        def _resolve_snippet(line_number: int, variable_name: str) -> Tuple[str, int]:
+            n = len(source_lines)
+            primary_idx = line_number - 1
+            if not (0 <= primary_idx < n):
+                primary_idx = 0
+            primary = source_lines[primary_idx] if 0 <= primary_idx < n else ""
+            if not variable_name or len(variable_name) <= 1 or variable_name in primary:
+                return primary.strip(), line_number if 1 <= line_number <= n else primary_idx + 1
+            for offset in (1, -1, 2, -2, 3, -3, 4, -4, 5, -5):
+                idx = primary_idx + offset
+                if 0 <= idx < n and variable_name in source_lines[idx]:
+                    return source_lines[idx].strip(), idx + 1
+            # Last resort: full-file scan for the variable's first appearance.
+            # Handles cases where the LLM reports the wrong absolute line
+            # (e.g. function-relative line never recombined with offset).
+            for idx, line in enumerate(source_lines):
+                if variable_name in line:
+                    return line.strip(), idx + 1
+            return primary.strip(), line_number
+
+        for src in all_sources:
+            snippet, resolved_line = _resolve_snippet(
+                src.location.line_number, src.variable_name
+            )
+            src.code_snippet = snippet
+            if resolved_line != src.location.line_number:
+                src.location = CodeLocation(
+                    file_path=src.location.file_path,
+                    line_number=resolved_line,
+                )
+            src.source_category = classify_source(src)
+
+        for snk in all_sinks:
+            snippet, resolved_line = _resolve_snippet(
+                snk.location.line_number, snk.variable_name
+            )
+            snk.code_snippet = snippet
+            if resolved_line != snk.location.line_number:
+                snk.location = CodeLocation(
+                    file_path=snk.location.file_path,
+                    line_number=resolved_line,
+                )
+            snk.sink_category = classify_sink(snk)
+            # LLMs frequently mis-label deserialization / code-injection sinks
+            # as `sql_injection` (the default) or `xss` (because of `readValue`
+            # / `output`). Override based on snippet patterns — much more
+            # reliable than the LLM-supplied vuln_type for these classes.
+            # Also scan ±3 lines around the sink: `_resolve_snippet` sometimes
+            # snaps to a follow-on `return` or assignment line, so the actual
+            # readValue/classForName call lives a line or two before.
+            ctx_lo = max(0, resolved_line - 4)
+            ctx_hi = min(len(source_lines), resolved_line + 3)
+            window = "\n".join(source_lines[ctx_lo:ctx_hi])
+            corrected = self._correct_vuln_type_from_snippet(snippet, window)
+            if corrected is not None:
+                snk.vulnerability_type = corrected
+
+        # Detect sanitizers using static pattern matching
+        all_sanitizers = self.sanitizer_detector.detect(source_code, file_path)
+
+        logger.info(
+            f"Extraction complete: {len(all_sources)} sources, {len(all_sinks)} sinks, "
+            f"{len(all_sanitizers)} sanitizers"
+        )
+
+        return Specification(
+            sources=all_sources,
+            sinks=all_sinks,
+            sanitizers=all_sanitizers,
+            llm_model=model,
+        )
+
+    def _split_into_functions(
+        self, code: str
+    ) -> List[Tuple[str, str, int, Optional[Dict[str, Any]]]]:
+        """Split Java code into individual functions using AST parsing.
+
+        Uses tree-sitter AST parser for accurate function extraction, falls back
+        to regex if AST parsing is unavailable. Each result is a tuple of
+        (function_name, function_code, line_offset, function_info).
+
+        Args:
+            code: Java source code.
+
+        Returns:
+            List of tuples (function_name, function_code, line_offset, function_info).
+        """
+        functions: List[Tuple[str, str, int, Optional[Dict[str, Any]]]] = []
+
+        # Try to use AST parser for accurate extraction
+        try:
+            ast_functions = self.ast_parser.extract_functions(code)
+
+            if ast_functions:
+                for func_info in ast_functions:
+                    func_name = func_info.get("name", "unknown")
+                    func_code = func_info.get("body", "")
+                    line_offset = func_info.get("start_line", 0) - 1
+
+                    if func_code:
+                        functions.append((func_name, func_code, line_offset, func_info))
+
+                logger.debug(f"Extracted {len(functions)} functions using AST parser")
+                return functions
+
+        except Exception as e:
+            logger.warning(f"AST-based extraction failed: {str(e)}, falling back to regex")
+
+        # Fallback to regex-based extraction
+        logger.debug("Using regex-based function extraction")
+
+        # Simple pattern to match Java methods
+        # Matches: [modifiers] [return_type] function_name(...)
+        pattern = r"(public|private|protected)?\s+(static\s+)?(\w+)\s+(\w+)\s*\("
+
+        for match in re.finditer(pattern, code):
+            start_pos = match.start()
+            func_name = match.group(4)  # function_name
+            return_type = match.group(3)  # return_type
+
+            # Find line number of this match
+            line_num = code[:start_pos].count("\n")
+
+            # Find the function body (simple approach: from here to next method or end)
+            start_brace = code.find("{", match.end())
+            if start_brace == -1:
+                continue
+
+            # Count braces to find end of function
+            brace_count = 0
+            end_pos = start_brace
+            for i, char in enumerate(code[start_brace:], start=start_brace):
+                if char == "{":
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_pos = i + 1
+                        break
+
+            func_code = code[match.start() : end_pos]
+
+            # Build function info dict for context
+            func_info_dict: Dict[str, Any] = {
+                "name": func_name,
+                "return_type": return_type,
+                "parameters": [],
+                "start_line": line_num + 1,
+            }
+
+            functions.append((func_name, func_code, line_num, func_info_dict))
+
+        logger.debug(f"Found {len(functions)} functions in code")
+
+        # If no functions found, treat entire code as one function
+        if not functions:
+            logger.debug("No functions found, treating entire code as single unit")
+            functions.append(("main", code, 0, {"name": "main"}))
+
+        return functions
+
+    # JSP-tag setter: `public void setX(Type x)` on one line. Captures the
+    # parameter name as a USER_INPUT source. Container populates these from
+    # tag-attribute strings supplied by the page author / request data.
+    _JSP_SETTER_RE = re.compile(
+        r"^\s*public\s+void\s+(set[A-Z]\w*)\s*\(\s*"
+        r"(?:final\s+)?"
+        r"(?:String|Integer|Long|Boolean|Double|Float|Object|"
+        r"int|long|boolean|double|float)\s+"
+        r"(\w+)\s*\)\s*$"
+    )
+
+    @staticmethod
+    def _is_jsp_tag_class(imports: List[str], classes: List[Dict[str, Any]]) -> bool:
+        """Detect whether a file declares a JSP tag handler class.
+
+        Heuristic: matches if any import resolves into the JSP tag-ext API or
+        any class name ends with ``Tag``. Conservative on purpose — falling
+        outside the scope yields no setter sources rather than wrong ones.
+        """
+        for imp in imports:
+            if "servlet.jsp.tagext" in imp or "wiki.tags" in imp:
+                return True
+        for cls in classes:
+            name = cls.get("name") or ""
+            if name.endswith("Tag"):
+                return True
+        return False
+
+    def _extract_jsp_setter_sources(
+        self,
+        source_code: str,
+        file_path: str,
+        imports: List[str],
+        classes: List[Dict[str, Any]],
+    ) -> List[Source]:
+        """Emit USER_INPUT sources for JSP-tag setter parameters.
+
+        Args:
+            source_code: Full Java source text.
+            file_path: File path for code location tracking.
+            imports: List of import statements (used for scoping).
+            classes: Extracted class metadata (used for scoping).
+
+        Returns:
+            List of synthesized Source objects (may be empty).
+        """
+        if not self._is_jsp_tag_class(imports, classes):
+            return []
+
+        sources: List[Source] = []
+        for line_idx, raw_line in enumerate(source_code.splitlines(), start=1):
+            match = self._JSP_SETTER_RE.match(raw_line)
+            if not match:
+                continue
+            setter_name = match.group(1)
+            param_name = match.group(2)
+            sources.append(
+                Source(
+                    location=CodeLocation(
+                        file_path=file_path,
+                        line_number=line_idx,
+                        function_name=setter_name,
+                    ),
+                    variable_name=param_name,
+                    type="user_input",
+                    confidence=0.85,
+                    code_snippet=raw_line.strip(),
+                    reasoning=(
+                        f"JSP tag setter '{setter_name}': container-populated "
+                        f"attribute value, attacker-controlled (CWE-079 vector)"
+                    ),
+                )
+            )
+        return sources
+
+    # Variable names that are known false-positive sources (internal Java objects)
+    FALSE_POSITIVE_SOURCES = {
+        "rs", "resultset",
+        "conn", "connection",
+        "stmt", "statement", "ps", "pstmt", "preparedstatement",
+        "ds", "datasource",
+        "ctx", "context",
+        "session", "sess",
+        "out", "writer", "pw",
+        "sb", "stringbuilder", "stringbuffer",
+    }
+
+    # Variable names that are known false-positive sinks
+    FALSE_POSITIVE_SINKS = {
+        "logger", "log", "LOGGER", "LOG",
+        "model", "modelmap", "modelandview",
+        "result", "ret",
+        "list", "map", "set", "array",
+        "sb", "stringbuilder", "stringbuffer",
+        "e", "ex", "exception", "err",
+    }
+
+    def _parse_llm_sources(
+        self, response: dict, file_path: str, line_offset: int = 0,
+        function_name: Optional[str] = None,
+    ) -> List[Source]:
+        """Parse LLM response and create Source objects.
+
+        Args:
+            response: LLM response as dict (should contain 'sources' key).
+            file_path: File path for code locations.
+            line_offset: Line number offset for this code segment.
+            function_name: Name of the function this source belongs to.
+
+        Returns:
+            List of Source objects filtered by confidence threshold.
+
+        Raises:
+            ParsingError: If response format is invalid.
+        """
+        if not isinstance(response, dict):
+            raise ParsingError("Response must be a dictionary")
+
+        if "sources" not in response:
+            raise ParsingError("Response missing 'sources' key")
+
+        sources: List[Source] = []
+
+        for source_data in response.get("sources", []):
+            try:
+                # Extract required fields
+                line = source_data.get("line")
+                variable = source_data.get("variable")
+                source_type = source_data.get("type")
+                confidence = float(source_data.get("confidence", 0.8))
+
+                # Validate required fields
+                if not line or not variable or not source_type:
+                    logger.warning(f"Skipping source with missing fields: {source_data}")
+                    continue
+
+                # Filter known false-positive source variable names
+                if variable.lower() in self.FALSE_POSITIVE_SOURCES:
+                    logger.debug(
+                        f"Skipping false-positive source '{variable}' "
+                        f"(known internal Java object)"
+                    )
+                    continue
+
+                # Filter by confidence threshold
+                if confidence < self.confidence_threshold:
+                    logger.debug(
+                        f"Skipping source '{variable}' with confidence {confidence}"
+                    )
+                    continue
+
+                # Create Source object
+                location = CodeLocation(
+                    file_path=file_path,
+                    line_number=line + line_offset,
+                    function_name=function_name,
+                )
+
+                source = Source(
+                    location=location,
+                    variable_name=variable,
+                    type=source_type,
+                    confidence=confidence,
+                    code_snippet="",  # Could be populated from code
+                    reasoning=source_data.get("reasoning"),
+                )
+
+                sources.append(source)
+                logger.debug(f"Parsed source: {variable} at line {line + line_offset}")
+
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning(f"Error parsing source {source_data}: {str(e)}")
+                continue
+
+        logger.debug(f"Parsed {len(sources)} sources from LLM response")
+        return sources
+
+    def _parse_llm_sinks(
+        self, response: dict, file_path: str, line_offset: int = 0,
+        function_name: Optional[str] = None,
+    ) -> List[Sink]:
+        """Parse LLM response and create Sink objects.
+
+        Args:
+            response: LLM response as dict (should contain 'sinks' key).
+            file_path: File path for code locations.
+            line_offset: Line number offset for this code segment.
+            function_name: Name of the function this sink belongs to.
+
+        Returns:
+            List of Sink objects filtered by confidence threshold.
+
+        Raises:
+            ParsingError: If response format is invalid.
+        """
+        if not isinstance(response, dict):
+            raise ParsingError("Response must be a dictionary")
+
+        if "sinks" not in response:
+            raise ParsingError("Response missing 'sinks' key")
+
+        sinks: List[Sink] = []
+
+        for sink_data in response.get("sinks", []):
+            try:
+                # Extract required fields
+                line = sink_data.get("line")
+                variable = sink_data.get("variable")
+                sink_type = sink_data.get("type")
+                vulnerability_type_str = sink_data.get("vulnerability_type", "SQL_INJECTION")
+                confidence = float(sink_data.get("confidence", 0.8))
+
+                # Validate required fields
+                if not line or not variable or not sink_type:
+                    logger.warning(f"Skipping sink with missing fields: {sink_data}")
+                    continue
+
+                # Filter known false-positive sink variable names
+                if variable.lower() in self.FALSE_POSITIVE_SINKS:
+                    logger.debug(
+                        f"Skipping false-positive sink '{variable}' "
+                        f"(known benign variable)"
+                    )
+                    continue
+
+                # Filter by confidence threshold
+                if confidence < self.confidence_threshold:
+                    logger.debug(f"Skipping sink '{variable}' with confidence {confidence}")
+                    continue
+
+                # Map vulnerability type string to enum
+                try:
+                    vuln_type = VulnerabilityType(
+                        vulnerability_type_str.lower().replace("_", "_")
+                    )
+                except (ValueError, AttributeError):
+                    # Try to infer from sink type instead of always defaulting to SQL_INJECTION
+                    vuln_type = self._infer_vulnerability_type(
+                        vulnerability_type_str, sink_type
+                    )
+                    logger.warning(
+                        f"Unknown vulnerability type: {vulnerability_type_str}, "
+                        f"inferred as {vuln_type.value}"
+                    )
+
+                # Create Sink object
+                location = CodeLocation(
+                    file_path=file_path,
+                    line_number=line + line_offset,
+                    function_name=function_name,
+                )
+
+                sink = Sink(
+                    location=location,
+                    variable_name=variable,
+                    type=sink_type,
+                    confidence=confidence,
+                    code_snippet="",  # Could be populated from code
+                    vulnerability_type=vuln_type,
+                    reasoning=sink_data.get("reasoning"),
+                )
+
+                sinks.append(sink)
+                logger.debug(f"Parsed sink: {variable} at line {line + line_offset}")
+
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning(f"Error parsing sink {sink_data}: {str(e)}")
+                continue
+
+        logger.debug(f"Parsed {len(sinks)} sinks from LLM response")
+        return sinks
+
+    # Snippet patterns that strongly imply a specific vulnerability class —
+    # used to overrule the LLM's vuln_type label (which is unreliable for
+    # deserialization and reflection-style code injection).
+    _DESERIALIZATION_SINK_RE = re.compile(
+        r"\.\s*readObject\s*\("
+        r"|\.\s*readValue\s*\("
+        r"|\.\s*deserialize\s*\("
+        r"|\bObjectInputStream\b"
+        r"|\bXMLDecoder\b"
+        r"|JsonSerialization\s*\.\s*readValue\s*\("
+        r"|ObjectMapper\s*\(\s*\)?\s*\.\s*readValue\s*\("
+    )
+    _CODE_INJECTION_SINK_RE = re.compile(
+        r"Reflections\s*\.\s*classForName\s*\("
+        r"|Class\s*\.\s*forName\s*\("
+        r"|ScriptEngine"
+        r"|GroovyShell"
+        r"|\bMethod\s*\.\s*invoke\s*\("
+        r"|new\s+ExpressionParser\s*\("
+    )
+
+    @classmethod
+    def _correct_vuln_type_from_snippet(
+        cls, snippet: str, context_window: str = ""
+    ) -> Optional[VulnerabilityType]:
+        """Reclassify a sink's vulnerability_type based on snippet patterns.
+
+        Args:
+            snippet: The single-line snippet at the sink location.
+            context_window: Optional broader text (e.g. ±3 lines around the
+                sink) to capture cases where `_resolve_snippet` snapped to
+                the line *after* the actual taint sink (return statement,
+                follow-on assignment, etc).
+
+        Returns:
+            *None* to leave the LLM's label intact. Only matches strong,
+            unambiguous patterns — avoids overruling on weak heuristics.
+        """
+        haystack = f"{snippet}\n{context_window}" if context_window else snippet
+        if not haystack:
+            return None
+        if cls._DESERIALIZATION_SINK_RE.search(haystack):
+            return VulnerabilityType.UNSAFE_DESERIALIZATION
+        if cls._CODE_INJECTION_SINK_RE.search(haystack):
+            return VulnerabilityType.CODE_INJECTION
+        return None
+
+    @staticmethod
+    def _infer_vulnerability_type(
+        raw_type: str, sink_type: str
+    ) -> VulnerabilityType:
+        """Infer VulnerabilityType from the raw LLM string and sink type.
+
+        Falls back based on keyword matching rather than always defaulting
+        to SQL_INJECTION.
+
+        Args:
+            raw_type: Raw vulnerability type string from the LLM.
+            sink_type: Sink type string from the LLM.
+
+        Returns:
+            Best-matching VulnerabilityType enum value.
+        """
+        combined = f"{raw_type} {sink_type}".lower()
+
+        # Deserialization / code-injection checks come first because their
+        # keywords (`deserialize`, `readValue`, `classForName`) are highly
+        # specific — placing them after the broader XSS/command rules would
+        # let `deserialize` get swallowed by the `output`/`reflect` heuristic.
+        if any(k in combined for k in (
+            "deserialize", "deserialization", "readobject", "readvalue",
+            "objectinputstream", "xmldecoder"
+        )):
+            return VulnerabilityType.UNSAFE_DESERIALIZATION
+        if any(k in combined for k in (
+            "code_injection", "code injection", "el_injection",
+            "expression_language", "classforname", "scriptengine", "groovyshell"
+        )):
+            return VulnerabilityType.CODE_INJECTION
+        if any(k in combined for k in ("xss", "cross-site", "html", "script", "output", "reflect")):
+            return VulnerabilityType.XSS
+        if any(k in combined for k in ("command", "exec", "process", "runtime", "shell")):
+            return VulnerabilityType.COMMAND_INJECTION
+        if any(k in combined for k in ("path", "traversal", "file", "directory")):
+            return VulnerabilityType.PATH_TRAVERSAL
+        if any(k in combined for k in ("xxe", "xml", "entity")):
+            return VulnerabilityType.XXE
+        if any(k in combined for k in ("ssrf", "url", "http_client", "request_forgery")):
+            return VulnerabilityType.SSRF
+        if any(k in combined for k in ("sql", "query", "database", "jdbc")):
+            return VulnerabilityType.SQL_INJECTION
+
+        return VulnerabilityType.SQL_INJECTION
+
+    def _extract_imports(self, code: str) -> List[str]:
+        """Extract import statements from Java code.
+
+        Args:
+            code: Java source code.
+
+        Returns:
+            List of import statement strings.
+        """
+        imports: List[str] = []
+        import_pattern = r"import\s+(?:static\s+)?([^;]+);"
+
+        for match in re.finditer(import_pattern, code):
+            import_stmt = match.group(1).strip()
+            if import_stmt:
+                imports.append(import_stmt)
+
+        logger.debug(f"Extracted {len(imports)} import statements")
+        return imports
+
+    def _extract_classes(self, code: str) -> List[Dict[str, Any]]:
+        """Extract class definitions from Java code.
+
+        Args:
+            code: Java source code.
+
+        Returns:
+            List of class info dictionaries.
+        """
+        try:
+            classes = self.ast_parser.extract_classes(code)
+            logger.debug(f"Extracted {len(classes)} classes using AST parser")
+            return classes
+        except Exception as e:
+            logger.debug(f"AST class extraction failed: {str(e)}, using regex fallback")
+
+        # Fallback to regex-based extraction
+        classes_list: List[Dict[str, Any]] = []
+        class_pattern = r"(public|private)?\s+class\s+(\w+)(?:\s+extends\s+(\w+))?(?:\s+implements\s+([^{]+))?"
+
+        for match in re.finditer(class_pattern, code):
+            class_name = match.group(2)
+            extends = match.group(3)
+            implements_str = match.group(4)
+            implements = (
+                [iface.strip() for iface in implements_str.split(",")]
+                if implements_str
+                else []
+            )
+
+            class_info: Dict[str, Any] = {
+                "name": class_name,
+                "extends": extends,
+                "implements": implements,
+            }
+
+            classes_list.append(class_info)
+
+        logger.debug(f"Extracted {len(classes_list)} classes using regex")
+        return classes_list

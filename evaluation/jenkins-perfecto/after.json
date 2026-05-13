@@ -1,0 +1,278 @@
+{
+  "aggregate": {
+    "total_tp": 2,
+    "total_fp": 0,
+    "total_fn": 0,
+    "total_unclassified": 7,
+    "expected_tp": 2,
+    "precision": 1.0,
+    "precision_strict": 0.2222,
+    "recall": 1.0,
+    "f1": 1.0,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2020-2261/PerfectoBuildWrapper.java",
+      "cve": "CVE-2020-2261",
+      "expected_tp": 2,
+      "found_tp": 2,
+      "fp": 0,
+      "fn": 0,
+      "unclassified": 7,
+      "tp_matched": [
+        {
+          "chain": {
+            "id": "perfectoConnectLocation_to_process_4833382080",
+            "type": "command_injection",
+            "source": {
+              "variable": "perfectoConnectLocation",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 158,
+              "code_snippet": "pcLocation = perfectoConnectLocation+File.separator+perfectoConnectFile;"
+            },
+            "sink": {
+              "variable": "process",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 169,
+              "code_snippet": "InputStream is = process.getInputStream();"
+            },
+            "path": [
+              "perfectoConnectLocation",
+              "cmdArgs",
+              "process"
+            ],
+            "confidence": 0.7
+          },
+          "tp": {
+            "id": "TP-1",
+            "source_var": "perfectoConnectLocation",
+            "sink_var": "cmdArgs",
+            "source_line": 151,
+            "sink_line": 167,
+            "vuln_type": "command_injection",
+            "description": "getTunnelId() parameter perfectoConnectLocation (from job config) -> string concatenation into bash -c -> Runtime.getRuntime().exec(cmdArgs)"
+          }
+        },
+        {
+          "chain": {
+            "id": "pcParameters_to_process_4833617920",
+            "type": "command_injection",
+            "source": {
+              "variable": "pcParameters",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 166,
+              "code_snippet": "String cmdArgs[] = {\"bash\", \"-c\", \"(cd \"+perfectoConnectLocation+\"; \"+baseCommand+\" \"+pcParameters.trim()+\")\"};"
+            },
+            "sink": {
+              "variable": "process",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 169,
+              "code_snippet": "InputStream is = process.getInputStream();"
+            },
+            "path": [
+              "pcParameters",
+              "cmdArgs",
+              "process"
+            ],
+            "confidence": 0.7
+          },
+          "tp": {
+            "id": "TP-2",
+            "source_var": "pcParameters",
+            "sink_var": "cmdArgs",
+            "source_line": 146,
+            "sink_line": 167,
+            "vuln_type": "command_injection",
+            "description": "pcParameters (job config field) -> baseCommand -> Runtime.getRuntime().exec",
+            "expected_realistic": false
+          }
+        }
+      ],
+      "fp_chains": [],
+      "fn_chains": [],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "perfectoConnectLocation_to_tunnelId_4833384704",
+            "type": "sql_injection",
+            "source": {
+              "variable": "perfectoConnectLocation",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 158,
+              "code_snippet": "pcLocation = perfectoConnectLocation+File.separator+perfectoConnectFile;"
+            },
+            "sink": {
+              "variable": "tunnelId",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 234,
+              "code_snippet": "PerfectoEnvironmentUtil.outputEnvironmentVariable(env, tunnelIdCustomName, tunnelId, true);"
+            },
+            "path": [
+              "perfectoConnectLocation",
+              "tunnelId"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "cloudName_to_process_4833382976",
+            "type": "command_injection",
+            "source": {
+              "variable": "cloudName",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 161,
+              "code_snippet": "listener.getLogger().println(pcLocation.trim()+\" start -c \"+cloudName.trim()+\".perfectomobile.com -s <<TOKEN>> \"+pcParameters.trim());"
+            },
+            "sink": {
+              "variable": "process",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 169,
+              "code_snippet": "InputStream is = process.getInputStream();"
+            },
+            "path": [
+              "cloudName",
+              "baseCommand",
+              "cmdArgs",
+              "process"
+            ],
+            "confidence": 0.7
+          }
+        },
+        {
+          "chain": {
+            "id": "cloudName_to_tunnelId_4829185088",
+            "type": "sql_injection",
+            "source": {
+              "variable": "cloudName",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 161,
+              "code_snippet": "listener.getLogger().println(pcLocation.trim()+\" start -c \"+cloudName.trim()+\".perfectomobile.com -s <<TOKEN>> \"+pcParameters.trim());"
+            },
+            "sink": {
+              "variable": "tunnelId",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 234,
+              "code_snippet": "PerfectoEnvironmentUtil.outputEnvironmentVariable(env, tunnelIdCustomName, tunnelId, true);"
+            },
+            "path": [
+              "cloudName",
+              "listener",
+              "tunnelId"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "apiKey_to_process_4833819712",
+            "type": "command_injection",
+            "source": {
+              "variable": "apiKey",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 219,
+              "code_snippet": "tunnelId = getTunnelId(perfectoConnectLocation, credentials.getCloudName(), apiKey, listener);"
+            },
+            "sink": {
+              "variable": "process",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 169,
+              "code_snippet": "InputStream is = process.getInputStream();"
+            },
+            "path": [
+              "apiKey",
+              "baseCommand",
+              "cmdArgs",
+              "process"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "apiKey_to_tunnelId_4833561088",
+            "type": "sql_injection",
+            "source": {
+              "variable": "apiKey",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 219,
+              "code_snippet": "tunnelId = getTunnelId(perfectoConnectLocation, credentials.getCloudName(), apiKey, listener);"
+            },
+            "sink": {
+              "variable": "tunnelId",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 234,
+              "code_snippet": "PerfectoEnvironmentUtil.outputEnvironmentVariable(env, tunnelIdCustomName, tunnelId, true);"
+            },
+            "path": [
+              "apiKey",
+              "tunnelId"
+            ],
+            "confidence": 0.95
+          }
+        },
+        {
+          "chain": {
+            "id": "pcParameters_to_tunnelId_4833595840",
+            "type": "sql_injection",
+            "source": {
+              "variable": "pcParameters",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 166,
+              "code_snippet": "String cmdArgs[] = {\"bash\", \"-c\", \"(cd \"+perfectoConnectLocation+\"; \"+baseCommand+\" \"+pcParameters.trim()+\")\"};"
+            },
+            "sink": {
+              "variable": "tunnelId",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 234,
+              "code_snippet": "PerfectoEnvironmentUtil.outputEnvironmentVariable(env, tunnelIdCustomName, tunnelId, true);"
+            },
+            "path": [
+              "pcParameters",
+              "listener",
+              "tunnelId"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "credentials_to_tunnelId_4833813888",
+            "type": "sql_injection",
+            "source": {
+              "variable": "credentials",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 218,
+              "code_snippet": "final String apiKey = credentials.getPassword().getPlainText();"
+            },
+            "sink": {
+              "variable": "tunnelId",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 234,
+              "code_snippet": "PerfectoEnvironmentUtil.outputEnvironmentVariable(env, tunnelIdCustomName, tunnelId, true);"
+            },
+            "path": [
+              "credentials",
+              "tunnelId"
+            ],
+            "confidence": 0.95
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 6,
+        "sinks_found": 8,
+        "sanitizers_found": 0,
+        "chains_found": 15,
+        "chains_verified": 9,
+        "verification_rate": 0.6,
+        "explanations_generated": 9,
+        "graph_nodes": 364,
+        "graph_edges": 119
+      },
+      "error": null
+    }
+  ]
+}

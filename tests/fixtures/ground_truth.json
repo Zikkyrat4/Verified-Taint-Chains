@@ -1,0 +1,367 @@
+{
+  "vulnerable_code": {
+    "sql_injection_basic.java": {
+      "expected_vulnerabilities": 1,
+      "vulnerabilities": [
+        {
+          "type": "sql_injection",
+          "source": {
+            "variable": "userId",
+            "line_number": 9,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "query",
+            "line_number": 10,
+            "type": "SQL"
+          },
+          "severity": "CRITICAL",
+          "cwe": "CWE-89"
+        }
+      ]
+    },
+    "sql_injection_complex.java": {
+      "expected_vulnerabilities": 2,
+      "vulnerabilities": [
+        {
+          "type": "sql_injection",
+          "source": {
+            "variable": "username",
+            "line_number": 9,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "query",
+            "line_number": 14,
+            "type": "SQL"
+          },
+          "severity": "CRITICAL",
+          "cwe": "CWE-89"
+        },
+        {
+          "type": "sql_injection",
+          "source": {
+            "variable": "email",
+            "line_number": 10,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "query",
+            "line_number": 18,
+            "type": "SQL"
+          },
+          "severity": "CRITICAL",
+          "cwe": "CWE-89"
+        }
+      ]
+    },
+    "xss_reflected.java": {
+      "expected_vulnerabilities": 2,
+      "vulnerabilities": [
+        {
+          "type": "xss",
+          "source": {
+            "variable": "name",
+            "line_number": 9,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "name",
+            "line_number": 10,
+            "type": "HTML Output"
+          },
+          "severity": "MEDIUM",
+          "cwe": "CWE-79"
+        },
+        {
+          "type": "xss",
+          "source": {
+            "variable": "searchQuery",
+            "line_number": 14,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "searchQuery",
+            "line_number": 16,
+            "type": "HTML Output"
+          },
+          "severity": "MEDIUM",
+          "cwe": "CWE-79"
+        }
+      ]
+    },
+    "command_injection.java": {
+      "expected_vulnerabilities": 2,
+      "vulnerabilities": [
+        {
+          "type": "command_injection",
+          "source": {
+            "variable": "hostname",
+            "line_number": 9,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "command",
+            "line_number": 10,
+            "type": "Command Execution"
+          },
+          "severity": "CRITICAL",
+          "cwe": "CWE-78"
+        },
+        {
+          "type": "command_injection",
+          "source": {
+            "variable": "directory",
+            "line_number": 19,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "directory",
+            "line_number": 21,
+            "type": "Command Execution"
+          },
+          "severity": "CRITICAL",
+          "cwe": "CWE-78"
+        }
+      ]
+    },
+    "path_traversal.java": {
+      "expected_vulnerabilities": 2,
+      "vulnerabilities": [
+        {
+          "type": "path_traversal",
+          "source": {
+            "variable": "filename",
+            "line_number": 9,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "file",
+            "line_number": 10,
+            "type": "File Path"
+          },
+          "severity": "HIGH",
+          "cwe": "CWE-22"
+        },
+        {
+          "type": "path_traversal",
+          "source": {
+            "variable": "userFile",
+            "line_number": 20,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "filePath",
+            "line_number": 22,
+            "type": "File Path"
+          },
+          "severity": "HIGH",
+          "cwe": "CWE-22"
+        }
+      ]
+    },
+    "xxe_injection.java": {
+      "expected_vulnerabilities": 1,
+      "vulnerabilities": [
+        {
+          "type": "xxe",
+          "source": {
+            "variable": "xmlData",
+            "line_number": 10,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "doc",
+            "line_number": 14,
+            "type": "XML Parser"
+          },
+          "severity": "HIGH",
+          "cwe": "CWE-611"
+        }
+      ]
+    },
+    "ssrf_attack.java": {
+      "expected_vulnerabilities": 2,
+      "vulnerabilities": [
+        {
+          "type": "ssrf",
+          "source": {
+            "variable": "targetUrl",
+            "line_number": 10,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "url",
+            "line_number": 11,
+            "type": "HTTP Request"
+          },
+          "severity": "HIGH",
+          "cwe": "CWE-918"
+        },
+        {
+          "type": "ssrf",
+          "source": {
+            "variable": "imageUrl",
+            "line_number": 29,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "url",
+            "line_number": 30,
+            "type": "HTTP Request"
+          },
+          "severity": "HIGH",
+          "cwe": "CWE-918"
+        }
+      ]
+    },
+    "sql_injection_long_path.java": {
+      "expected_vulnerabilities": 1,
+      "vulnerabilities": [
+        {
+          "type": "sql_injection",
+          "source": {
+            "variable": "userInput",
+            "line_number": 10,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "query",
+            "line_number": 23,
+            "type": "SQL"
+          },
+          "severity": "CRITICAL",
+          "cwe": "CWE-89",
+          "expected_path_length": 5,
+          "comment": "Long path through multiple transformations"
+        }
+      ]
+    },
+    "xss_with_partial_sanitization.java": {
+      "expected_vulnerabilities": 1,
+      "vulnerabilities": [
+        {
+          "type": "xss",
+          "source": {
+            "variable": "message",
+            "line_number": 11,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "cleaned",
+            "line_number": 17,
+            "type": "HTML Output"
+          },
+          "severity": "MEDIUM",
+          "cwe": "CWE-79",
+          "has_sanitizer": true,
+          "sanitizer_effective": false,
+          "comment": "Partial sanitization is insufficient"
+        }
+      ]
+    },
+    "multiple_vulnerabilities.java": {
+      "expected_vulnerabilities": 3,
+      "vulnerabilities": [
+        {
+          "type": "sql_injection",
+          "source": {
+            "variable": "username",
+            "line_number": 10,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "query",
+            "line_number": 12,
+            "type": "SQL"
+          },
+          "severity": "CRITICAL",
+          "cwe": "CWE-89"
+        },
+        {
+          "type": "xss",
+          "source": {
+            "variable": "bio",
+            "line_number": 25,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "bio",
+            "line_number": 26,
+            "type": "HTML Output"
+          },
+          "severity": "MEDIUM",
+          "cwe": "CWE-79"
+        },
+        {
+          "type": "path_traversal",
+          "source": {
+            "variable": "avatarFile",
+            "line_number": 31,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "file",
+            "line_number": 32,
+            "type": "File Path"
+          },
+          "severity": "HIGH",
+          "cwe": "CWE-22"
+        }
+      ]
+    },
+    "sql_injection_control_flow.java": {
+      "expected_vulnerabilities": 1,
+      "vulnerabilities": [
+        {
+          "type": "sql_injection",
+          "source": {
+            "variable": "category",
+            "line_number": 11,
+            "type": "User Input"
+          },
+          "sink": {
+            "variable": "query",
+            "line_number": 29,
+            "type": "SQL"
+          },
+          "severity": "CRITICAL",
+          "cwe": "CWE-89",
+          "has_control_flow": true,
+          "comment": "Path through if statements and loops"
+        }
+      ]
+    }
+  },
+  "safe_code": {
+    "sql_safe_prepared_statement.java": {
+      "expected_vulnerabilities": 0,
+      "comment": "Uses PreparedStatement correctly"
+    },
+    "xss_safe_encoding.java": {
+      "expected_vulnerabilities": 0,
+      "comment": "Properly encodes output"
+    },
+    "command_safe_array.java": {
+      "expected_vulnerabilities": 0,
+      "comment": "Uses command array without shell"
+    },
+    "path_safe_validation.java": {
+      "expected_vulnerabilities": 0,
+      "comment": "Validates and canonicalizes paths"
+    }
+  },
+  "metrics": {
+    "total_vulnerable_files": 11,
+    "total_safe_files": 4,
+    "total_expected_vulnerabilities": 19,
+    "vulnerability_distribution": {
+      "sql_injection": 7,
+      "xss": 4,
+      "command_injection": 2,
+      "path_traversal": 3,
+      "xxe": 1,
+      "ssrf": 2
+    }
+  }
+}

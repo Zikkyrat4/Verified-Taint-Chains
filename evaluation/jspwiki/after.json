@@ -1,0 +1,167 @@
+{
+  "aggregate": {
+    "total_tp": 2,
+    "total_fp": 2,
+    "total_fn": 0,
+    "total_unclassified": 0,
+    "expected_tp": 2,
+    "precision": 0.5,
+    "precision_strict": 0.5,
+    "recall": 1.0,
+    "f1": 0.6667,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2019-10076/LinkToTag.java",
+      "cve": "CVE-2019-10076",
+      "expected_tp": 2,
+      "found_tp": 2,
+      "fp": 2,
+      "fn": 0,
+      "unclassified": 0,
+      "tp_matched": [
+        {
+          "chain": {
+            "id": "title_to_out_4825574336",
+            "type": "xss",
+            "source": {
+              "variable": "title",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
+              "line": 69,
+              "code_snippet": "public void setTitle( String title )"
+            },
+            "sink": {
+              "variable": "out",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
+              "line": 36,
+              "code_snippet": "*    <LI>format - either \"anchor\" or \"url\" to output either an <A>... or just the HREF part of one."
+            },
+            "path": [
+              "title",
+              "m_title",
+              "out"
+            ],
+            "confidence": 0.7749999999999999
+          },
+          "tp": {
+            "id": "TP-1",
+            "source_var": "title",
+            "sink_var": "m_title",
+            "source_line": 69,
+            "sink_line": 127,
+            "vuln_type": "xss",
+            "description": "setTitle(String title) \u2014 attacker-controlled title attribute -> m_title field -> out.print(...m_title...)"
+          }
+        },
+        {
+          "chain": {
+            "id": "access_to_out_4827752384",
+            "type": "xss",
+            "source": {
+              "variable": "access",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
+              "line": 74,
+              "code_snippet": "public void setAccesskey( String access )"
+            },
+            "sink": {
+              "variable": "out",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
+              "line": 36,
+              "code_snippet": "*    <LI>format - either \"anchor\" or \"url\" to output either an <A>... or just the HREF part of one."
+            },
+            "path": [
+              "access",
+              "m_accesskey",
+              "out"
+            ],
+            "confidence": 0.7749999999999999
+          },
+          "tp": {
+            "id": "TP-2",
+            "source_var": "access",
+            "sink_var": "m_accesskey",
+            "source_line": 74,
+            "sink_line": 126,
+            "vuln_type": "xss",
+            "description": "setAccesskey(String access) -> m_accesskey field -> out.print(...m_accesskey...)"
+          }
+        }
+      ],
+      "fp_chains": [
+        {
+          "chain": {
+            "id": "m_pageName_to_out_4825176448",
+            "type": "xss",
+            "source": {
+              "variable": "m_pageName",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
+              "line": 83,
+              "code_snippet": "String     pageName = m_pageName;"
+            },
+            "sink": {
+              "variable": "out",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
+              "line": 36,
+              "code_snippet": "*    <LI>format - either \"anchor\" or \"url\" to output either an <A>... or just the HREF part of one."
+            },
+            "path": [
+              "m_pageName",
+              "pageName",
+              "url",
+              "out"
+            ],
+            "confidence": 0.7
+          },
+          "fp_pattern": {
+            "source_pattern": "pageContext|m_pageName|getVersion",
+            "reason": "Internal JSP context fields"
+          }
+        },
+        {
+          "chain": {
+            "id": "m_pageName_to_url_4825347840",
+            "type": "xss",
+            "source": {
+              "variable": "m_pageName",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
+              "line": 83,
+              "code_snippet": "String     pageName = m_pageName;"
+            },
+            "sink": {
+              "variable": "url",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
+              "line": 118,
+              "code_snippet": "url = m_wikiContext.getURL( WikiContext.VIEW, pageName,"
+            },
+            "path": [
+              "m_pageName",
+              "pageName",
+              "url"
+            ],
+            "confidence": 0.7
+          },
+          "fp_pattern": {
+            "sink_pattern": "m_wikiContext\\.getURL|m_wikiContext\\.getPage",
+            "reason": "Internal wiki context API"
+          }
+        }
+      ],
+      "fn_chains": [],
+      "unclassified_chains": [],
+      "pipeline_metrics": {
+        "sources_found": 6,
+        "sinks_found": 3,
+        "sanitizers_found": 0,
+        "chains_found": 4,
+        "chains_verified": 4,
+        "verification_rate": 1.0,
+        "explanations_generated": 4,
+        "graph_nodes": 179,
+        "graph_edges": 36
+      },
+      "error": null
+    }
+  ]
+}

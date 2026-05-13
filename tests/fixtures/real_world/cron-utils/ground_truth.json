@@ -1,0 +1,35 @@
+{
+  "_comment": "Ground truth for VTC evaluation on cron-utils. CVE-2021-41269 — Template injection: cron expression embedded into IllegalArgumentException message; downstream Hibernate Validator evaluates EL on the message, leading to RCE.",
+  "files": {
+    "CVE-2021-41269/CronParser.java": {
+      "cve": "CVE-2021-41269",
+      "cwe": "CWE-094",
+      "vulnerability": "Java EL injection via @Cron-validated expression",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "expression",
+          "sink_var": "expression",
+          "source_line": 84,
+          "sink_line": 131,
+          "vuln_type": "command_injection",
+          "description": "parse(String expression) — user-controlled cron expression -> String.format(\"Failed to parse '%s'...\", expression) -> IllegalArgumentException message -> EL evaluation in validator framework"
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "Preconditions\\.checkNotNull", "reason": "Null check"},
+        {"sink_pattern": "expressions\\.put|expressions\\.get|expressions\\.keySet", "reason": "Internal HashMap mutations"},
+        {"sink_pattern": "new ArrayList|new HashMap|new SingleCron|new CompositeCron", "reason": "Internal collection / model construction"},
+        {"sink_pattern": "Arrays\\.stream|Collectors\\.toList|stream\\(\\)", "reason": "Stream helpers"},
+        {"sink_pattern": "fields\\.get\\(j\\)\\.parse", "reason": "Internal recursive parser call"},
+        {"source_pattern": "fieldDefinition|cronDefinition", "reason": "Internal config from constructor"}
+      ]
+    }
+  },
+  "metrics": {
+    "total_files": 1,
+    "ideal_true_positives": 1,
+    "realistic_true_positives_min": 0,
+    "realistic_true_positives_max": 1
+  }
+}

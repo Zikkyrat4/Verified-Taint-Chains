@@ -1,0 +1,35 @@
+{
+  "_comment": "Ground truth for VTC evaluation on Jenkins docker-commons-plugin. CVE-2022-20617 — OS Command Injection via Docker registry endpoint URL parsing without authority validation.",
+  "files": {
+    "CVE-2022-20617/DockerRegistryEndpoint.java": {
+      "cve": "CVE-2022-20617",
+      "cwe": "CWE-078",
+      "vulnerability": "OS Command Injection via untrusted Docker registry URL",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "s",
+          "sink_var": "url",
+          "source_line": 120,
+          "sink_line": 128,
+          "vuln_type": "command_injection",
+          "description": "fromImageName(String s, ...) parameter -> regex matcher.group(2) -> new URL(...) used in subsequent shell context"
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "LOGGER\\.log|LOGGER\\.fine", "reason": "Logging"},
+        {"sink_pattern": "new IllegalArgumentException", "reason": "Exception construction"},
+        {"sink_pattern": "Util\\.fixEmpty", "reason": "Sanitization helper"},
+        {"sink_pattern": "Collections\\.emptyList|Collections\\.singletonList", "reason": "Collection helpers"},
+        {"source_var": "credentialsId", "reason": "Credential ID, not user-routed in this flow"},
+        {"sink_pattern": "AuthenticationTokens\\.convert", "reason": "Internal credentials API"}
+      ]
+    }
+  },
+  "metrics": {
+    "total_files": 1,
+    "ideal_true_positives": 1,
+    "realistic_true_positives_min": 0,
+    "realistic_true_positives_max": 1
+  }
+}

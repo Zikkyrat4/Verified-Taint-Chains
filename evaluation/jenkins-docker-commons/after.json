@@ -1,0 +1,100 @@
+{
+  "aggregate": {
+    "total_tp": 0,
+    "total_fp": 0,
+    "total_fn": 1,
+    "total_unclassified": 2,
+    "expected_tp": 1,
+    "precision": 0.0,
+    "precision_strict": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2022-20617/DockerRegistryEndpoint.java",
+      "cve": "CVE-2022-20617",
+      "expected_tp": 1,
+      "found_tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "unclassified": 2,
+      "tp_matched": [],
+      "fp_chains": [],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "s",
+          "sink_var": "url",
+          "source_line": 120,
+          "sink_line": 128,
+          "vuln_type": "command_injection",
+          "description": "fromImageName(String s, ...) parameter -> regex matcher.group(2) -> new URL(...) used in subsequent shell context"
+        }
+      ],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "build_to_token_4829200448",
+            "type": "sql_injection",
+            "source": {
+              "variable": "build",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
+              "line": 235,
+              "code_snippet": "return newKeyMaterialFactory(build.getParent(), workspace.getChannel());"
+            },
+            "sink": {
+              "variable": "token",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
+              "line": 258,
+              "code_snippet": "return token.newKeyMaterialFactory(getEffectiveUrl(), target, launcher, listener);"
+            },
+            "path": [
+              "build",
+              "workspace",
+              "token"
+            ],
+            "confidence": 0.7
+          }
+        },
+        {
+          "chain": {
+            "id": "build_to_workspace_4828756032",
+            "type": "command_injection",
+            "source": {
+              "variable": "build",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
+              "line": 235,
+              "code_snippet": "return newKeyMaterialFactory(build.getParent(), workspace.getChannel());"
+            },
+            "sink": {
+              "variable": "workspace",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
+              "line": 288,
+              "code_snippet": "* @param workspace a workspace being used for operations ({@link WorkspaceList#tempDir} will be applied)"
+            },
+            "path": [
+              "build",
+              "workspace"
+            ],
+            "confidence": 0.7
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 7,
+        "sinks_found": 14,
+        "sanitizers_found": 1,
+        "chains_found": 3,
+        "chains_verified": 2,
+        "verification_rate": 0.6666666666666666,
+        "explanations_generated": 2,
+        "graph_nodes": 430,
+        "graph_edges": 115
+      },
+      "error": null
+    }
+  ]
+}

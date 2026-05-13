@@ -1,0 +1,205 @@
+{
+  "aggregate": {
+    "total_tp": 0,
+    "total_fp": 2,
+    "total_fn": 1,
+    "total_unclassified": 4,
+    "expected_tp": 1,
+    "precision": 0.0,
+    "precision_strict": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2021-41269/CronParser.java",
+      "cve": "CVE-2021-41269",
+      "expected_tp": 1,
+      "found_tp": 0,
+      "fp": 2,
+      "fn": 1,
+      "unclassified": 4,
+      "tp_matched": [],
+      "fp_chains": [
+        {
+          "chain": {
+            "id": "expression_to_expressionParts_4826912128",
+            "type": "command_injection",
+            "source": {
+              "variable": "expression",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 92,
+              "code_snippet": "List<Cron> crons = Arrays.stream(expression.split(\"\\\\|\\\\|\")).map(this::parse).collect(Collectors.toList());"
+            },
+            "sink": {
+              "variable": "expressionParts",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 113,
+              "code_snippet": "String fieldWithTrailingCommas = Arrays.stream(expressionParts).filter(x -> x.endsWith(\",\")).findAny().orElse(null);"
+            },
+            "path": [
+              "expression",
+              "replaced",
+              "expressionParts"
+            ],
+            "confidence": 0.7
+          },
+          "fp_pattern": {
+            "sink_pattern": "Arrays\\.stream|Collectors\\.toList|stream\\(\\)",
+            "reason": "Stream helpers"
+          }
+        },
+        {
+          "chain": {
+            "id": "expression_to_expressionParts_4810699776",
+            "type": "xxe",
+            "source": {
+              "variable": "expression",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 92,
+              "code_snippet": "List<Cron> crons = Arrays.stream(expression.split(\"\\\\|\\\\|\")).map(this::parse).collect(Collectors.toList());"
+            },
+            "sink": {
+              "variable": "expressionParts",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 127,
+              "code_snippet": "results.add(fields.get(j).parse(expressionParts[j]));"
+            },
+            "path": [
+              "expression",
+              "replaced",
+              "expressionParts"
+            ],
+            "confidence": 0.7
+          },
+          "fp_pattern": {
+            "sink_pattern": "fields\\.get\\(j\\)\\.parse",
+            "reason": "Internal recursive parser call"
+          }
+        }
+      ],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "expression",
+          "sink_var": "expression",
+          "source_line": 84,
+          "sink_line": 131,
+          "vuln_type": "command_injection",
+          "description": "parse(String expression) \u2014 user-controlled cron expression -> String.format(\"Failed to parse '%s'...\", expression) -> IllegalArgumentException message -> EL evaluation in validator framework"
+        }
+      ],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "expression_to_replaced_4826554688",
+            "type": "sql_injection",
+            "source": {
+              "variable": "expression",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 92,
+              "code_snippet": "List<Cron> crons = Arrays.stream(expression.split(\"\\\\|\\\\|\")).map(this::parse).collect(Collectors.toList());"
+            },
+            "sink": {
+              "variable": "replaced",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 86,
+              "code_snippet": "final String replaced = expression.replaceAll(\"\\\\s+\", \" \").trim();"
+            },
+            "path": [
+              "expression",
+              "replaced"
+            ],
+            "confidence": 0.7
+          }
+        },
+        {
+          "chain": {
+            "id": "expression_to_expressionParts_4826560384",
+            "type": "xss",
+            "source": {
+              "variable": "expression",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 92,
+              "code_snippet": "List<Cron> crons = Arrays.stream(expression.split(\"\\\\|\\\\|\")).map(this::parse).collect(Collectors.toList());"
+            },
+            "sink": {
+              "variable": "expressionParts",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 111,
+              "code_snippet": "final String[] expressionParts = replaced.toUpperCase().split(\" \");"
+            },
+            "path": [
+              "expression",
+              "replaced",
+              "expressionParts"
+            ],
+            "confidence": 0.7
+          }
+        },
+        {
+          "chain": {
+            "id": "expression_to_expressionParts_4826915584",
+            "type": "sql_injection",
+            "source": {
+              "variable": "expression",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 92,
+              "code_snippet": "List<Cron> crons = Arrays.stream(expression.split(\"\\\\|\\\\|\")).map(this::parse).collect(Collectors.toList());"
+            },
+            "sink": {
+              "variable": "expressionParts",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 124,
+              "code_snippet": "final int size = expressionParts.length;"
+            },
+            "path": [
+              "expression",
+              "replaced",
+              "expressionParts"
+            ],
+            "confidence": 0.7
+          }
+        },
+        {
+          "chain": {
+            "id": "expression_to_expressionParts_4826865472",
+            "type": "ssrf",
+            "source": {
+              "variable": "expression",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 92,
+              "code_snippet": "List<Cron> crons = Arrays.stream(expression.split(\"\\\\|\\\\|\")).map(this::parse).collect(Collectors.toList());"
+            },
+            "sink": {
+              "variable": "expressionParts",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/cron-utils/CVE-2021-41269/CronParser.java",
+              "line": 111,
+              "code_snippet": "final String[] expressionParts = replaced.toUpperCase().split(\" \");"
+            },
+            "path": [
+              "expression",
+              "replaced",
+              "expressionParts"
+            ],
+            "confidence": 0.7
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 1,
+        "sinks_found": 6,
+        "sanitizers_found": 0,
+        "chains_found": 6,
+        "chains_verified": 6,
+        "verification_rate": 1.0,
+        "explanations_generated": 6,
+        "graph_nodes": 183,
+        "graph_edges": 104
+      },
+      "error": null
+    }
+  ]
+}

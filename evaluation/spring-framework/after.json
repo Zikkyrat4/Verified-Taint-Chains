@@ -1,0 +1,80 @@
+{
+  "aggregate": {
+    "total_tp": 0,
+    "total_fp": 1,
+    "total_fn": 1,
+    "total_unclassified": 0,
+    "expected_tp": 1,
+    "precision": 0.0,
+    "precision_strict": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2022-22965/CachedIntrospectionResults.java",
+      "cve": "CVE-2022-22965",
+      "expected_tp": 1,
+      "found_tp": 0,
+      "fp": 1,
+      "fn": 1,
+      "unclassified": 0,
+      "tp_matched": [],
+      "fp_chains": [
+        {
+          "chain": {
+            "id": "beanClass_to_pd_4826433536",
+            "type": "sql_injection",
+            "source": {
+              "variable": "beanClass",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 360,
+              "code_snippet": "return new GenericTypeAwarePropertyDescriptor(beanClass, pd.getName(), pd.getReadMethod(),"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 361,
+              "code_snippet": "pd.getWriteMethod(), pd.getPropertyEditorClass());"
+            },
+            "path": [
+              "beanClass",
+              "pd"
+            ],
+            "confidence": 0.7
+          },
+          "fp_pattern": {
+            "source_pattern": "ifc|currClass|existingPd|pd\\.getName",
+            "reason": "Internal iteration variables"
+          }
+        }
+      ],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "beanClass",
+          "sink_var": "beanInfo",
+          "source_line": 269,
+          "sink_line": 274,
+          "vuln_type": "command_injection",
+          "description": "Constructor beanClass parameter (request-derived via data binding) -> getBeanInfo(beanClass) -> Introspector.getBeanInfo, exposing classLoader/protectionDomain getters that can be reached via property paths like class.module.classLoader.URLs[0]"
+        }
+      ],
+      "unclassified_chains": [],
+      "pipeline_metrics": {
+        "sources_found": 2,
+        "sinks_found": 1,
+        "sanitizers_found": 0,
+        "chains_found": 1,
+        "chains_verified": 1,
+        "verification_rate": 1.0,
+        "explanations_generated": 1,
+        "graph_nodes": 441,
+        "graph_edges": 107
+      },
+      "error": null
+    }
+  ]
+}

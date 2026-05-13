@@ -1,0 +1,99 @@
+{
+  "aggregate": {
+    "total_tp": 1,
+    "total_fp": 0,
+    "total_fn": 0,
+    "total_unclassified": 1,
+    "expected_tp": 1,
+    "precision": 1.0,
+    "precision_strict": 0.5,
+    "recall": 1.0,
+    "f1": 1.0,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2018-9159/ClassPathResource.java",
+      "cve": "CVE-2018-9159",
+      "expected_tp": 1,
+      "found_tp": 1,
+      "fp": 0,
+      "fn": 0,
+      "unclassified": 1,
+      "tp_matched": [
+        {
+          "chain": {
+            "id": "path_to_is_4829155456",
+            "type": "path_traversal",
+            "source": {
+              "variable": "path",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spark/CVE-2018-9159/ClassPathResource.java",
+              "line": 141,
+              "code_snippet": "is = this.classLoader.getResourceAsStream(this.path);"
+            },
+            "sink": {
+              "variable": "is",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spark/CVE-2018-9159/ClassPathResource.java",
+              "line": 146,
+              "code_snippet": "return is;"
+            },
+            "path": [
+              "path",
+              "is"
+            ],
+            "confidence": 0.7
+          },
+          "tp": {
+            "id": "TP-1",
+            "source_var": "path",
+            "sink_var": "path",
+            "source_line": 75,
+            "sink_line": 141,
+            "vuln_type": "path_traversal",
+            "description": "Constructor `path` parameter -> StringUtils.cleanPath -> this.path -> classLoader.getResourceAsStream(this.path)"
+          }
+        }
+      ],
+      "fp_chains": [],
+      "fn_chains": [],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "path_to_url_4826175360",
+            "type": "xss",
+            "source": {
+              "variable": "path",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spark/CVE-2018-9159/ClassPathResource.java",
+              "line": 141,
+              "code_snippet": "is = this.classLoader.getResourceAsStream(this.path);"
+            },
+            "sink": {
+              "variable": "url",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spark/CVE-2018-9159/ClassPathResource.java",
+              "line": 168,
+              "code_snippet": "return url;"
+            },
+            "path": [
+              "path",
+              "url"
+            ],
+            "confidence": 0.7
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 5,
+        "sinks_found": 2,
+        "sanitizers_found": 3,
+        "chains_found": 2,
+        "chains_verified": 2,
+        "verification_rate": 1.0,
+        "explanations_generated": 2,
+        "graph_nodes": 209,
+        "graph_edges": 48
+      },
+      "error": null
+    }
+  ]
+}

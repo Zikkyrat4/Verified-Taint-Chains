@@ -1,0 +1,46 @@
+{
+  "_comment": "Ground truth for VTC evaluation on Jenkins perfecto-plugin. CVE-2020-2261 — OS Command Injection: build configuration fields concatenated into bash -c invocation.",
+  "files": {
+    "CVE-2020-2261/PerfectoBuildWrapper.java": {
+      "cve": "CVE-2020-2261",
+      "cwe": "CWE-078",
+      "vulnerability": "OS Command Injection via Perfecto Connect launch parameters",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "perfectoConnectLocation",
+          "sink_var": "cmdArgs",
+          "source_line": 151,
+          "sink_line": 167,
+          "vuln_type": "command_injection",
+          "description": "getTunnelId() parameter perfectoConnectLocation (from job config) -> string concatenation into bash -c -> Runtime.getRuntime().exec(cmdArgs)"
+        },
+        {
+          "id": "TP-2",
+          "source_var": "pcParameters",
+          "sink_var": "cmdArgs",
+          "source_line": 146,
+          "sink_line": 167,
+          "vuln_type": "command_injection",
+          "description": "pcParameters (job config field) -> baseCommand -> Runtime.getRuntime().exec",
+          "expected_realistic": false
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "listener\\.getLogger\\(\\)\\.println|listener\\.fatalError", "reason": "Logging"},
+        {"sink_pattern": "logger\\.fine|logger\\.info", "reason": "Logging"},
+        {"sink_pattern": "Pattern\\.compile|Matcher", "reason": "Regex helpers"},
+        {"sink_pattern": "new IOException", "reason": "Exception construction"},
+        {"sink_pattern": "BufferedReader|InputStreamReader", "reason": "Stream wrappers"},
+        {"source_var": "isWindows", "reason": "Platform detection"},
+        {"sink_pattern": "this\\.\\w+\\s*=", "reason": "Field assignment in constructor"}
+      ]
+    }
+  },
+  "metrics": {
+    "total_files": 1,
+    "ideal_true_positives": 2,
+    "realistic_true_positives_min": 0,
+    "realistic_true_positives_max": 1
+  }
+}

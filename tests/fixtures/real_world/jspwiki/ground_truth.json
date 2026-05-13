@@ -1,0 +1,43 @@
+{
+  "_comment": "Ground truth for VTC evaluation on Apache JSPWiki. CVE-2019-10076 — Stored XSS in attachment links via unescaped `title` and `accesskey` JSP tag attributes.",
+  "files": {
+    "CVE-2019-10076/LinkToTag.java": {
+      "cve": "CVE-2019-10076",
+      "cwe": "CWE-079",
+      "vulnerability": "Stored XSS via unescaped accesskey/title attributes in JSP tag",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "title",
+          "sink_var": "m_title",
+          "source_line": 69,
+          "sink_line": 127,
+          "vuln_type": "xss",
+          "description": "setTitle(String title) — attacker-controlled title attribute -> m_title field -> out.print(...m_title...)"
+        },
+        {
+          "id": "TP-2",
+          "source_var": "access",
+          "sink_var": "m_accesskey",
+          "source_line": 74,
+          "sink_line": 126,
+          "vuln_type": "xss",
+          "description": "setAccesskey(String access) -> m_accesskey field -> out.print(...m_accesskey...)"
+        }
+      ],
+      "false_positive_patterns": [
+        {"sink_pattern": "params\\.append|new StringBuilder", "reason": "Local string assembly for URL params"},
+        {"sink_pattern": "m_wikiContext\\.getURL|m_wikiContext\\.getPage", "reason": "Internal wiki context API"},
+        {"sink_pattern": "p instanceof Attachment", "reason": "Type check"},
+        {"sink_pattern": "super\\.initTag", "reason": "Parent class initialization"},
+        {"source_pattern": "pageContext|m_pageName|getVersion", "reason": "Internal JSP context fields"}
+      ]
+    }
+  },
+  "metrics": {
+    "total_files": 1,
+    "ideal_true_positives": 2,
+    "realistic_true_positives_min": 0,
+    "realistic_true_positives_max": 2
+  }
+}
