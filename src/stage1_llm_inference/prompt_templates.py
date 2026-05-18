@@ -20,22 +20,29 @@ You are a security expert analyzing Java code for untrusted data sources.
 ## Task
 Identify ALL sources of untrusted data entry points in this code.
 
-### What counts as a source:
-- **User Input**: `request.getParameter()`, `request.getHeader()`, `request.getInputStream()`, `request.getCookies()`
-- **Request Attributes**: `request.getAttribute()` — when the attribute was set from user-controlled data (e.g., login interceptors storing user objects)
-- **Method Parameters**: Parameters annotated with `@RequestParam`, `@PathVariable`, `@RequestBody`, `@RequestHeader`, `@CookieValue`
-- **File Operations**: `FileReader`, `Files.readAllBytes()`, `Scanner` on files
-- **Network**: Socket reads, HTTP client responses
-- **System**: Environment variables, system properties, Runtime.exec() output
-- **Other**: Deserialization, JNDI lookups, XML parsing
-- **Object Properties**: Properties of user-controlled objects (e.g., `loginUser.getUsername()` where `loginUser` comes from request)
+### Definition (reason from this, do not just match a list)
+A **source** is any expression through which a value that an external,
+untrusted actor can influence enters this code: HTTP request data, request
+bodies/headers/cookies/parameters, uploaded or read file contents, network
+responses, message-queue payloads, deserialized objects, JNDI/LDAP lookups,
+parsed XML/JSON, environment/system inputs, or a property of an object that
+itself originated from any of the above. If an attacker can affect the value —
+even via an API you have not seen before — it is a source.
 
-### IMPORTANT: What is NOT a source:
-- `ResultSet` (`rs`), `Connection` (`conn`), `Statement` (`stmt`), `PreparedStatement` (`ps`) — these are internal Java objects, NOT user input
-- `ArrayList`, `HashMap`, `StringBuilder` — internal data structures
-- Variables assigned from constants or hardcoded values
-- Return values of internal service calls that do NOT depend on user input
-- The source variable is the one that RECEIVES untrusted data (e.g., `username` in `username = request.getParameter("user")`), NOT the API object itself
+### Illustrative examples (NON-exhaustive — do not limit yourself to these)
+- `request.getParameter()`, `getHeader()`, `getInputStream()`, `getCookies()`
+- Parameters annotated `@RequestParam`, `@PathVariable`, `@RequestBody`, `@RequestHeader`, `@CookieValue`
+- `request.getAttribute()` when the attribute was populated from user-controlled data upstream
+- File/network reads, deserialization, XML/JSON parsing of external data
+- A property of a user-controlled object (e.g. `obj.getName()` where `obj` came from a request)
+
+### What is NOT a source:
+- Internal JDBC/IO objects: result sets, connections, statements, prepared statements — these are not external input
+- Generic in-memory data structures (lists, maps, builders)
+- Constants, hardcoded values, configuration objects
+- Server-side session/identity accessors and framework configuration getters whose value the server controls (not the attacker)
+- Return values of internal service/DAO calls that do not depend on external input
+- The source variable is the one that RECEIVES untrusted data (e.g. `username` in `username = request.getParameter("user")`), NOT the API object itself
 
 ## Analysis Requirements
 For each source, provide:
@@ -87,46 +94,49 @@ You are a security expert analyzing Java code for dangerous operations.
 ```
 
 ## Task
-Identify ALL dangerous sinks where untrusted data could cause security vulnerabilities.
+Identify ALL dangerous sinks where untrusted data could cause a security
+vulnerability.
 
-### What counts as a sink:
-- **SQL**: `Statement.execute()`, `executeQuery()`, `prepareStatement()` with string concat, `createQuery()`, `createNativeQuery()` with string concat
-- **Command Execution**: `Runtime.getRuntime().exec()`, `ProcessBuilder`, `Process` — variable PASSED as command argument
-- **File Operations**: `FileOutputStream`, `FileWriter`, `Files.write()` with user-controlled paths
-- **XML**: `DocumentBuilder.parse()`, `SAXParser.parse()`, `XMLReader` without XXE protection
-- **HTTP Response**: `PrintWriter.println()`, `response.sendRedirect()`, response headers, `response.getWriter().write()`
-- **XSS/Output**: Direct HTML/JavaScript output without encoding, string concatenation into error messages that are reflected to users (e.g., `throw new RuntimeException("error: " + userInput)`), `model.addAttribute()` with unsanitized data rendered in views, `setAttribute()` for data rendered in JSP/templates
-- **Path Traversal**: File path construction without validation
-- **LDAP/Database**: LDAP queries, NoSQL operations with user input
-- **Reflection**: `Class.forName()`, `Method.invoke()` with user-controlled data
-- **Serialization**: `ObjectInputStream.readObject()` from untrusted source
-- **SSRF**: `new URL(userInput)`, `HttpURLConnection`, `HttpClient` with user-controlled URLs
+### Definition (reason from capability, do not just match a list)
+A **sink** is any operation that **interprets, executes, transmits, or
+renders** a value such that an attacker-controlled value reaching it would
+violate confidentiality, integrity, or availability. Ask: "If this value were
+fully attacker-controlled, what concretely could go wrong here?" If there is a
+concrete security impact, it is a sink — **even if the API or library is one
+you have not seen before**. Classify by capability and impact, not by
+membership in a fixed list.
+
+### Illustrative capability categories (NON-exhaustive — report novel ones too)
+- Query/command interpreters: SQL/JPQL/HQL, OS commands, LDAP, XPath, NoSQL
+- Code/expression evaluation & reflection: script engines, EL/template engines, `Class.forName`, `Method.invoke`, dynamic proxies
+- Deserialization of untrusted data (native, XML, polymorphic JSON)
+- Untrusted XML parsing without entity protection
+- Filesystem path construction; file read/write with influenced paths
+- Outbound request targets, redirect targets, URL construction
+- Response rendering / header / cookie writing without encoding; reflected error or exception messages
+- Any other operation where attacker-controlled input crosses a trust or interpretation boundary
 
 ### IMPORTANT: What is NOT a sink:
-- `request.getAttribute()` — this READS data, it does NOT execute anything dangerous
-- `model.addAttribute()` — this is a sink ONLY if the template renders it without escaping; otherwise it is just passing data to the view layer
-- Variables used ONLY in null-checks or conditional logic (`if (loginUser == null)`)
-- Logging statements (`logger.info()`, `log.debug()`) — unless logs are displayed to users
+- Pure reads (e.g. `request.getAttribute()`) — reading executes nothing
+- Passing data to a view layer that is known to auto-escape it
+- Variables used ONLY in null-checks or conditional logic
+- Logging statements — unless the log is rendered back to users
+- Internal builders/setters that only store data on framework state objects, and event/audit logging calls
 - The sink variable is the one that CARRIES untrusted data INTO the dangerous operation, NOT the operation object itself
 
 ## Analysis Requirements
 For each sink, provide:
-1. **Line number** where sink occurs
-2. **Variable** being passed to sink (the untrusted data variable, NOT the API object)
-3. **Sink type** (from list above)
-4. **Vulnerability type** this sink could enable
-5. **Sink pattern** (method name, class, operation)
-6. **Confidence score** (0.0-1.0)
-
-## Vulnerability Types
-- sql_injection, command_injection, xxe, xss, path_traversal, ssrf
-- ldap_injection, code_injection, expression_injection, deserialization
-
-## Important Notes
-- Consider the destination of the operation (where data goes)
-- Check parameter types and method signatures
-- Account for indirect sinks (helper methods that eventually reach dangerous operations)
-- A sink is especially critical if parameters are user-controlled
+1. **Line number** where the sink occurs
+2. **Variable** carrying the untrusted data into the operation (NOT the API object)
+3. **Sink type** (short operation descriptor)
+4. **Vulnerability type** — your own concise snake_case label for the class of
+   weakness (use a well-known name when one fits; invent a precise one if the
+   class is unusual — do NOT force-fit it into an unrelated category)
+5. **CWE id** — best-fitting CWE (e.g. `"CWE-601"`); use `"CWE-UNKNOWN"` only
+   if you genuinely cannot determine one
+6. **Sink pattern** (method name, class, operation)
+7. **Confidence score** (0.0-1.0)
+8. **Reasoning** — why an attacker-controlled value here causes that impact
 
 ## Required Output Format
 Return ONLY valid JSON with NO additional text:
@@ -137,10 +147,11 @@ Return ONLY valid JSON with NO additional text:
             "line": <line_number>,
             "variable": "<variable_name>",
             "type": "<sink_type>",
-            "vulnerability_type": "<vulnerability_type>",
+            "vulnerability_type": "<your_snake_case_class>",
+            "cwe_id": "<CWE-NNN or CWE-UNKNOWN>",
             "pattern": "<method_or_operation>",
             "confidence": <0.0_to_1.0>,
-            "reasoning": "<brief_explanation>"
+            "reasoning": "<why attacker-controlled data here is dangerous>"
         }}
     ]
 }}
@@ -165,51 +176,51 @@ You are a security expert analyzing Java code for taint-analysis vulnerabilities
 ```
 
 ## Task
-Identify untrusted data SOURCES and dangerous SINKS in this code.
-Only report findings where you are confident that untrusted user data can reach a dangerous operation.
+Identify untrusted data SOURCES and dangerous SINKS in this code by reasoning
+about data flow and capability — not by matching a fixed catalog. Report a
+finding when an attacker-influenced value can reach an operation whose misuse
+has a concrete security impact.
 
-### What counts as a SOURCE (untrusted data entry point):
-- `request.getParameter()`, `request.getHeader()`, `request.getInputStream()`, `request.getCookies()`
-- `request.getAttribute()` — when attribute was set from user-controlled data
-- Method parameters annotated with `@RequestParam`, `@PathVariable`, `@RequestBody`
-- Properties of user-controlled objects (e.g., `loginUser.getUsername()` where `loginUser` comes from request)
-- File reads, network input, deserialization
+### SOURCE — definition (reason from this)
+Any expression through which a value an external, untrusted actor can
+influence enters this code. Ask: "Can an attacker affect this value?" If yes,
+it is a source — including via APIs you have not seen before.
+Illustrative (NON-exhaustive): request parameters/headers/cookies/bodies,
+`@RequestParam`/`@PathVariable`/`@RequestBody` params, file/network reads,
+deserialized/parsed external data, a property of an object that itself came
+from any of these.
 
-### What is NOT a source:
-- `ResultSet`, `Connection`, `Statement`, `PreparedStatement` — internal Java objects
-- `ArrayList`, `HashMap`, `StringBuilder` — data structures
-- Return values of internal service/DAO methods that don't depend on user input
+NOT a source:
+- Internal JDBC/IO objects (result sets, connections, statements) and generic in-memory data structures
 - Constants, hardcoded values, configuration objects
-- Session/authentication data retrieved from server-side storage: `session.getAttribute()`, `authSession.getAuthNote()`, `getAuthenticatedUser()`, `getPrincipal()`
-- Return values from framework configuration methods: `getRealm()`, `getClient()`, `getConfig()`, `getProvider()`
-- Variables that hold internal state objects: `AuthenticationFlow`, `ExecutionModel`, `SessionModel`
+- Server-side session/identity accessors and framework configuration getters whose value the server (not the attacker) controls
+- Return values of internal service/DAO calls that do not depend on external input
 
-### What counts as a SINK (dangerous operation):
-- **SQL**: `executeQuery()`, `executeUpdate()`, string concatenation into SQL queries
-- **XSS**: `response.getWriter().write()`, `setAttribute()` for data rendered in templates, string concatenation into error/exception messages shown to users (e.g., `throw new RuntimeException("error: " + userInput)`)
-- **Command**: `Runtime.exec()`, `ProcessBuilder` with user-controlled arguments
-- **Path Traversal**: `new File(userInput)`, `Paths.get(userInput)` without validation
-- **XXE**: `DocumentBuilder.parse()` without secure configuration
-- **SSRF**: `new URL(userInput)`, `HttpURLConnection` with user-controlled URLs
+### SINK — definition (reason from capability)
+Any operation that interprets, executes, transmits, or renders a value such
+that an attacker-controlled value would violate confidentiality, integrity, or
+availability. Ask: "If this value were fully attacker-controlled, what
+concretely could go wrong?" If there is a concrete impact, it is a sink —
+**even with an unfamiliar API**. Classify by capability/impact, not by a list.
+Illustrative (NON-exhaustive): query/command interpreters (SQL, OS, LDAP,
+XPath, NoSQL); code/expression evaluation & reflection; deserialization of
+untrusted data; unsafe XML parsing; filesystem path construction; outbound
+request / redirect / URL targets; unencoded response/header/cookie rendering
+and reflected error messages; any other trust-boundary crossing.
 
-### What is NOT a sink:
-- `request.getAttribute()` — reads data, does not execute anything
-- Null-checks: `if (var == null)` — conditional logic, not a dangerous operation
-- Logging: `logger.info()`, `log.debug()` — unless logs are displayed to users
-- Internal method calls that don't reach dangerous APIs
-- `model.addAttribute()` — only a sink if rendered without escaping
-- Framework object constructors: `new AuthenticationFlow(...)`, `new FormProvider(...)`, `new SessionContext(...)`
-- Internal setter methods that store data in framework objects: `.setClient()`, `.setState()`, `.setAuthNote()`
-- Event/audit logging: `event.detail()`, `event.error()`, `event.success()`
-- Exception constructors: `new AuthenticationFlowException(...)`, `throw new ErrorPageException(...)`
-
-## Vulnerability Types
-sql_injection, xss, command_injection, path_traversal, xxe, ssrf
+NOT a sink:
+- Pure reads; conditional/null-check usage
+- Passing data to a view layer known to auto-escape it
+- Logging — unless rendered back to users
+- Internal builders/setters that only store data on framework state objects, framework object constructors, and event/audit logging calls
 
 ## IMPORTANT
-- The source variable is the one that HOLDS untrusted data, not the API object
-- The sink variable is the one that CARRIES untrusted data INTO the dangerous operation
-- Only report HIGH CONFIDENCE findings (>= 0.7)
+- The source variable HOLDS the untrusted data; the sink variable CARRIES it
+  INTO the dangerous operation — never the API/operation object itself
+- Only report findings you are confident about (>= 0.7)
+- Use your own concise snake_case `vulnerability_type` (a well-known name when
+  one fits; a precise novel one otherwise — do NOT force-fit into an unrelated
+  category) plus the best-fitting `cwe_id`
 - If no sources or sinks found, return empty arrays
 
 ## Required Output Format
@@ -231,10 +242,11 @@ Return ONLY valid JSON with NO additional text:
             "line": <line_number>,
             "variable": "<variable_name>",
             "type": "<sink_type>",
-            "vulnerability_type": "<vulnerability_type>",
+            "vulnerability_type": "<your_snake_case_class>",
+            "cwe_id": "<CWE-NNN or CWE-UNKNOWN>",
             "pattern": "<method_or_operation>",
             "confidence": <0.0_to_1.0>,
-            "reasoning": "<explanation>"
+            "reasoning": "<why attacker-controlled data here is dangerous>"
         }}
     ]
 }}

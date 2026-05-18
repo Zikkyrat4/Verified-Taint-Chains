@@ -35,6 +35,11 @@ CWE_MAPPING = {
     VulnerabilityType.PATH_TRAVERSAL: "CWE-22",
     VulnerabilityType.XXE: "CWE-611",
     VulnerabilityType.SSRF: "CWE-918",
+    VulnerabilityType.UNSAFE_DESERIALIZATION: "CWE-502",
+    VulnerabilityType.CODE_INJECTION: "CWE-94",
+    VulnerabilityType.OPEN_REDIRECT: "CWE-601",
+    # OTHER intentionally absent: the CWE comes from the LLM-supplied cwe_id
+    # on the sink (open-vocabulary), resolved in map_to_cwe().
 }
 
 
@@ -42,10 +47,14 @@ CWE_MAPPING = {
 SEVERITY_MAPPING = {
     VulnerabilityType.SQL_INJECTION: "CRITICAL",
     VulnerabilityType.COMMAND_INJECTION: "CRITICAL",
+    VulnerabilityType.UNSAFE_DESERIALIZATION: "CRITICAL",
+    VulnerabilityType.CODE_INJECTION: "CRITICAL",
     VulnerabilityType.XXE: "HIGH",
     VulnerabilityType.SSRF: "HIGH",
     VulnerabilityType.XSS: "MEDIUM",
     VulnerabilityType.PATH_TRAVERSAL: "HIGH",
+    VulnerabilityType.OPEN_REDIRECT: "MEDIUM",
+    VulnerabilityType.OTHER: "MEDIUM",
 }
 
 
@@ -121,7 +130,9 @@ class ExplanationGenerator:
                 how_to_fix=explanation_data["how_to_fix"],
                 example_fix=explanation_data["example_fix"],
                 severity=self.determine_severity(chain),
-                cwe_id=self.map_to_cwe(chain.vulnerability_type),
+                cwe_id=self.map_to_cwe(
+                    chain.vulnerability_type, chain.sink.cwe_id
+                ),
             )
 
             logger.info(f"Generated explanation for chain {chain.id}")
@@ -243,16 +254,30 @@ class ExplanationGenerator:
 
         return overall_confidence
 
-    def map_to_cwe(self, vulnerability_type: VulnerabilityType) -> Optional[str]:
+    def map_to_cwe(
+        self,
+        vulnerability_type: VulnerabilityType,
+        llm_cwe_id: Optional[str] = None,
+    ) -> Optional[str]:
         """Map vulnerability type to CWE identifier.
 
+        For canonical classes the static table wins. For OTHER (an
+        open-vocabulary class the LLM identified that has no named enum
+        member) the LLM-supplied CWE is authoritative — this is what keeps
+        novel / 0-day findings reporting a correct CWE.
+
         Args:
-            vulnerability_type: VulnerabilityType enum value.
+            vulnerability_type: Normalized VulnerabilityType enum value.
+            llm_cwe_id: Raw CWE id the LLM attached to the sink, if any.
 
         Returns:
             CWE identifier (e.g., "CWE-89") or None if unmapped.
         """
         cwe = CWE_MAPPING.get(vulnerability_type)
+        if cwe is None and llm_cwe_id:
+            normalized = llm_cwe_id.strip().upper()
+            if normalized and normalized != "CWE-UNKNOWN":
+                cwe = normalized
         logger.debug(f"Mapped {vulnerability_type.value} to {cwe}")
         return cwe
 

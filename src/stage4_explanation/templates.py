@@ -811,6 +811,93 @@ if (addr.isLoopbackAddress() ||
 
 
 # ============================================================================
+# Open Redirect Template
+# ============================================================================
+
+OPEN_REDIRECT_TEMPLATE = VulnerabilityTemplate(
+    vuln_type=VulnerabilityType.OPEN_REDIRECT,
+    name="Open Redirect",
+    description=(
+        "An Open Redirect occurs when attacker-influenced data is used as the "
+        "target of a redirect or forward without validation against an "
+        "allowlist, letting an attacker send victims to an arbitrary external "
+        "site (phishing, OAuth token theft)."
+    ),
+    attack_scenario=(
+        "**Attack Example:**\n\n"
+        "```java\n"
+        "String url = request.getParameter(\"next\");\n"
+        "response.sendRedirect(url); // url = https://evil.example\n"
+        "```"
+    ),
+    common_pitfalls=[
+        "Blacklisting schemes instead of allowlisting hosts",
+        "Validating only a prefix (bypassed via `//evil.com` or `\\evil.com`)",
+        "Trusting the Referer/Host header for the base URL",
+    ],
+    fix_strategies=[
+        {
+            "title": "Allowlist redirect targets",
+            "description": "Resolve the target against a fixed set of "
+            "permitted internal paths/hosts; reject anything else.",
+            "code_example": "if (!ALLOWED.contains(target)) target = \"/\";",
+        }
+    ],
+    secure_patterns=[
+        "Use server-side mapping keys instead of raw URLs",
+        "Restrict redirects to same-origin relative paths",
+    ],
+    cwe_id="CWE-601",
+    owasp_category="A01:2021 - Broken Access Control",
+    severity_default="MEDIUM",
+    references=["https://cwe.mitre.org/data/definitions/601.html"],
+)
+
+
+# ============================================================================
+# Generic Template (open-vocabulary / novel classes -> VulnerabilityType.OTHER)
+# ============================================================================
+
+GENERIC_TEMPLATE = VulnerabilityTemplate(
+    vuln_type=VulnerabilityType.OTHER,
+    name="Tainted Data Flow",
+    description=(
+        "Attacker-influenced data reaches a security-sensitive operation that "
+        "does not map onto a predefined vulnerability class. The model "
+        "classified it via its own label and CWE (see the finding's "
+        "vulnerability_label / cwe_id); treat it as a candidate weakness and "
+        "review the data flow manually."
+    ),
+    attack_scenario=(
+        "An attacker controls the source value; it propagates along the "
+        "reported path into the sink operation, whose misuse has the security "
+        "impact the model described in its reasoning."
+    ),
+    common_pitfalls=[
+        "Assuming an unfamiliar API is safe because it is not on a known list",
+        "Missing validation between the source and the sink",
+    ],
+    fix_strategies=[
+        {
+            "title": "Validate or encode at the trust boundary",
+            "description": "Constrain the tainted value to an expected, safe "
+            "domain before it reaches the sink (allowlist, canonicalize, "
+            "encode for the sink's context).",
+            "code_example": "// validate `value` against an allowlist before use",
+        }
+    ],
+    secure_patterns=[
+        "Treat all external input as untrusted until validated",
+        "Apply context-appropriate encoding at the sink",
+    ],
+    cwe_id="CWE-UNKNOWN",
+    owasp_category="OWASP - Unclassified / review required",
+    severity_default="MEDIUM",
+    references=["https://owasp.org/www-project-top-ten/"],
+)
+
+
+# ============================================================================
 # Template Registry
 # ============================================================================
 
@@ -821,19 +908,22 @@ TEMPLATE_REGISTRY: Dict[VulnerabilityType, VulnerabilityTemplate] = {
     VulnerabilityType.PATH_TRAVERSAL: PATH_TRAVERSAL_TEMPLATE,
     VulnerabilityType.XXE: XXE_TEMPLATE,
     VulnerabilityType.SSRF: SSRF_TEMPLATE,
+    VulnerabilityType.OPEN_REDIRECT: OPEN_REDIRECT_TEMPLATE,
+    VulnerabilityType.OTHER: GENERIC_TEMPLATE,
 }
 
 
 def get_template(vuln_type: VulnerabilityType) -> VulnerabilityTemplate:
-    """Get template for vulnerability type.
+    """Get the explanation template for a vulnerability type.
+
+    Falls back to the generic template for any class without a dedicated
+    one (including open-vocabulary OTHER findings) so 0-day / novel results
+    still produce a readable report instead of raising.
 
     Args:
-        vuln_type: Vulnerability type.
+        vuln_type: Normalized vulnerability type.
 
     Returns:
-        VulnerabilityTemplate for the type.
-
-    Raises:
-        KeyError: If no template exists for this type.
+        The matching template, or GENERIC_TEMPLATE as a safe default.
     """
-    return TEMPLATE_REGISTRY[vuln_type]
+    return TEMPLATE_REGISTRY.get(vuln_type, GENERIC_TEMPLATE)

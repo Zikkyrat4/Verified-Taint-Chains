@@ -1,6 +1,7 @@
 """Specification extractor using LLM for source and sink detection."""
 
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -79,6 +80,35 @@ class SimpleSpecificationExtractor:
         r"|getAttribute|RuntimeException|throw\s+new"
     )
 
+    @staticmethod
+    def _is_trivial_function(func_code: str) -> bool:
+        """True if a function structurally cannot contain taint logic.
+
+        Structural (not keyword-based) so it never hides a 0-day: a function
+        is trivial only when its body has no method/constructor calls and is
+        at most two statements — i.e. an empty body, a plain field accessor
+        (`return this.x;` / `this.x = x;`), or a constant return. Anything
+        that calls into other code is analyzed.
+        """
+        brace = func_code.find("{")
+        if brace == -1:
+            # No braces: either an abstract/interface decl or a regex-fallback
+            # code chunk. Treat the whole text as the "body" and let the
+            # call/statement heuristic decide — never blanket-skip, so a
+            # brace-less chunk that still contains a sink is not hidden.
+            body = func_code
+        else:
+            body = func_code[brace + 1:]
+            rb = body.rfind("}")
+            if rb != -1:
+                body = body[:rb]
+        # A call site is `name(` — distinct from control keywords. If the body
+        # invokes anything, treat it as non-trivial (could reach a sink).
+        if re.search(r"\b[A-Za-z_]\w*\s*\(", body):
+            return False
+        statements = [s for s in body.split(";") if s.strip()]
+        return len(statements) <= 2
+
     async def extract(
         self, source_code: str, file_path: str = "", model: str = "gpt-4-turbo"
     ) -> Specification:
@@ -114,18 +144,42 @@ class SimpleSpecificationExtractor:
         functions = self._split_into_functions(source_code)
         logger.debug(f"Split code into {len(functions)} functions")
 
+        # Prioritization, NOT exclusion. A keyword-based filter that *drops*
+        # functions blinds the detector to 0-day patterns that use unfamiliar
+        # APIs. Instead: analyze every non-trivial function, ordered so that
+        # functions matching known security patterns go first (useful when a
+        # MAX_FILES/time budget truncates a huge project). Structurally
+        # trivial functions (empty / pure accessors with no calls) carry no
+        # taint logic and are skipped to bound cost without hiding behavior.
+        # `VTC_FAST_PREFILTER=true` restores the old hard skip (debug/CI only).
+        fast_prefilter = os.getenv("VTC_FAST_PREFILTER", "false").lower() in (
+            "true", "1", "yes", "on"
+        )
+
+        analyzable: List[Tuple[str, str, int, Optional[Dict[str, Any]]]] = []
+        skipped_funcs = 0
+        for entry in functions:
+            func_name, func_code = entry[0], entry[1]
+            if self._is_trivial_function(func_code):
+                skipped_funcs += 1
+                continue
+            if fast_prefilter and not self._FUNC_SECURITY_RE.search(func_code):
+                logger.debug(f"[fast] Skipping {func_name}: no security patterns")
+                skipped_funcs += 1
+                continue
+            analyzable.append(entry)
+
+        # Stable-sort: security-pattern hits first, original order preserved
+        # within each group.
+        analyzable.sort(
+            key=lambda e: 0 if self._FUNC_SECURITY_RE.search(e[1]) else 1
+        )
+
         all_sources: List[Source] = []
         all_sinks: List[Sink] = []
 
         # Analyze each function with context — single combined LLM call
-        skipped_funcs = 0
-        for func_name, func_code, line_offset, func_info in functions:
-            # Function-level pre-filter: skip functions with no security patterns
-            if not self._FUNC_SECURITY_RE.search(func_code):
-                logger.debug(f"Skipping function {func_name}: no security patterns")
-                skipped_funcs += 1
-                continue
-
+        for func_name, func_code, line_offset, func_info in analyzable:
             try:
                 logger.debug(f"Analyzing function: {func_name}")
 
@@ -187,8 +241,9 @@ class SimpleSpecificationExtractor:
 
         if skipped_funcs:
             logger.info(
-                f"Skipped {skipped_funcs}/{len(functions)} functions "
-                f"(no security patterns)"
+                f"Analyzed {len(analyzable)}/{len(functions)} functions; "
+                f"skipped {skipped_funcs} "
+                f"({'fast-prefilter' if fast_prefilter else 'structurally trivial only'})"
             )
 
         # Syntactic pre-pass: JSP-tag setter parameters as USER_INPUT sources.
@@ -255,19 +310,17 @@ class SimpleSpecificationExtractor:
                     line_number=resolved_line,
                 )
             snk.sink_category = classify_sink(snk)
-            # LLMs frequently mis-label deserialization / code-injection sinks
-            # as `sql_injection` (the default) or `xss` (because of `readValue`
-            # / `output`). Override based on snippet patterns — much more
-            # reliable than the LLM-supplied vuln_type for these classes.
-            # Also scan ±3 lines around the sink: `_resolve_snippet` sometimes
-            # snaps to a follow-on `return` or assignment line, so the actual
-            # readValue/classForName call lives a line or two before.
-            ctx_lo = max(0, resolved_line - 4)
-            ctx_hi = min(len(source_lines), resolved_line + 3)
-            window = "\n".join(source_lines[ctx_lo:ctx_hi])
-            corrected = self._correct_vuln_type_from_snippet(snippet, window)
-            if corrected is not None:
-                snk.vulnerability_type = corrected
+            # Snippet patterns are a LAST-RESORT normalizer, not an override:
+            # the LLM owns the classification. Only step in when the LLM gave
+            # nothing recognizable (normalized to OTHER) — never overrule a
+            # confident label. This keeps detection LLM-driven.
+            if snk.vulnerability_type is VulnerabilityType.OTHER:
+                ctx_lo = max(0, resolved_line - 4)
+                ctx_hi = min(len(source_lines), resolved_line + 3)
+                window = "\n".join(source_lines[ctx_lo:ctx_hi])
+                corrected = self._correct_vuln_type_from_snippet(snippet, window)
+                if corrected is not None:
+                    snk.vulnerability_type = corrected
 
         # Detect sanitizers using static pattern matching
         all_sanitizers = self.sanitizer_detector.detect(source_code, file_path)
@@ -582,7 +635,19 @@ class SimpleSpecificationExtractor:
                 line = sink_data.get("line")
                 variable = sink_data.get("variable")
                 sink_type = sink_data.get("type")
-                vulnerability_type_str = sink_data.get("vulnerability_type", "SQL_INJECTION")
+                # Open-vocabulary: do NOT default to a concrete class. An
+                # absent/unknown label must normalize to OTHER, never silently
+                # to SQL_INJECTION.
+                vulnerability_type_str = sink_data.get("vulnerability_type", "")
+                raw_label = (vulnerability_type_str or "").strip() or None
+                cwe_id = sink_data.get("cwe_id")
+                if isinstance(cwe_id, (int, float)):
+                    # Some models emit `"cwe_id": 601` instead of "CWE-601".
+                    cwe_id = f"CWE-{int(cwe_id)}"
+                elif isinstance(cwe_id, str):
+                    cwe_id = cwe_id.strip() or None
+                else:
+                    cwe_id = None
                 confidence = float(sink_data.get("confidence", 0.8))
 
                 # Validate required fields
@@ -603,20 +668,27 @@ class SimpleSpecificationExtractor:
                     logger.debug(f"Skipping sink '{variable}' with confidence {confidence}")
                     continue
 
-                # Map vulnerability type string to enum
+                # Normalize the open-vocabulary label to a canonical enum
+                # token. This is a deterministic post-step ONLY: the raw
+                # label and CWE id are preserved on the Sink regardless.
                 try:
                     vuln_type = VulnerabilityType(
-                        vulnerability_type_str.lower().replace("_", "_")
+                        (vulnerability_type_str or "").strip().lower()
                     )
                 except (ValueError, AttributeError):
-                    # Try to infer from sink type instead of always defaulting to SQL_INJECTION
                     vuln_type = self._infer_vulnerability_type(
-                        vulnerability_type_str, sink_type
+                        vulnerability_type_str, sink_type, cwe_id
                     )
-                    logger.warning(
-                        f"Unknown vulnerability type: {vulnerability_type_str}, "
-                        f"inferred as {vuln_type.value}"
-                    )
+                    if vuln_type is VulnerabilityType.OTHER:
+                        logger.info(
+                            f"Open-vocabulary vuln class kept as OTHER: "
+                            f"label={raw_label!r} cwe={cwe_id!r}"
+                        )
+                    else:
+                        logger.debug(
+                            f"Normalized vuln label {vulnerability_type_str!r} "
+                            f"-> {vuln_type.value}"
+                        )
 
                 # Create Sink object
                 location = CodeLocation(
@@ -632,6 +704,8 @@ class SimpleSpecificationExtractor:
                     confidence=confidence,
                     code_snippet="",  # Could be populated from code
                     vulnerability_type=vuln_type,
+                    vulnerability_label=raw_label,
+                    cwe_id=cwe_id,
                     reasoning=sink_data.get("reasoning"),
                 )
 
@@ -692,21 +766,40 @@ class SimpleSpecificationExtractor:
             return VulnerabilityType.CODE_INJECTION
         return None
 
-    @staticmethod
-    def _infer_vulnerability_type(
-        raw_type: str, sink_type: str
-    ) -> VulnerabilityType:
-        """Infer VulnerabilityType from the raw LLM string and sink type.
+    # Maps a CWE id to its canonical enum bucket. Used only as a
+    # normalization aid when the free-text label is unrecognized but the LLM
+    # supplied a CWE — never to invent or override a finding.
+    _CWE_TO_VULN = {
+        "89": VulnerabilityType.SQL_INJECTION,
+        "79": VulnerabilityType.XSS,
+        "78": VulnerabilityType.COMMAND_INJECTION,
+        "22": VulnerabilityType.PATH_TRAVERSAL,
+        "611": VulnerabilityType.XXE,
+        "918": VulnerabilityType.SSRF,
+        "502": VulnerabilityType.UNSAFE_DESERIALIZATION,
+        "94": VulnerabilityType.CODE_INJECTION,
+        "95": VulnerabilityType.CODE_INJECTION,
+        "917": VulnerabilityType.CODE_INJECTION,
+        "601": VulnerabilityType.OPEN_REDIRECT,
+    }
 
-        Falls back based on keyword matching rather than always defaulting
-        to SQL_INJECTION.
+    @classmethod
+    def _infer_vulnerability_type(
+        cls, raw_type: str, sink_type: str, cwe_id: Optional[str] = None
+    ) -> VulnerabilityType:
+        """Normalize a raw LLM label (+ optional CWE) to a canonical enum.
+
+        Deterministic post-normalization only. Unrecognized classes resolve
+        to OTHER (NOT SQL_INJECTION) so genuinely novel / 0-day findings stay
+        visible instead of being silently mislabeled.
 
         Args:
-            raw_type: Raw vulnerability type string from the LLM.
+            raw_type: Raw, open-vocabulary vulnerability label from the LLM.
             sink_type: Sink type string from the LLM.
+            cwe_id: Optional CWE id from the LLM (e.g. "CWE-601").
 
         Returns:
-            Best-matching VulnerabilityType enum value.
+            Canonical VulnerabilityType; OTHER when no confident mapping.
         """
         combined = f"{raw_type} {sink_type}".lower()
 
@@ -732,12 +825,28 @@ class SimpleSpecificationExtractor:
             return VulnerabilityType.PATH_TRAVERSAL
         if any(k in combined for k in ("xxe", "xml", "entity")):
             return VulnerabilityType.XXE
+        # Open-redirect MUST be checked before SSRF: a label like
+        # "url_redirection" contains the bare substring "url", which the SSRF
+        # rule would otherwise greedily claim. "redirect" is the stronger,
+        # more specific signal.
+        if any(k in combined for k in ("open_redirect", "open redirect", "redirect", "sendredirect")):
+            return VulnerabilityType.OPEN_REDIRECT
         if any(k in combined for k in ("ssrf", "url", "http_client", "request_forgery")):
             return VulnerabilityType.SSRF
         if any(k in combined for k in ("sql", "query", "database", "jdbc")):
             return VulnerabilityType.SQL_INJECTION
 
-        return VulnerabilityType.SQL_INJECTION
+        # Free-text didn't match; try the LLM-supplied CWE before giving up.
+        # Strip leading zeros so zero-padded ids ("CWE-079") match the
+        # unpadded keys — must stay consistent with evaluate._cwe_digits.
+        if cwe_id:
+            digits = re.sub(r"\D", "", str(cwe_id)).lstrip("0")
+            mapped = cls._CWE_TO_VULN.get(digits)
+            if mapped is not None:
+                return mapped
+
+        # Genuinely unrecognized: keep it visible as OTHER (0-day candidate).
+        return VulnerabilityType.OTHER
 
     def _extract_imports(self, code: str) -> List[str]:
         """Extract import statements from Java code.

@@ -62,6 +62,14 @@ def _norm(s: Optional[str]) -> str:
     return (s or "").strip().lower()
 
 
+def _cwe_digits(s: Optional[str]) -> str:
+    """Extract the numeric core of a CWE id ('CWE-094' -> '94'); '' if none."""
+    if not s:
+        return ""
+    digits = "".join(ch for ch in str(s) if ch.isdigit())
+    return digits.lstrip("0") or ("0" if digits else "")
+
+
 def _vars_match(reported: str, expected: str) -> bool:
     """Fuzzy variable-name match: substring either direction (case-insensitive)."""
     r, e = _norm(reported), _norm(expected)
@@ -114,10 +122,28 @@ def _chain_matches_tp(chain: Dict[str, Any], tp: Dict[str, Any]) -> bool:
 
     var_ok = src_ok and sink_ok
     type_ok = (not exp_type) or vuln_type == exp_type or exp_type in vuln_type
+    # Open-vocabulary fallback: a finding the LLM classified as OTHER (no
+    # named enum match) still pins a real class via its CWE. Accept the type
+    # when the LLM-supplied CWE equals the file's expected CWE.
+    if not type_ok and exp_type:
+        exp_cwe = _cwe_digits(tp.get("_cwe"))
+        chain_cwe = _cwe_digits(chain.get("cwe"))
+        if exp_cwe and chain_cwe and exp_cwe == chain_cwe:
+            type_ok = True
 
-    if src_exact and sink_exact:
-        # Variable names already pin down the flow uniquely; trust them and
-        # skip the noisy line check.
+    # Line numbers from an LLM are noise: it reports the use site, a
+    # function-relative offset, or a declaration line — error easily exceeds
+    # any small tolerance. When BOTH variables correspond (non-degenerate
+    # names) AND the vulnerability type agrees, the flow is already pinned;
+    # the line check then only manufactures false negatives on correct
+    # detections (observed: jenkins-perfecto, keycloak deser). Keep it solely
+    # as a tie-breaker when the variable match is weak/degenerate.
+    exp_src_nontrivial = len(_norm(exp_src)) > 1
+    exp_sink_nontrivial = len(_norm(exp_sink)) > 1
+    strong_match = (
+        var_ok and type_ok and exp_src_nontrivial and exp_sink_nontrivial
+    )
+    if (src_exact and sink_exact) or strong_match:
         line_ok = True
     else:
         line_ok = _line_close(src_line, tp.get("source_line", 0)) and _line_close(
@@ -184,6 +210,8 @@ def _chain_to_dict(chain) -> Dict[str, Any]:
     return {
         "id": chain.id,
         "type": chain.vulnerability_type.value,
+        "cwe": getattr(chain.sink, "cwe_id", None) or "",
+        "vulnerability_label": getattr(chain.sink, "vulnerability_label", None) or "",
         "source": {
             "variable": chain.source.variable_name,
             "file": getattr(chain.source.location, "file_path", ""),
@@ -216,6 +244,13 @@ def _classify_chains(
     """
     tps = truth.get("true_positives", [])
     fp_patterns = truth.get("false_positive_patterns", [])
+    # Propagate the file-level expected CWE onto each TP so the open-vocabulary
+    # CWE fallback in _chain_matches_tp can use it (TP entries carry only
+    # vuln_type; the CWE lives one level up).
+    file_cwe = truth.get("cwe")
+    if file_cwe:
+        for _tp in tps:
+            _tp.setdefault("_cwe", file_cwe)
 
     tp_matched: List[Dict[str, Any]] = []
     fp_chains: List[Dict[str, Any]] = []

@@ -4,6 +4,7 @@
     "OIDCLoginProtocol.java": {
       "cve": "CVE-2024-2419",
       "vulnerability": "Open Redirect (CWE-601)",
+      "cwe": "CWE-601",
       "true_positives": [
         {
           "id": "TP-1",
@@ -11,7 +12,7 @@
           "sink_var": "redirectUri",
           "source_line": 215,
           "sink_line": 303,
-          "vuln_type": "xss",
+          "vuln_type": "open_redirect",
           "description": "authSession.getRedirectUri() -> redirectUri.build() in authenticated()"
         },
         {
@@ -20,7 +21,7 @@
           "sink_var": "redirectUri",
           "source_line": 321,
           "sink_line": 345,
-          "vuln_type": "xss",
+          "vuln_type": "open_redirect",
           "description": "authSession.getRedirectUri() -> redirectUri.build() in sendError()"
         },
         {
@@ -29,20 +30,47 @@
           "sink_var": "finalRedirectUri",
           "source_line": 392,
           "sink_line": 400,
-          "vuln_type": "xss",
+          "vuln_type": "open_redirect",
           "description": "logoutSession.getAuthNote(LOGOUT_REDIRECT_URI) -> renderLogoutPage()"
         }
       ],
       "false_positive_patterns": [
-        {"sink_pattern": "event\\.detail", "reason": "Event/audit logging is not a dangerous sink"},
-        {"source_pattern": "STATE_PARAM|NONCE_PARAM|ISSUER|KC_ACTION", "reason": "Server-controlled framework values"},
-        {"sink_pattern": "new AuthenticationSessionManager", "reason": "Framework constructor"},
-        {"sink_pattern": "new ResourceAdminManager", "reason": "Framework constructor"},
-        {"sink_pattern": "new OAuth2Code", "reason": "Internal object creation"},
-        {"sink_pattern": "session\\.tokens\\(\\)\\.encode", "reason": "Internal admin API"},
-        {"source_var": "session", "reason": "Framework setter field"},
-        {"source_var": "realm", "reason": "Framework setter field"},
-        {"source_var": "uriInfo", "reason": "Framework setter field"}
+        {
+          "sink_pattern": "event\\.detail",
+          "reason": "Event/audit logging is not a dangerous sink"
+        },
+        {
+          "source_pattern": "STATE_PARAM|NONCE_PARAM|ISSUER|KC_ACTION",
+          "reason": "Server-controlled framework values"
+        },
+        {
+          "sink_pattern": "new AuthenticationSessionManager",
+          "reason": "Framework constructor"
+        },
+        {
+          "sink_pattern": "new ResourceAdminManager",
+          "reason": "Framework constructor"
+        },
+        {
+          "sink_pattern": "new OAuth2Code",
+          "reason": "Internal object creation"
+        },
+        {
+          "sink_pattern": "session\\.tokens\\(\\)\\.encode",
+          "reason": "Internal admin API"
+        },
+        {
+          "source_var": "session",
+          "reason": "Framework setter field"
+        },
+        {
+          "source_var": "realm",
+          "reason": "Framework setter field"
+        },
+        {
+          "source_var": "uriInfo",
+          "reason": "Framework setter field"
+        }
       ]
     },
     "SerializedBrokeredIdentityContext.java": {
@@ -87,13 +115,34 @@
         }
       ],
       "false_positive_patterns": [
-        {"sink_pattern": "JsonSerialization\\.writeValueAsBytes", "reason": "Serialization (write), not deserialization"},
-        {"sink_pattern": "Base64Url\\.encode", "reason": "Encoding, not dangerous"},
-        {"sink_pattern": "authSession\\.setAuthNote", "reason": "Writing to session, not executing"},
-        {"sink_pattern": "new BrokeredIdentityContext", "reason": "Constructor with internal ID"},
-        {"sink_pattern": "ctx\\.set\\w+", "reason": "Internal setters on new object"},
-        {"sink_pattern": "new SerializedBrokeredIdentityContext", "reason": "Internal constructor"},
-        {"source_pattern": "getId\\(\\)|getBrokerUsername\\(\\)|getEmail\\(\\)|getFirstAttribute", "reason": "Internal getters"}
+        {
+          "sink_pattern": "JsonSerialization\\.writeValueAsBytes",
+          "reason": "Serialization (write), not deserialization"
+        },
+        {
+          "sink_pattern": "Base64Url\\.encode",
+          "reason": "Encoding, not dangerous"
+        },
+        {
+          "sink_pattern": "authSession\\.setAuthNote",
+          "reason": "Writing to session, not executing"
+        },
+        {
+          "sink_pattern": "new BrokeredIdentityContext",
+          "reason": "Constructor with internal ID"
+        },
+        {
+          "sink_pattern": "ctx\\.set\\w+",
+          "reason": "Internal setters on new object"
+        },
+        {
+          "sink_pattern": "new SerializedBrokeredIdentityContext",
+          "reason": "Internal constructor"
+        },
+        {
+          "source_pattern": "getId\\(\\)|getBrokerUsername\\(\\)|getEmail\\(\\)|getFirstAttribute",
+          "reason": "Internal getters"
+        }
       ]
     },
     "CVE-2022-3782/RedirectUtils.java": {
@@ -113,10 +162,22 @@
         }
       ],
       "false_positive_patterns": [
-        {"sink_pattern": "session\\.getContext\\(\\)|client\\.get(RedirectUris|RootUrl)", "reason": "Internal context / validated client config"},
-        {"sink_pattern": "logger\\.debug", "reason": "Logging"},
-        {"sink_pattern": "new StringBuilder|sb\\.append", "reason": "Local string assembly"},
-        {"sink_pattern": "Urls\\.realmInstalledAppUrnCallback", "reason": "Internal URL builder"}
+        {
+          "sink_pattern": "session\\.getContext\\(\\)|client\\.get(RedirectUris|RootUrl)",
+          "reason": "Internal context / validated client config"
+        },
+        {
+          "sink_pattern": "logger\\.debug",
+          "reason": "Logging"
+        },
+        {
+          "sink_pattern": "new StringBuilder|sb\\.append",
+          "reason": "Local string assembly"
+        },
+        {
+          "sink_pattern": "Urls\\.realmInstalledAppUrnCallback",
+          "reason": "Internal URL builder"
+        }
       ]
     },
     "CVE-2022-4361/SamlService.java": {
@@ -134,12 +195,30 @@
         }
       ],
       "false_positive_patterns": [
-        {"sink_pattern": "new SamlClient", "reason": "Framework constructor"},
-        {"sink_pattern": "validateDestination|getBindingType", "reason": "Validation / type lookup"},
-        {"sink_pattern": "client\\.getAttribute", "reason": "Internal client config"},
-        {"sink_pattern": "event\\.error|event\\.detail", "reason": "Audit logging"},
-        {"sink_pattern": "authSession\\.setClientNote|authSession\\.setProtocol", "reason": "Internal session fields"},
-        {"sink_pattern": "createAuthenticationSession", "reason": "Framework method"}
+        {
+          "sink_pattern": "new SamlClient",
+          "reason": "Framework constructor"
+        },
+        {
+          "sink_pattern": "validateDestination|getBindingType",
+          "reason": "Validation / type lookup"
+        },
+        {
+          "sink_pattern": "client\\.getAttribute",
+          "reason": "Internal client config"
+        },
+        {
+          "sink_pattern": "event\\.error|event\\.detail",
+          "reason": "Audit logging"
+        },
+        {
+          "sink_pattern": "authSession\\.setClientNote|authSession\\.setProtocol",
+          "reason": "Internal session fields"
+        },
+        {
+          "sink_pattern": "createAuthenticationSession",
+          "reason": "Framework method"
+        }
       ]
     }
   },

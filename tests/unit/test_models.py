@@ -31,6 +31,8 @@ class TestVulnerabilityTypeEnum:
             "ssrf",
             "deserialization",
             "code_injection",
+            "open_redirect",
+            "other",
         }
         actual_types = {v.value for v in VulnerabilityType}
         assert actual_types == expected_types

@@ -76,8 +76,10 @@ class TestClassifySourceSessionData:
         src = _make_source('Object val = session.getAttribute("user");')
         assert classify_source(src) == SourceCategory.SESSION_DATA
 
-    def test_get_auth_note(self) -> None:
-        src = _make_source('String note = authSession.getAuthNote("attempt");')
+    def test_get_note(self) -> None:
+        # Product-agnostic session-note accessor (replaces the former
+        # keycloak-specific getAuthNote case).
+        src = _make_source('String note = session.getNote("attempt");')
         assert classify_source(src) == SourceCategory.SESSION_DATA
 
     def test_get_authenticated_user(self) -> None:

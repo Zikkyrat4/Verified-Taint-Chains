@@ -1,9 +1,9 @@
 {
   "aggregate": {
     "total_tp": 0,
-    "total_fp": 1,
+    "total_fp": 8,
     "total_fn": 1,
-    "total_unclassified": 0,
+    "total_unclassified": 15,
     "expected_tp": 1,
     "precision": 0.0,
     "precision_strict": 0.0,
@@ -18,15 +18,17 @@
       "cve": "CVE-2022-22965",
       "expected_tp": 1,
       "found_tp": 0,
-      "fp": 1,
+      "fp": 8,
       "fn": 1,
-      "unclassified": 0,
+      "unclassified": 15,
       "tp_matched": [],
       "fp_chains": [
         {
           "chain": {
-            "id": "beanClass_to_pd_4826433536",
-            "type": "sql_injection",
+            "id": "beanClass_to_pd_4824723968",
+            "type": "ssrf",
+            "cwe": "CWE-918",
+            "vulnerability_label": "untrusted_data_injection",
             "source": {
               "variable": "beanClass",
               "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
@@ -43,11 +45,216 @@
               "beanClass",
               "pd"
             ],
-            "confidence": 0.7
+            "confidence": 0.85
           },
           "fp_pattern": {
             "source_pattern": "ifc|currClass|existingPd|pd\\.getName",
             "reason": "Internal iteration variables"
+          }
+        },
+        {
+          "chain": {
+            "id": "beanClass_to_results_4860129408",
+            "type": "other",
+            "cwe": "CWE-904",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "beanClass",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 360,
+              "code_snippet": "return new GenericTypeAwarePropertyDescriptor(beanClass, pd.getName(), pd.getReadMethod(),"
+            },
+            "sink": {
+              "variable": "results",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 192,
+              "code_snippet": "CachedIntrospectionResults existing = classCacheToUse.putIfAbsent(beanClass, results);"
+            },
+            "path": [
+              "beanClass",
+              "results"
+            ],
+            "confidence": 0.8999999999999999
+          },
+          "fp_pattern": {
+            "sink_pattern": "strongClassCache\\.|softClassCache\\.|classCacheToUse\\.",
+            "reason": "Internal cache mutations"
+          }
+        },
+        {
+          "chain": {
+            "id": "beanClass_to_beanInfo_4861555968",
+            "type": "other",
+            "cwe": "CWE-904",
+            "vulnerability_label": "untrusted_data_injection",
+            "source": {
+              "variable": "beanClass",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 360,
+              "code_snippet": "return new GenericTypeAwarePropertyDescriptor(beanClass, pd.getName(), pd.getReadMethod(),"
+            },
+            "sink": {
+              "variable": "beanInfo",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 245,
+              "code_snippet": "return beanInfo;"
+            },
+            "path": [
+              "beanClass",
+              "beanInfo"
+            ],
+            "confidence": 0.875
+          },
+          "fp_pattern": {
+            "source_pattern": "ifc|currClass|existingPd|pd\\.getName",
+            "reason": "Internal iteration variables"
+          }
+        },
+        {
+          "chain": {
+            "id": "beanClass_to_pd_4831931776",
+            "type": "xss",
+            "cwe": "CWE-913",
+            "vulnerability_label": "untrusted_data_in_propertydescriptor",
+            "source": {
+              "variable": "beanClass",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 360,
+              "code_snippet": "return new GenericTypeAwarePropertyDescriptor(beanClass, pd.getName(), pd.getReadMethod(),"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 320,
+              "code_snippet": "(existingPd.getReadMethod() == null && pd.getReadMethod() != null)) {"
+            },
+            "path": [
+              "beanClass",
+              "pd"
+            ],
+            "confidence": 0.8999999999999999
+          },
+          "fp_pattern": {
+            "source_pattern": "ifc|currClass|existingPd|pd\\.getName",
+            "reason": "Internal iteration variables"
+          }
+        },
+        {
+          "chain": {
+            "id": "beanClass_to_existingPd_5173873792",
+            "type": "xss",
+            "cwe": "CWE-913",
+            "vulnerability_label": "untrusted_data_in_propertydescriptor",
+            "source": {
+              "variable": "beanClass",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 360,
+              "code_snippet": "return new GenericTypeAwarePropertyDescriptor(beanClass, pd.getName(), pd.getReadMethod(),"
+            },
+            "sink": {
+              "variable": "existingPd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 320,
+              "code_snippet": "(existingPd.getReadMethod() == null && pd.getReadMethod() != null)) {"
+            },
+            "path": [
+              "beanClass",
+              "pd",
+              "existingPd"
+            ],
+            "confidence": 0.8999999999999999
+          },
+          "fp_pattern": {
+            "source_pattern": "ifc|currClass|existingPd|pd\\.getName",
+            "reason": "Internal iteration variables"
+          }
+        },
+        {
+          "chain": {
+            "id": "beanClass_to_pd_5171955200",
+            "type": "other",
+            "cwe": "CWE-703",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "beanClass",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 360,
+              "code_snippet": "return new GenericTypeAwarePropertyDescriptor(beanClass, pd.getName(), pd.getReadMethod(),"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 348,
+              "code_snippet": "pd = this.propertyDescriptors.get(StringUtils.capitalize(name));"
+            },
+            "path": [
+              "beanClass",
+              "pd"
+            ],
+            "confidence": 0.925
+          },
+          "fp_pattern": {
+            "source_pattern": "ifc|currClass|existingPd|pd\\.getName",
+            "reason": "Internal iteration variables"
+          }
+        },
+        {
+          "chain": {
+            "id": "beanClass_to_existing_5173437504",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "beanClass",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 360,
+              "code_snippet": "return new GenericTypeAwarePropertyDescriptor(beanClass, pd.getName(), pd.getReadMethod(),"
+            },
+            "sink": {
+              "variable": "existing",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 370,
+              "code_snippet": "return (existing != null ? existing : td);"
+            },
+            "path": [
+              "beanClass",
+              "existing"
+            ],
+            "confidence": 0.975
+          },
+          "fp_pattern": {
+            "source_pattern": "ifc|currClass|existingPd|pd\\.getName",
+            "reason": "Internal iteration variables"
+          }
+        },
+        {
+          "chain": {
+            "id": "classLoader_to_results_4832302144",
+            "type": "other",
+            "cwe": "CWE-904",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "classLoader",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 143,
+              "code_snippet": "acceptedClassLoaders.add(classLoader);"
+            },
+            "sink": {
+              "variable": "results",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 192,
+              "code_snippet": "CachedIntrospectionResults existing = classCacheToUse.putIfAbsent(beanClass, results);"
+            },
+            "path": [
+              "classLoader",
+              "softClassCache",
+              "results"
+            ],
+            "confidence": 0.8999999999999999
+          },
+          "fp_pattern": {
+            "sink_pattern": "strongClassCache\\.|softClassCache\\.|classCacheToUse\\.",
+            "reason": "Internal cache mutations"
           }
         }
       ],
@@ -59,20 +266,402 @@
           "source_line": 269,
           "sink_line": 274,
           "vuln_type": "command_injection",
-          "description": "Constructor beanClass parameter (request-derived via data binding) -> getBeanInfo(beanClass) -> Introspector.getBeanInfo, exposing classLoader/protectionDomain getters that can be reached via property paths like class.module.classLoader.URLs[0]"
+          "description": "Constructor beanClass parameter (request-derived via data binding) -> getBeanInfo(beanClass) -> Introspector.getBeanInfo, exposing classLoader/protectionDomain getters that can be reached via property paths like class.module.classLoader.URLs[0]",
+          "_cwe": "CWE-094"
         }
       ],
-      "unclassified_chains": [],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "pd_to_existingPd_5173432704",
+            "type": "xss",
+            "cwe": "CWE-913",
+            "vulnerability_label": "untrusted_data_in_propertydescriptor",
+            "source": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 361,
+              "code_snippet": "pd.getWriteMethod(), pd.getPropertyEditorClass());"
+            },
+            "sink": {
+              "variable": "existingPd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 320,
+              "code_snippet": "(existingPd.getReadMethod() == null && pd.getReadMethod() != null)) {"
+            },
+            "path": [
+              "pd",
+              "existingPd"
+            ],
+            "confidence": 0.8999999999999999
+          }
+        },
+        {
+          "chain": {
+            "id": "pd_to_existing_4860576128",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 361,
+              "code_snippet": "pd.getWriteMethod(), pd.getPropertyEditorClass());"
+            },
+            "sink": {
+              "variable": "existing",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 370,
+              "code_snippet": "return (existing != null ? existing : td);"
+            },
+            "path": [
+              "pd",
+              "existing"
+            ],
+            "confidence": 0.975
+          }
+        },
+        {
+          "chain": {
+            "id": "classLoader_to_existing_5171955200",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "classLoader",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 143,
+              "code_snippet": "acceptedClassLoaders.add(classLoader);"
+            },
+            "sink": {
+              "variable": "existing",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 370,
+              "code_snippet": "return (existing != null ? existing : td);"
+            },
+            "path": [
+              "classLoader",
+              "softClassCache",
+              "results",
+              "existing"
+            ],
+            "confidence": 0.975
+          }
+        },
+        {
+          "chain": {
+            "id": "candidate_to_classLoaderToCheck_5173432448",
+            "type": "other",
+            "cwe": "CWE-913",
+            "vulnerability_label": "untrusted_data_injection",
+            "source": {
+              "variable": "candidate",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 219,
+              "code_snippet": "if (candidate == parent) {"
+            },
+            "sink": {
+              "variable": "classLoaderToCheck",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 225,
+              "code_snippet": "ClassLoader classLoaderToCheck = candidate;"
+            },
+            "path": [
+              "candidate",
+              "classLoaderToCheck"
+            ],
+            "confidence": 0.8999999999999999
+          }
+        },
+        {
+          "chain": {
+            "id": "name_to_pd_5169890176",
+            "type": "ssrf",
+            "cwe": "CWE-918",
+            "vulnerability_label": "untrusted_data_injection",
+            "source": {
+              "variable": "name",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 346,
+              "code_snippet": "pd = this.propertyDescriptors.get(StringUtils.uncapitalize(name));"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 361,
+              "code_snippet": "pd.getWriteMethod(), pd.getPropertyEditorClass());"
+            },
+            "path": [
+              "name",
+              "pd"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "name_to_pd_4811150912",
+            "type": "xss",
+            "cwe": "CWE-913",
+            "vulnerability_label": "untrusted_data_in_propertydescriptor",
+            "source": {
+              "variable": "name",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 346,
+              "code_snippet": "pd = this.propertyDescriptors.get(StringUtils.uncapitalize(name));"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 320,
+              "code_snippet": "(existingPd.getReadMethod() == null && pd.getReadMethod() != null)) {"
+            },
+            "path": [
+              "name",
+              "pd"
+            ],
+            "confidence": 0.875
+          }
+        },
+        {
+          "chain": {
+            "id": "name_to_existingPd_5173436608",
+            "type": "xss",
+            "cwe": "CWE-913",
+            "vulnerability_label": "untrusted_data_in_propertydescriptor",
+            "source": {
+              "variable": "name",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 346,
+              "code_snippet": "pd = this.propertyDescriptors.get(StringUtils.uncapitalize(name));"
+            },
+            "sink": {
+              "variable": "existingPd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 320,
+              "code_snippet": "(existingPd.getReadMethod() == null && pd.getReadMethod() != null)) {"
+            },
+            "path": [
+              "name",
+              "pd",
+              "existingPd"
+            ],
+            "confidence": 0.875
+          }
+        },
+        {
+          "chain": {
+            "id": "name_to_pd_5171767424",
+            "type": "other",
+            "cwe": "CWE-703",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "name",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 346,
+              "code_snippet": "pd = this.propertyDescriptors.get(StringUtils.uncapitalize(name));"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 348,
+              "code_snippet": "pd = this.propertyDescriptors.get(StringUtils.capitalize(name));"
+            },
+            "path": [
+              "name",
+              "pd"
+            ],
+            "confidence": 0.9
+          }
+        },
+        {
+          "chain": {
+            "id": "name_to_existing_5171610624",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "name",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 346,
+              "code_snippet": "pd = this.propertyDescriptors.get(StringUtils.uncapitalize(name));"
+            },
+            "sink": {
+              "variable": "existing",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 370,
+              "code_snippet": "return (existing != null ? existing : td);"
+            },
+            "path": [
+              "name",
+              "pd",
+              "existing"
+            ],
+            "confidence": 0.95
+          }
+        },
+        {
+          "chain": {
+            "id": "propertyDescriptors_to_pd_5171589760",
+            "type": "ssrf",
+            "cwe": "CWE-918",
+            "vulnerability_label": "untrusted_data_injection",
+            "source": {
+              "variable": "propertyDescriptors",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 355,
+              "code_snippet": "return this.propertyDescriptors.values().toArray(EMPTY_PROPERTY_DESCRIPTOR_ARRAY);"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 361,
+              "code_snippet": "pd.getWriteMethod(), pd.getPropertyEditorClass());"
+            },
+            "path": [
+              "propertyDescriptors",
+              "pd"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "propertyDescriptors_to_pd_5171591040",
+            "type": "xss",
+            "cwe": "CWE-913",
+            "vulnerability_label": "untrusted_data_in_propertydescriptor",
+            "source": {
+              "variable": "propertyDescriptors",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 355,
+              "code_snippet": "return this.propertyDescriptors.values().toArray(EMPTY_PROPERTY_DESCRIPTOR_ARRAY);"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 320,
+              "code_snippet": "(existingPd.getReadMethod() == null && pd.getReadMethod() != null)) {"
+            },
+            "path": [
+              "propertyDescriptors",
+              "pd"
+            ],
+            "confidence": 0.875
+          }
+        },
+        {
+          "chain": {
+            "id": "propertyDescriptors_to_existingPd_5171586368",
+            "type": "xss",
+            "cwe": "CWE-913",
+            "vulnerability_label": "untrusted_data_in_propertydescriptor",
+            "source": {
+              "variable": "propertyDescriptors",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 355,
+              "code_snippet": "return this.propertyDescriptors.values().toArray(EMPTY_PROPERTY_DESCRIPTOR_ARRAY);"
+            },
+            "sink": {
+              "variable": "existingPd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 320,
+              "code_snippet": "(existingPd.getReadMethod() == null && pd.getReadMethod() != null)) {"
+            },
+            "path": [
+              "propertyDescriptors",
+              "existingPd"
+            ],
+            "confidence": 0.875
+          }
+        },
+        {
+          "chain": {
+            "id": "propertyDescriptors_to_pd_4860526080",
+            "type": "other",
+            "cwe": "CWE-703",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "propertyDescriptors",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 355,
+              "code_snippet": "return this.propertyDescriptors.values().toArray(EMPTY_PROPERTY_DESCRIPTOR_ARRAY);"
+            },
+            "sink": {
+              "variable": "pd",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 348,
+              "code_snippet": "pd = this.propertyDescriptors.get(StringUtils.capitalize(name));"
+            },
+            "path": [
+              "propertyDescriptors",
+              "pd"
+            ],
+            "confidence": 0.9
+          }
+        },
+        {
+          "chain": {
+            "id": "propertyDescriptors_to_existing_4860226496",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "propertyDescriptors",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 355,
+              "code_snippet": "return this.propertyDescriptors.values().toArray(EMPTY_PROPERTY_DESCRIPTOR_ARRAY);"
+            },
+            "sink": {
+              "variable": "existing",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 370,
+              "code_snippet": "return (existing != null ? existing : td);"
+            },
+            "path": [
+              "propertyDescriptors",
+              "pd",
+              "existing"
+            ],
+            "confidence": 0.95
+          }
+        },
+        {
+          "chain": {
+            "id": "td_to_existing_4811379328",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "taint_analysis_vulnerability",
+            "source": {
+              "variable": "td",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 370,
+              "code_snippet": "return (existing != null ? existing : td);"
+            },
+            "sink": {
+              "variable": "existing",
+              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/spring-framework/CVE-2022-22965/CachedIntrospectionResults.java",
+              "line": 370,
+              "code_snippet": "return (existing != null ? existing : td);"
+            },
+            "path": [
+              "td",
+              "existing"
+            ],
+            "confidence": 0.975
+          }
+        }
+      ],
       "pipeline_metrics": {
-        "sources_found": 2,
-        "sinks_found": 1,
+        "sources_found": 17,
+        "sinks_found": 18,
         "sanitizers_found": 0,
-        "chains_found": 1,
-        "chains_verified": 1,
-        "verification_rate": 1.0,
-        "explanations_generated": 1,
-        "graph_nodes": 441,
-        "graph_edges": 107
+        "chains_found": 29,
+        "chains_verified": 23,
+        "verification_rate": 0.7931034482758621,
+        "explanations_generated": 23,
+        "graph_nodes": 445,
+        "graph_edges": 131
       },
       "error": null
     }

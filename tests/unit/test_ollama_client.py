@@ -97,10 +97,12 @@ class TestOllamaClient:
         result = await client._make_api_call(messages, temperature=0.5, max_tokens=200)
 
         assert result == "test response from ollama"
+        # num_predict is floored at OLLAMA_MIN_NUM_PREDICT (default 4096) so
+        # reasoning-heavy models don't truncate the trailing JSON.
         mock_client.chat.assert_called_once_with(
             model="llama3:latest",
             messages=messages,
-            options={"temperature": 0.5, "num_predict": 200},
+            options={"temperature": 0.5, "num_predict": 4096},
             format="json",
         )
 

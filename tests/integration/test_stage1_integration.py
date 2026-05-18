@@ -368,12 +368,15 @@ class TestSpecificationExtractorWithMocks:
         }"""
 
         with patch.object(client, "chat_with_json_prompt", new_callable=AsyncMock) as mock_analyze:
-            # No security patterns in code, so LLM is never called
+            mock_analyze.return_value = {"sources": [], "sinks": []}
             spec = await extractor.extract(code, "SafeService.java")
 
         assert len(spec.sources) == 0
         assert len(spec.sinks) == 0
-        mock_analyze.assert_not_called()
+        # The function is non-trivial (it makes a call), so it IS sent to the
+        # LLM — detection is prioritization, not keyword exclusion. Emptiness
+        # comes from the model's verdict, not from skipping the code.
+        mock_analyze.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_specification_extractor_confidence_filtering(self) -> None:

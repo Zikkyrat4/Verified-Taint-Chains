@@ -260,8 +260,16 @@ class TestRunProject:
     """Tests for run_project (unified cross-file analysis)."""
 
     @pytest.mark.asyncio
-    async def test_run_project_only_extracts_relevant_files(self, test_config, tmp_path):
-        """Verify spec_extractor.extract is called only for security-relevant files."""
+    async def test_run_project_analyzes_all_files_by_default(
+        self, test_config, tmp_path, monkeypatch
+    ):
+        """Default: every file is analyzed (priority, NOT exclusion).
+
+        Keyword-filtering files away blinds the detector to 0-day patterns
+        that use unfamiliar APIs, so both the security-matching and the
+        non-matching file must reach the extractor.
+        """
+        monkeypatch.delenv("VTC_FAST_PREFILTER", raising=False)
         relevant = tmp_path / "Controller.java"
         irrelevant = tmp_path / "Model.java"
         relevant.write_text('String q = request.getParameter("q"); stmt.executeQuery(q);')
@@ -280,7 +288,35 @@ class TestRunProject:
 
         result = await pipeline.run_project([str(relevant), str(irrelevant)])
 
-        # Only 1 relevant file should trigger LLM extraction
+        assert mock_extractor.extract.call_count == 2
+        assert result["files_llm_extracted"] == 2
+        assert result["files_skipped"] == 0
+        assert result["files_analyzed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_run_project_fast_prefilter_excludes_irrelevant(
+        self, test_config, tmp_path, monkeypatch
+    ):
+        """VTC_FAST_PREFILTER=true restores the old exclude-irrelevant path."""
+        monkeypatch.setenv("VTC_FAST_PREFILTER", "true")
+        relevant = tmp_path / "Controller.java"
+        irrelevant = tmp_path / "Model.java"
+        relevant.write_text('String q = request.getParameter("q"); stmt.executeQuery(q);')
+        irrelevant.write_text("public class Model { private int id; }")
+
+        mock_spec = MagicMock()
+        mock_spec.sources = []
+        mock_spec.sinks = []
+        mock_spec.sanitizers = []
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract = AsyncMock(return_value=mock_spec)
+
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor = mock_extractor
+
+        result = await pipeline.run_project([str(relevant), str(irrelevant)])
+
         assert mock_extractor.extract.call_count == 1
         assert result["files_llm_extracted"] == 1
         assert result["files_skipped"] == 1

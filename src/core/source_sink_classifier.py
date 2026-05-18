@@ -31,16 +31,14 @@ _SOURCE_PATTERNS: List[Tuple[re.Pattern, SourceCategory]] = [
     (re.compile(
         r"FileReader\(|readLine\(|readAllBytes\(|InputStream"
         r"|deserialize\(|readObject\(|Scanner\(|BufferedReader\("
-        r"|getAssertionConsumerServiceURL\(|getProtocolBinding\("
-        r"|JsonSerialization\.readValue\(|ObjectMapper\.readValue\("
+        r"|\.readValue\("
     ), SourceCategory.EXTERNAL_DATA),
 
-    # SESSION_DATA — session attributes, auth notes, authenticated user
+    # SESSION_DATA — server-side session/identity accessors (product-agnostic)
     (re.compile(
-        r"getSession\(|getAttribute\(|getAuthNote\(|getNote\("
+        r"getSession\(|getAttribute\(|getNote\("
         r"|getClaim\(|getAuthenticatedUser\(|getPrincipal\("
         r"|getCredentials\(|session\.get|getRedirectUri\("
-        r"|getClientNote\("
     ), SourceCategory.SESSION_DATA),
 
     # DATABASE — query results, entity properties

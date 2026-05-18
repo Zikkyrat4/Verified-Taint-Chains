@@ -1,6 +1,7 @@
 """Main pipeline orchestrator for security analysis."""
 
 import asyncio
+import os
 import re
 import time
 from pathlib import Path
@@ -213,8 +214,8 @@ class SimplePipeline:
                 irrelevant.append((java_file, code))
 
         logger.info(
-            f"File filter: {len(relevant)}/{len(java_files)} files are security-relevant "
-            f"({len(irrelevant)} skipped for LLM extraction)"
+            f"File priority: {len(relevant)}/{len(java_files)} files match known "
+            f"security patterns (analyzed first); {len(irrelevant)} analyzed after"
         )
         return relevant, irrelevant
 
@@ -250,8 +251,24 @@ class SimplePipeline:
         logger.info(f"Starting project-mode analysis on {len(java_files)} files")
 
         try:
-            # Partition files by security relevance
+            # Partition files by security relevance — used for ORDERING, not
+            # exclusion. Analyzing only keyword-matching files blinds the
+            # detector to 0-day patterns in files using unfamiliar APIs, so
+            # every file is analyzed (security-matching ones first). The old
+            # exclude-irrelevant behavior is opt-in via VTC_FAST_PREFILTER
+            # (debug/CI only).
             relevant, irrelevant = self._partition_files(java_files)
+            fast_prefilter = os.getenv(
+                "VTC_FAST_PREFILTER", "false"
+            ).lower() in ("true", "1", "yes", "on")
+            if fast_prefilter:
+                logger.info(
+                    f"[fast] Excluding {len(irrelevant)} non-matching files "
+                    f"from Stage 1"
+                )
+            else:
+                relevant = relevant + irrelevant
+                irrelevant = []
 
             # Stage 1: concurrent per-file extraction on relevant files only
             all_sources: List = []
@@ -747,10 +764,11 @@ class SimplePipeline:
         # path discovery routes spurious cross-method "flows" through them
         # because the graph treats them as connectors. Endpoint usage
         # (source or sink) is fine; only the intermediate role is suspect.
-        # Conservative list — chosen from observed SAML/OIDC noise patterns.
+        # Generic shared-connector field names common to many Java web/MVC
+        # frameworks (not specific to any product).
         _HUB_NODES = frozenset({
             "session", "responseBuilder", "clientSession", "clientSessionCtx",
-            "userSession", "authSession", "event", "auditEvent",
+            "userSession", "event", "auditEvent", "context", "builder",
         })
         kept: List[TaintChain] = []
         hub_dropped = 0

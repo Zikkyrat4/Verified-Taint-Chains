@@ -42,6 +42,13 @@ class VulnerabilityType(str, Enum):
     SSRF = "ssrf"
     UNSAFE_DESERIALIZATION = "deserialization"
     CODE_INJECTION = "code_injection"
+    OPEN_REDIRECT = "open_redirect"
+    # Canonical bucket for any vulnerability class the LLM identifies that
+    # does not map onto a named member above. The detector stays
+    # open-vocabulary: the LLM's raw label and CWE id are preserved on the
+    # Sink (vulnerability_label / cwe_id); this enum value only exists so
+    # downstream code keyed on a closed set still has a total mapping.
+    OTHER = "other"
 
 
 class VerificationStatus(str, Enum):
@@ -130,6 +137,14 @@ class Sink(BaseModel):
     confidence: float
     code_snippet: str
     vulnerability_type: VulnerabilityType
+    # Raw, open-vocabulary label exactly as the LLM produced it (e.g.
+    # "prototype_pollution", "ssti"). Preserved verbatim even when
+    # vulnerability_type normalizes to OTHER, so reports and 0-day triage
+    # keep the model's own classification.
+    vulnerability_label: Optional[str] = None
+    # CWE id supplied by the LLM (e.g. "CWE-601"). Used by Stage 4 to emit a
+    # correct CWE even for classes with no named enum member.
+    cwe_id: Optional[str] = None
     reasoning: Optional[str] = None
     sink_category: Optional[SinkCategory] = None
 
