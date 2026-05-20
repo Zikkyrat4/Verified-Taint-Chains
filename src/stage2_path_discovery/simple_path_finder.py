@@ -161,7 +161,12 @@ class SimpleGraphBuilder:
 
         # Pattern 1: Simple assignment var1 = var2 or var1 = constant
         # Matches: var1 = var2; or var1 = var2 + var3;
-        assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;=]+);"
+        # The RHS character class excludes ``;`` (statement terminator) but
+        # NOT ``=`` — otherwise any RHS with ``==`` / ``!=`` / ``<=`` / ``>=``
+        # or a ternary like ``x == null ? a : b`` aborts the whole match,
+        # losing the data-flow edge entirely. Real Java code hits this
+        # constantly (e.g. ``var f = new File(dir, id == null ? def : id);``).
+        assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;]+);"
 
         for match in re.finditer(assignment_pattern, code):
             target_var = match.group(1).strip()

@@ -253,7 +253,11 @@ class EnhancedGraphBuilder:
         edges: List[Tuple[str, str, Dict]] = []
 
         # Pattern 1: Simple assignment var1 = var2 or var1 = constant
-        assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;=]+);"
+        # See note in SimpleGraphBuilder: excluding ``=`` from the RHS char
+        # class drops every assignment whose RHS contains a comparison or
+        # ternary (``new File(dir, id == null ? a : b)``, ``var ok = (a != b)``,
+        # ``String s = (x <= 5) ? "low" : "high"``). Allow ``=`` in the RHS.
+        assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;]+);"
 
         for match in re.finditer(assignment_pattern, code):
             target_var = match.group(1).strip()

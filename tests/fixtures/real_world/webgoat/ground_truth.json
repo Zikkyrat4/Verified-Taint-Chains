@@ -11,24 +11,24 @@
         {
           "id": "TP-1",
           "source_var": "fullName",
-          "sink_var": "uploadedFile",
+          "sink_var": "fullName",
           "source_file": "ProfileUpload.java",
           "sink_file": "ProfileUploadBase.java",
           "source_line": 41,
           "sink_line": 51,
           "vuln_type": "path_traversal",
-          "description": "ProfileUpload.uploadFileHandler(@RequestParam fullName) -> super.execute(file, fullName, username) -> new File(uploadDirectory, fullName). Cross-file: source in subclass, sink in base class."
+          "description": "ProfileUpload.uploadFileHandler(@RequestParam fullName) -> super.execute(file, fullName, username) -> new File(uploadDirectory, fullName). Cross-file: @RequestParam source in subclass, sink-site (the tainted argument to `new File`) in inherited base method. Sink variable is `fullName` itself — `uploadedFile` is only the assignment target."
         },
         {
           "id": "TP-2",
-          "source_var": "file",
-          "sink_var": "uploadedFile",
+          "source_var": "fullName",
+          "sink_var": "fullName",
           "source_file": "ProfileUploadRemoveUserInput.java",
           "sink_file": "ProfileUploadBase.java",
           "source_line": 41,
           "sink_line": 51,
           "vuln_type": "path_traversal",
-          "description": "ProfileUploadRemoveUserInput.uploadFileHandler -> super.execute(file, file.getOriginalFilename(), username) -> new File(uploadDirectory, fullName). Lesson teaches that removing the form param doesn't help — filename is still attacker-controlled via MultipartFile."
+          "description": "ProfileUploadRemoveUserInput.uploadFileHandler -> super.execute(file, file.getOriginalFilename(), username) -> new File(uploadDirectory, fullName). Removing the form param doesn't help — filename is still attacker-controlled via MultipartFile.getOriginalFilename(). Source file scoped to RemoveUserInput so this TP doesn't collide with TP-1."
         }
       ],
       "false_positive_patterns": [
@@ -58,6 +58,10 @@
         {
           "source_var": "username",
           "reason": "@CurrentUsername — server-authenticated"
+        },
+        {
+          "sink_var": "username",
+          "reason": "@CurrentUsername — server-authenticated identity"
         }
       ]
     },
@@ -73,6 +77,14 @@
         {
           "source_var": "fullName",
           "reason": "Sanitized via .replace(\"../\", \"\") at call site"
+        },
+        {
+          "source_var": "username",
+          "reason": "@CurrentUsername — server-authenticated"
+        },
+        {
+          "sink_var": "username",
+          "reason": "@CurrentUsername — server-authenticated identity, not exploitable"
         }
       ]
     },
@@ -94,13 +106,13 @@
         {
           "id": "TP-3",
           "source_var": "id",
-          "sink_var": "catPicture",
+          "sink_var": "id",
           "source_file": "ProfileUploadRetrieval.java",
           "sink_file": "ProfileUploadRetrieval.java",
           "source_line": 99,
           "sink_line": 101,
           "vuln_type": "path_traversal",
-          "description": "request.getParameter(\"id\") -> new File(catPicturesDirectory, id + \".jpg\") -> FileCopyUtils.copyToByteArray. Single-file flow but lives inside the project-mode fixture."
+          "description": "request.getParameter(\"id\") -> new File(catPicturesDirectory, id + \".jpg\") -> FileCopyUtils.copyToByteArray. Single-file flow but lives inside the project-mode fixture. Sink variable is `id` (the tainted argument)."
         }
       ],
       "false_positive_patterns": [
@@ -133,13 +145,13 @@
         {
           "id": "TP-4",
           "source_var": "e",
-          "sink_var": "f",
+          "sink_var": "e",
           "source_file": "ProfileZipSlip.java",
           "sink_file": "ProfileZipSlip.java",
           "source_line": 78,
           "sink_line": 79,
           "vuln_type": "path_traversal",
-          "description": "Enumerated ZipEntry e (attacker-controlled archive) -> new File(tmpZipDirectory, e.getName()) -> Files.copy(is, f.toPath()). Classic Zip Slip."
+          "description": "Enumerated ZipEntry e (attacker-controlled archive) -> new File(tmpZipDirectory, e.getName()) -> Files.copy(is, f.toPath()). Classic Zip Slip. Sink variable is `e` itself — the tainted ZipEntry whose name controls extraction path."
         }
       ],
       "false_positive_patterns": [
