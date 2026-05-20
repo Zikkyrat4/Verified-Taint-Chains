@@ -134,6 +134,21 @@ class OllamaClient(BaseLLMClient):
             "temperature": temperature,
             "num_predict": effective_predict,
         }
+        # temperature=0 alone does NOT guarantee determinism on quantised MoE
+        # models (qwen3-coder, deepseek-coder). Variable-name choices for
+        # source/sink labels can drift between identical runs, which is
+        # catastrophic for bridge-edge cross-file matching (run 1: TP-1 found,
+        # run 2-3: lost — same prompt, different ``fullName`` selection). Pin
+        # the RNG so the same code + prompt yields the same spec across runs.
+        # Override or disable via OLLAMA_SEED (empty/"none" turns it off).
+        seed_env = os.getenv("OLLAMA_SEED", "42")
+        if seed_env and seed_env.lower() not in ("", "none", "off", "false", "0"):
+            try:
+                options["seed"] = int(seed_env)
+            except ValueError:
+                logger.warning(
+                    f"OLLAMA_SEED='{seed_env}' is not an int, leaving unseeded"
+                )
 
         # Some MoE models (e.g. qwen3-coder-next:q8_0) return empty content
         # when grammar-constrained via format="json". Allow disabling via env.

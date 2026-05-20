@@ -98,11 +98,13 @@ class TestOllamaClient:
 
         assert result == "test response from ollama"
         # num_predict is floored at OLLAMA_MIN_NUM_PREDICT (default 4096) so
-        # reasoning-heavy models don't truncate the trailing JSON.
+        # reasoning-heavy models don't truncate the trailing JSON. ``seed`` is
+        # injected (default 42) so quantised MoE models stop drifting between
+        # otherwise-identical runs.
         mock_client.chat.assert_called_once_with(
             model="llama3:latest",
             messages=messages,
-            options={"temperature": 0.5, "num_predict": 4096},
+            options={"temperature": 0.5, "num_predict": 4096, "seed": 42},
             format="json",
         )
 
