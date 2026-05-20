@@ -1,0 +1,175 @@
+{
+  "_comment": "Ground truth for the WebGoat PathTraversal lesson — a project-mode fixture. The pipeline must run all files together (pipeline.run_project) so that cross-file taint flows (subclass -> base class) can be observed. Source: https://github.com/WebGoat/WebGoat @ main, GPL-2.0-or-later.",
+  "_source_url": "https://github.com/WebGoat/WebGoat/tree/main/src/main/java/org/owasp/webgoat/lessons/pathtraversal",
+  "_license": "GPL-2.0-or-later (WebGoat authors)",
+  "mode": "project",
+  "files": {
+    "pathtraversal/ProfileUploadBase.java": {
+      "cwe": "CWE-022",
+      "vulnerability": "Path Traversal — uploadDirectory + attacker-controlled filename",
+      "true_positives": [
+        {
+          "id": "TP-1",
+          "source_var": "fullName",
+          "sink_var": "uploadedFile",
+          "source_file": "ProfileUpload.java",
+          "sink_file": "ProfileUploadBase.java",
+          "source_line": 41,
+          "sink_line": 51,
+          "vuln_type": "path_traversal",
+          "description": "ProfileUpload.uploadFileHandler(@RequestParam fullName) -> super.execute(file, fullName, username) -> new File(uploadDirectory, fullName). Cross-file: source in subclass, sink in base class."
+        },
+        {
+          "id": "TP-2",
+          "source_var": "file",
+          "sink_var": "uploadedFile",
+          "source_file": "ProfileUploadRemoveUserInput.java",
+          "sink_file": "ProfileUploadBase.java",
+          "source_line": 41,
+          "sink_line": 51,
+          "vuln_type": "path_traversal",
+          "description": "ProfileUploadRemoveUserInput.uploadFileHandler -> super.execute(file, file.getOriginalFilename(), username) -> new File(uploadDirectory, fullName). Lesson teaches that removing the form param doesn't help — filename is still attacker-controlled via MultipartFile."
+        }
+      ],
+      "false_positive_patterns": [
+        {
+          "source_var": "username",
+          "reason": "@CurrentUsername — server-authenticated identity, not user-controlled in dangerous way"
+        },
+        {
+          "source_var": "webGoatHomeDirectory",
+          "reason": "Server config from @Value, not user input"
+        },
+        {
+          "sink_pattern": "FileSystemUtils\\.deleteRecursively",
+          "reason": "Cleanup under a server-controlled prefix"
+        },
+        {
+          "sink_pattern": "defaultImage|getResourceAsStream",
+          "reason": "Static resource loading from classpath"
+        }
+      ]
+    },
+    "pathtraversal/ProfileUpload.java": {
+      "cwe": "CWE-022",
+      "vulnerability": "Path Traversal — subclass entry point for ProfileUploadBase",
+      "true_positives": [],
+      "false_positive_patterns": [
+        {
+          "source_var": "username",
+          "reason": "@CurrentUsername — server-authenticated"
+        }
+      ]
+    },
+    "pathtraversal/ProfileUploadFix.java": {
+      "cwe": "CWE-022",
+      "vulnerability": "Sanitized variant — should NOT be flagged",
+      "true_positives": [],
+      "false_positive_patterns": [
+        {
+          "sink_pattern": "super\\.execute|new File",
+          "reason": "Fix variant applies fullName.replace(\"../\", \"\") before delegating — sanitized"
+        },
+        {
+          "source_var": "fullName",
+          "reason": "Sanitized via .replace(\"../\", \"\") at call site"
+        }
+      ]
+    },
+    "pathtraversal/ProfileUploadRemoveUserInput.java": {
+      "cwe": "CWE-022",
+      "vulnerability": "Path Traversal — fileless form, but MultipartFile.getOriginalFilename() still tainted",
+      "true_positives": [],
+      "false_positive_patterns": [
+        {
+          "source_var": "username",
+          "reason": "@CurrentUsername — server-authenticated"
+        }
+      ]
+    },
+    "pathtraversal/ProfileUploadRetrieval.java": {
+      "cwe": "CWE-022",
+      "vulnerability": "Path Traversal — id query param controls File path",
+      "true_positives": [
+        {
+          "id": "TP-3",
+          "source_var": "id",
+          "sink_var": "catPicture",
+          "source_file": "ProfileUploadRetrieval.java",
+          "sink_file": "ProfileUploadRetrieval.java",
+          "source_line": 99,
+          "sink_line": 101,
+          "vuln_type": "path_traversal",
+          "description": "request.getParameter(\"id\") -> new File(catPicturesDirectory, id + \".jpg\") -> FileCopyUtils.copyToByteArray. Single-file flow but lives inside the project-mode fixture."
+        }
+      ],
+      "false_positive_patterns": [
+        {
+          "sink_pattern": "ClassPathResource|getResourceAsStream",
+          "reason": "Static classpath resource loading in @PostConstruct init"
+        },
+        {
+          "sink_pattern": "log\\.error|log\\.info",
+          "reason": "Logging — not an exploitable sink"
+        },
+        {
+          "source_var": "username",
+          "reason": "@CurrentUsername — server-authenticated"
+        },
+        {
+          "sink_pattern": "Sha512DigestUtils\\.shaHex",
+          "reason": "Hashing — not file-system sink"
+        },
+        {
+          "sink_pattern": "ResponseEntity\\.badRequest|ResponseEntity\\.status",
+          "reason": "HTTP error builder — not a sink"
+        }
+      ]
+    },
+    "pathtraversal/ProfileZipSlip.java": {
+      "cwe": "CWE-022",
+      "vulnerability": "Zip Slip — ZipEntry.getName() controls extraction path",
+      "true_positives": [
+        {
+          "id": "TP-4",
+          "source_var": "e",
+          "sink_var": "f",
+          "source_file": "ProfileZipSlip.java",
+          "sink_file": "ProfileZipSlip.java",
+          "source_line": 78,
+          "sink_line": 79,
+          "vuln_type": "path_traversal",
+          "description": "Enumerated ZipEntry e (attacker-controlled archive) -> new File(tmpZipDirectory, e.getName()) -> Files.copy(is, f.toPath()). Classic Zip Slip."
+        }
+      ],
+      "false_positive_patterns": [
+        {
+          "source_var": "username",
+          "reason": "@CurrentUsername — server-authenticated"
+        },
+        {
+          "sink_pattern": "Files\\.createTempDirectory",
+          "reason": "Tempdir creation with username prefix only — not exploitable"
+        },
+        {
+          "sink_pattern": "log\\.error|log\\.info",
+          "reason": "Logging"
+        }
+      ]
+    },
+    "pathtraversal/PathTraversal.java": {
+      "cwe": "CWE-022",
+      "vulnerability": "Lesson registration class — no flows expected",
+      "true_positives": [],
+      "false_positive_patterns": []
+    }
+  },
+  "metrics": {
+    "total_files": 7,
+    "ideal_true_positives": 4,
+    "realistic_true_positives_min": 2,
+    "realistic_true_positives_max": 4,
+    "cross_file_true_positives": 2,
+    "comment": "TP-1 and TP-2 require cross-file (project-mode) analysis: source in subclass file, sink in inherited base method. TP-3 and TP-4 are single-file flows kept inside the project fixture as a control."
+  }
+}

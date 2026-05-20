@@ -85,6 +85,20 @@ def _line_close(reported: int, expected: int, tolerance: int = 5) -> bool:
     return abs(reported - expected) <= tolerance
 
 
+def _file_matches(reported_path: str, expected_basename: str) -> bool:
+    """Project-mode file constraint: chain.source/sink.file ends with expected basename.
+
+    The reported path is absolute (e.g. ``/abs/.../webgoat/pathtraversal/Foo.java``);
+    the TP encodes only a basename or short relative path (``Foo.java`` or
+    ``pathtraversal/Foo.java``). Match by suffix.
+    """
+    if not expected_basename:
+        return True  # no constraint declared
+    r = _norm(reported_path)
+    e = _norm(expected_basename)
+    return r.endswith(e) or r.endswith("/" + e) or e in r
+
+
 def _chain_matches_tp(chain: Dict[str, Any], tp: Dict[str, Any]) -> bool:
     """Match a reported chain against an expected true positive.
 
@@ -98,16 +112,30 @@ def _chain_matches_tp(chain: Dict[str, Any], tp: Dict[str, Any]) -> bool:
     exactly (case-insensitive) — LLMs report the *use* line, not the
     declaration line, and noise from that easily exceeds any small tolerance
     while still pointing at the same vulnerability.
+
+    Project-mode: when the TP carries ``source_file`` / ``sink_file``, the
+    reported chain's source.file / sink.file must end with those (suffix
+    match), so a cross-file flow is only credited when both endpoints land in
+    the right files.
     """
     src_var = chain["source"]["variable"]
     sink_var = chain["sink"]["variable"]
     src_line = chain["source"].get("line", 0)
     sink_line = chain["sink"].get("line", 0)
+    src_file = chain["source"].get("file", "") or ""
+    sink_file = chain["sink"].get("file", "") or ""
     vuln_type = _norm(chain.get("type", ""))
 
     exp_src = tp.get("source_var", "")
     exp_sink = tp.get("sink_var", "")
+    exp_src_file = tp.get("source_file", "")
+    exp_sink_file = tp.get("sink_file", "")
     exp_type = _norm(tp.get("vuln_type", ""))
+
+    # Project-mode file pinning: cross-file flow only credited when both
+    # endpoints live in the declared files.
+    if not (_file_matches(src_file, exp_src_file) and _file_matches(sink_file, exp_sink_file)):
+        return False
 
     src_exact = _norm(src_var) == _norm(exp_src) and bool(exp_src)
     sink_exact = _norm(sink_var) == _norm(exp_sink) and bool(exp_sink)
@@ -453,10 +481,144 @@ async def _evaluate_file(
     return fe
 
 
+def _route_chain_to_file(
+    chain: Dict[str, Any],
+    file_keys: List[str],
+) -> Optional[str]:
+    """Attribute a project-mode chain to a ground-truth file key.
+
+    A chain belongs to the file whose sink lives in it (that's where the
+    vulnerability surfaces). Falls back to the source file if the sink path
+    doesn't match any known key. Returns the most-specific (longest) match.
+    """
+    sink_path = _norm(chain["sink"].get("file", "") or "")
+    src_path = _norm(chain["source"].get("file", "") or "")
+    best: Optional[str] = None
+    best_len = 0
+    for key in file_keys:
+        k = _norm(key)
+        if not k:
+            continue
+        if sink_path.endswith(k) or sink_path.endswith("/" + k) or k in sink_path:
+            if len(k) > best_len:
+                best, best_len = key, len(k)
+    if best is not None:
+        return best
+    for key in file_keys:
+        k = _norm(key)
+        if not k:
+            continue
+        if src_path.endswith(k) or src_path.endswith("/" + k) or k in src_path:
+            if len(k) > best_len:
+                best, best_len = key, len(k)
+    return best
+
+
+async def _run_project_evaluation(
+    fixtures_dir: Path,
+    truth: Dict[str, Any],
+) -> EvaluationReport:
+    """Evaluate a multi-file fixture using pipeline.run_project once.
+
+    The whole .java tree under fixtures_dir is handed to the project-mode
+    orchestrator so cross-file taint flows are visible. Reported chains are
+    then routed back to the per-file rows of ground_truth.json via
+    ``_route_chain_to_file``.
+    """
+    config = load_config_from_env()
+    pipeline = SimplePipeline(config)
+    report = EvaluationReport()
+
+    java_files = sorted(str(p) for p in fixtures_dir.rglob("*.java"))
+    if not java_files:
+        print(f"[skip] no .java files under {fixtures_dir}", file=sys.stderr)
+        report.aggregate = _aggregate(report)
+        return report
+
+    print(
+        f"[run] project mode: {len(java_files)} files under {fixtures_dir.name}",
+        file=sys.stderr,
+    )
+
+    # Pre-initialise one FileEvaluation per ground-truth file so absent
+    # findings still show as FN rows.
+    file_evals: Dict[str, FileEvaluation] = {}
+    for rel_name, truth_for_file in truth.get("files", {}).items():
+        expected = len(
+            [t for t in truth_for_file.get("true_positives", []) if t.get("expected_realistic", True)]
+        )
+        file_evals[rel_name] = FileEvaluation(
+            file=rel_name,
+            cve=truth_for_file.get("cve", ""),
+            expected_tp=expected,
+        )
+
+    try:
+        result = await pipeline.run_project(java_files, show_progress=False)
+    except Exception as exc:
+        # Attach error to every file entry so the report shows it.
+        msg = f"{type(exc).__name__}: {exc}"
+        for fe in file_evals.values():
+            fe.error = msg
+        report.files = list(file_evals.values())
+        report.aggregate = _aggregate(report)
+        return report
+
+    pipeline_metrics = result.get("metrics", {})
+    chains = [_chain_to_dict(c) for c in result.get("verified_chains", [])]
+    file_keys = list(truth.get("files", {}).keys())
+
+    # Bucket chains by attributed ground-truth file.
+    buckets: Dict[str, List[Dict[str, Any]]] = {k: [] for k in file_keys}
+    orphan_chains: List[Dict[str, Any]] = []
+    for ch in chains:
+        key = _route_chain_to_file(ch, file_keys)
+        if key is None:
+            orphan_chains.append(ch)
+        else:
+            buckets[key].append(ch)
+
+    for rel_name, truth_for_file in truth.get("files", {}).items():
+        fe = file_evals[rel_name]
+        fe.pipeline_metrics = pipeline_metrics
+        tp_matched, fp_chains, unclassified, fn_chains = _classify_chains(
+            buckets[rel_name], truth_for_file
+        )
+        fe.tp_matched = tp_matched
+        fe.fp_chains = fp_chains
+        fe.unclassified_chains = unclassified
+        fe.fn_chains = fn_chains
+        fe.found_tp = len(tp_matched)
+        fe.fp = len(fp_chains)
+        fe.unclassified = len(unclassified)
+        fe.fn = len(fn_chains)
+
+    # Chains whose sink/source file didn't map to any ground-truth key — put
+    # them in a synthetic project-level bucket so they're visible but don't
+    # inflate per-file precision/recall.
+    if orphan_chains:
+        orphan = FileEvaluation(file="<project-orphan>")
+        orphan.unclassified_chains = [{"chain": c} for c in orphan_chains]
+        orphan.unclassified = len(orphan_chains)
+        orphan.pipeline_metrics = pipeline_metrics
+        report.files = list(file_evals.values()) + [orphan]
+    else:
+        report.files = list(file_evals.values())
+
+    report.aggregate = _aggregate(report)
+    return report
+
+
 async def _run_evaluation(
     fixtures_dir: Path,
     truth: Dict[str, Any],
 ) -> EvaluationReport:
+    # Project-mode fixture: hand the entire .java tree to pipeline.run_project
+    # so cross-file flows (e.g. subclass entry point → inherited base method)
+    # can actually be traced. Single-file mode is the default.
+    if truth.get("mode") == "project":
+        return await _run_project_evaluation(fixtures_dir, truth)
+
     config = load_config_from_env()
     pipeline = SimplePipeline(config)
     report = EvaluationReport()

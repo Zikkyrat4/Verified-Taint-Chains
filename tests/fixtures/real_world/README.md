@@ -16,24 +16,51 @@ real_world/<project>/
 и валидного `ground_truth.json`. Структурный регрессионный тест:
 `pytest tests/unit/test_real_world_fixtures.py`.
 
+## Режимы оценки
+
+| Режим | Когда | Что вызывается |
+|---|---|---|
+| `single-file` (default) | `ground_truth.json` без `mode` или `mode != "project"` | `pipeline.run(file)` поштучно для каждого `files["<rel>"]`. Кросс-файловые потоки не отслеживаются. |
+| `project` | `ground_truth.json` содержит `"mode": "project"` | `pipeline.run_project(all .java files)` один раз; цепочки атрибутируются к `files["<rel>"]` по `chain.sink.file`. Кросс-файловые TP заявляются через `source_file`/`sink_file` в записи TP. |
+
+Каждый single-file проект — это **CVE, обнаружимая по одному файлу**: source, sink и
+семантика sink'а локально присутствуют в коде. Если эксплойт требует знания о
+другой библиотеке (Hibernate Validator EL-evaluation), о вызывающей стороне
+конструктора или о цепочке через другой класс — кейс **не входит** в
+single-file набор; такие сценарии измеряются project-режимом.
+
 ## CWE-coverage matrix
 
-10 .java файлов в 6 проектах, 6 классов уязвимостей. Источник CVE —
-[`cwe-bench-java`](https://github.com/iris-sast/cwe-bench-java) +
-ранее размеченные Keycloak-кейсы.
+7 single-file файлов + 1 project-mode фикстура, 5 классов уязвимостей.
+Источник CVE — [`cwe-bench-java`](https://github.com/iris-sast/cwe-bench-java),
+ранее размеченные Keycloak-кейсы, и
+[WebGoat](https://github.com/WebGoat/WebGoat) (GPL-2.0-or-later) для project-режима.
+
+### Single-file evaluation
 
 | CWE | Класс | Project | File |
 |-----|-------|---------|------|
 | CWE-022 | Path Traversal | keycloak | `CVE-2022-3782/RedirectUtils.java` |
-| CWE-022 | Path Traversal | spark | `CVE-2018-9159/ClassPathResource.java` |
 | CWE-078 | OS Command Injection | jenkins-docker-commons | `CVE-2022-20617/DockerRegistryEndpoint.java` |
 | CWE-078 | OS Command Injection | jenkins-perfecto | `CVE-2020-2261/PerfectoBuildWrapper.java` |
 | CWE-079 | XSS | keycloak | `CVE-2022-4361/SamlService.java` |
 | CWE-079 | XSS | jspwiki | `CVE-2019-10076/LinkToTag.java` |
-| CWE-094 | Code Injection | cron-utils | `CVE-2021-41269/CronParser.java` |
-| CWE-094 | Code Injection | spring-framework | `CVE-2022-22965/CachedIntrospectionResults.java` (Spring4Shell) |
 | CWE-502 | Unsafe Deserialization | keycloak | `SerializedBrokeredIdentityContext.java` |
 | CWE-601 | Open Redirect | keycloak | `OIDCLoginProtocol.java` |
+
+### Project-mode evaluation
+
+| CWE | Класс | Project | Files | Что измеряется |
+|-----|-------|---------|-------|---|
+| CWE-022 | Path Traversal / Zip Slip | webgoat | `pathtraversal/*.java` (7 файлов) | TP-1/TP-2 — source в подклассе, sink в наследованном методе базы (кросс-файл). TP-3/TP-4 — single-file как контроль. ProfileUploadFix — known-FP (санитайзер). |
+
+**Кейсы, исключённые из single-file набора по принципиальным причинам:**
+
+| Бывший CVE | Причина исключения |
+|---|---|
+| `cron-utils/CVE-2021-41269` (EL injection) | Sink — `throw new IllegalArgumentException(format, expression)` — становится опасным только из-за Hibernate Validator EL-evaluation в **другой** библиотеке. Single-file LLM этого не видит. |
+| `spark/CVE-2018-9159` (path traversal) | Source — параметр конструктора `public ClassPathResource(String path, …)`. USER_INPUT-attribution требует знания вызывающей стороны (entry point) в другом файле. |
+| `spring-framework/CVE-2022-22965` (Spring4Shell) | Эксплойт цепляется через `ClassLoader` → `protectionDomain` → Tomcat `AccessLogValve` — несколько классов в разных пакетах. Принципиально вне single-file scope. |
 
 ## Методология детекции (для защиты — train/test leakage)
 
@@ -83,6 +110,7 @@ real_world/<project>/
 
 ```jsonc
 {
+  "mode": "project",                     // optional; "project" → pipeline.run_project, иначе per-file
   "files": {
     "<rel/path/inside/project>.java": {
       "cve": "CVE-2024-XXXXX",          // optional, для отчёта
@@ -94,6 +122,8 @@ real_world/<project>/
           "id": "TP-1",                  // unique within file
           "source_var": "redirect",      // имя source-переменной
           "sink_var": "redirectUri",
+          "source_file": "Foo.java",     // optional; project-mode — basename файла source
+          "sink_file":   "Bar.java",     // optional; project-mode — basename файла sink
           "source_line": 215,            // 1-indexed; 0 = unknown
           "sink_line": 303,
           "vuln_type": "xss",            // xss | sql_injection | command_injection | path_traversal | xxe | ssrf | deserialization | open_redirect | code_injection
