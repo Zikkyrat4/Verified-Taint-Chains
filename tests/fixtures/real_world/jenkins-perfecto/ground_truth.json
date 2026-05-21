@@ -9,11 +9,11 @@
         {
           "id": "TP-1",
           "source_var": "perfectoConnectLocation",
-          "sink_var": "cmdArgs",
+          "sink_var": "baseCommand",
           "source_line": 151,
-          "sink_line": 167,
+          "sink_line": 160,
           "vuln_type": "command_injection",
-          "description": "getTunnelId() parameter perfectoConnectLocation (from job config) -> string concatenation into bash -c -> Runtime.getRuntime().exec(cmdArgs)"
+          "description": "getTunnelId() parameter perfectoConnectLocation (from job config) -> concatenated into the bash command string baseCommand (line 160) -> wrapped in cmdArgs={\"bash\",\"-c\", ...baseCommand...} -> Runtime.getRuntime().exec(cmdArgs). Sink variable is `baseCommand`, the assembled command string where the tainted config is concatenated (the injection point the detector terminates on); `cmdArgs` is only the exec wrapper one hop downstream. The source -> baseCommand chain faithfully captures CVE-2020-2261."
         },
         {
           "id": "TP-2",
