@@ -22,8 +22,8 @@ matrix в [`tests/fixtures/real_world/README.md`](../tests/fixtures/real_world/R
 Снятый snapshot пока есть только для `keycloak/` — остальные проекты
 прогоняются by-demand командами ниже.
 
-Подробный case-study keycloak —
-[`docs/evaluation_keycloak.md`](../docs/evaluation_keycloak.md).
+Агрегированные результаты и методология оценки —
+[`docs/evaluation.md`](../docs/evaluation.md).
 
 ## Воспроизведение
 
