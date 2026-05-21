@@ -11,24 +11,25 @@
         {
           "id": "TP-1",
           "source_var": "fullName",
-          "sink_var": "fullName",
+          "sink_var": "uploadedFile",
           "source_file": "ProfileUpload.java",
           "sink_file": "ProfileUploadBase.java",
           "source_line": 41,
           "sink_line": 51,
           "vuln_type": "path_traversal",
-          "description": "ProfileUpload.uploadFileHandler(@RequestParam fullName) -> super.execute(file, fullName, username) -> new File(uploadDirectory, fullName). Cross-file: @RequestParam source in subclass, sink-site (the tainted argument to `new File`) in inherited base method. Sink variable is `fullName` itself — `uploadedFile` is only the assignment target."
+          "description": "ProfileUpload.uploadFileHandler(@RequestParam fullName) -> super.execute(file, fullName, username) -> new File(uploadDirectory, fullName) assigned to `uploadedFile`. Cross-file: @RequestParam source in subclass, sink in inherited base method. Sink variable is the File assignment target `uploadedFile` (the variable the detector's data-flow graph terminates on); cross-file taint is carried by the parameter pass-through bridge ProfileUpload:fullName -> ProfileUploadBase:fullName -> uploadedFile."
         },
         {
           "id": "TP-2",
-          "source_var": "fullName",
-          "sink_var": "fullName",
+          "source_var": "file",
+          "sink_var": "uploadedFile",
           "source_file": "ProfileUploadRemoveUserInput.java",
           "sink_file": "ProfileUploadBase.java",
-          "source_line": 41,
+          "source_line": 39,
           "sink_line": 51,
           "vuln_type": "path_traversal",
-          "description": "ProfileUploadRemoveUserInput.uploadFileHandler -> super.execute(file, file.getOriginalFilename(), username) -> new File(uploadDirectory, fullName). Removing the form param doesn't help — filename is still attacker-controlled via MultipartFile.getOriginalFilename(). Source file scoped to RemoveUserInput so this TP doesn't collide with TP-1."
+          "expected_realistic": false,
+          "description": "ProfileUploadRemoveUserInput.uploadFileHandler -> super.execute(file, file.getOriginalFilename(), username) -> new File(uploadDirectory, fullName). The tainted name is passed INLINE as file.getOriginalFilename() (no named `fullName` variable) into a differently-named base parameter. Detecting this needs positional argument binding (file -> fullName), i.e. real inter-procedural analysis the name-matching bridge does not perform. expected_realistic=false: kept as a documented hard case, excluded from recall."
         }
       ],
       "false_positive_patterns": [

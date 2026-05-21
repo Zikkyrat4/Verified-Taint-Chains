@@ -467,6 +467,33 @@ class SimplePipeline:
                             f"Bridge edge: {src_node} -> {snk_node}"
                         )
 
+        # Bridge 2 (parameter pass-through): a source variable in file A often
+        # re-appears as a same-named formal parameter in file B (inheritance /
+        # delegation — a subclass passes ``fullName`` into
+        # ``super.execute(file, fullName, ..)`` and the base method then builds
+        # ``new File(dir, fullName)`` assigned to ``uploadedFile``). Bridge 1
+        # only fires when the *same name* is also a sink in B; when B's sink is
+        # the assignment target (``uploadedFile``) the cross-file flow is lost.
+        # Connect the source to B's same-named node when that node actually
+        # propagates onward (out-degree > 0), so taint reaches B's own sinks.
+        # Restricted to source variables to bound the number of false bridges.
+        bridged = set()
+        for var_name, occurrences in src_by_var.items():
+            for src_fpath, src_obj in occurrences:
+                src_node = scope_map[id(src_obj)]
+                if src_node not in merged:
+                    continue
+                for bfpath in file_code_map:
+                    if bfpath == src_fpath:
+                        continue
+                    b_node = f"{_short_name(bfpath)}:{var_name}"
+                    if b_node == src_node or (src_node, b_node) in bridged:
+                        continue
+                    if b_node in merged and merged.out_degree(b_node) > 0:
+                        merged.add_edge(src_node, b_node, weight=1.0, bridge=True)
+                        bridged.add((src_node, b_node))
+                        logger.debug(f"Param bridge edge: {src_node} -> {b_node}")
+
         logger.info(
             f"Scoped graph: {merged.number_of_nodes()} nodes, "
             f"{merged.number_of_edges()} edges across {len(file_code_map)} files"

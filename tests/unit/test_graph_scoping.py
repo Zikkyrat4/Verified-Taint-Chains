@@ -176,6 +176,48 @@ class TestBuildScopedGraph:
         assert "mod1/Util.java:data" in graph.nodes
         assert "mod2/Util.java:data" in graph.nodes
 
+    @pytest.mark.asyncio
+    async def test_parameter_passthrough_bridge(self, test_config):
+        """Source in A bridges to a same-named param in B that flows onward.
+
+        Models inheritance/delegation: a subclass passes ``fullName`` into a
+        base method that builds ``new File(dir, fullName)`` assigned to
+        ``uploadedFile``. The same name is NOT a sink in B (the sink is the
+        assignment target), so the original source&sink bridge cannot fire —
+        only the parameter pass-through bridge connects the flow.
+        """
+        pipeline = SimplePipeline(test_config)
+
+        code_a = "AttackResult h(String fullName) { return base.execute(file, fullName, user); }"
+        code_b = "void execute(String fullName) { File uploadedFile = new File(dir, fullName); }"
+
+        loc_a = CodeLocation(file_path="/project/Sub.java", line_number=1)
+        loc_b = CodeLocation(file_path="/project/Base.java", line_number=1)
+
+        src_a = Source(
+            location=loc_a, variable_name="fullName",
+            type="user_input", confidence=0.9, code_snippet="",
+        )
+        snk_b = Sink(
+            location=loc_b, variable_name="uploadedFile",
+            type="file_operation", confidence=0.9, code_snippet="",
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+        )
+
+        file_code_map = {"/project/Sub.java": code_a, "/project/Base.java": code_b}
+        file_sources = {"/project/Sub.java": [src_a], "/project/Base.java": []}
+        file_sinks = {"/project/Sub.java": [], "/project/Base.java": [snk_b]}
+
+        graph, _ = await pipeline._build_scoped_graph(
+            file_code_map, file_sources, file_sinks,
+        )
+
+        import networkx as nx
+        # The bridge connects the subclass source to the base's same-named param,
+        assert graph.has_edge("Sub.java:fullName", "Base.java:fullName")
+        # and the full cross-file flow reaches the base sink.
+        assert nx.has_path(graph, "Sub.java:fullName", "Base.java:uploadedFile")
+
 
 class TestRunProjectScoping:
     """Integration tests for run_project with scoped graphs."""
