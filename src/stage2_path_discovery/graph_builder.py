@@ -257,7 +257,10 @@ class EnhancedGraphBuilder:
         # class drops every assignment whose RHS contains a comparison or
         # ternary (``new File(dir, id == null ? a : b)``, ``var ok = (a != b)``,
         # ``String s = (x <= 5) ? "low" : "high"``). Allow ``=`` in the RHS.
-        assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;]+);"
+        # The optional ``[]`` after the name captures C-style array
+        # declarations ``String cmdArgs[] = {...}`` whose bracket would
+        # otherwise sit between the name and ``=`` and skip the whole match.
+        assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\[\s*\])?\s*=\s*([^;]+);"
 
         for match in re.finditer(assignment_pattern, code):
             target_var = match.group(1).strip()

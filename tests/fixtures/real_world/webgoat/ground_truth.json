@@ -106,13 +106,13 @@
         {
           "id": "TP-3",
           "source_var": "id",
-          "sink_var": "id",
+          "sink_var": "catPicture",
           "source_file": "ProfileUploadRetrieval.java",
           "sink_file": "ProfileUploadRetrieval.java",
           "source_line": 99,
           "sink_line": 101,
           "vuln_type": "path_traversal",
-          "description": "request.getParameter(\"id\") -> new File(catPicturesDirectory, id + \".jpg\") -> FileCopyUtils.copyToByteArray. Single-file flow but lives inside the project-mode fixture. Sink variable is `id` (the tainted argument)."
+          "description": "request.getParameter(\"id\") -> new File(catPicturesDirectory, id + \".jpg\") assigned to `catPicture` -> FileCopyUtils.copyToByteArray. Single-file flow inside the project-mode fixture. Sink variable is `catPicture` (the File built from the tainted `id`): source and sink must be distinct nodes, otherwise the detector's self-loop filter discards the single-node path."
         }
       ],
       "false_positive_patterns": [
@@ -145,13 +145,13 @@
         {
           "id": "TP-4",
           "source_var": "e",
-          "sink_var": "e",
+          "sink_var": "f",
           "source_file": "ProfileZipSlip.java",
           "sink_file": "ProfileZipSlip.java",
           "source_line": 78,
           "sink_line": 79,
           "vuln_type": "path_traversal",
-          "description": "Enumerated ZipEntry e (attacker-controlled archive) -> new File(tmpZipDirectory, e.getName()) -> Files.copy(is, f.toPath()). Classic Zip Slip. Sink variable is `e` itself — the tainted ZipEntry whose name controls extraction path."
+          "description": "Enumerated ZipEntry e (attacker-controlled archive) -> new File(tmpZipDirectory, e.getName()) assigned to `f` -> Files.copy(is, f.toPath()). Classic Zip Slip. Sink variable is `f` (the File built from the tainted entry name): source and sink must be distinct nodes, otherwise the detector's self-loop filter discards the single-node path."
         }
       ],
       "false_positive_patterns": [

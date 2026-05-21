@@ -166,7 +166,11 @@ class SimpleGraphBuilder:
         # or a ternary like ``x == null ? a : b`` aborts the whole match,
         # losing the data-flow edge entirely. Real Java code hits this
         # constantly (e.g. ``var f = new File(dir, id == null ? def : id);``).
-        assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;]+);"
+        # The optional ``[]`` after the name captures C-style array
+        # declarations ``String cmdArgs[] = {...}`` — without it the bracket
+        # sits between the name and ``=`` and the whole assignment is missed,
+        # so nothing flows INTO the array (e.g. the args to Runtime.exec).
+        assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\[\s*\])?\s*=\s*([^;]+);"
 
         for match in re.finditer(assignment_pattern, code):
             target_var = match.group(1).strip()
