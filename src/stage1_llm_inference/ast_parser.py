@@ -513,9 +513,20 @@ class JavaASTParser:
             Text content of the node.
         """
         try:
-            start_byte = node.start_byte
-            end_byte = node.end_byte
-            return source_code[start_byte:end_byte]
+            # tree-sitter reports start_byte/end_byte as UTF-8 BYTE offsets,
+            # not str character indices. Slicing the str directly is off by
+            # one (or more) for every node that follows a multi-byte char —
+            # e.g. the ``©`` in a license header shifts all subsequent
+            # identifiers, so ``catPicture`` becomes ``atPicture`` and the
+            # data-flow edges silently fail to match the graph's node names.
+            # Prefer node.text (raw bytes, always correct); fall back to
+            # slicing the encoded source.
+            raw = getattr(node, "text", None)
+            if raw is not None:
+                return raw.decode("utf-8", errors="ignore")
+            return source_code.encode("utf-8")[
+                node.start_byte : node.end_byte
+            ].decode("utf-8", errors="ignore")
         except Exception:
             return ""
 

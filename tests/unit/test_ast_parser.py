@@ -191,3 +191,30 @@ public class Outer {
         # Passing None should return empty string
         text = parser._get_node_text(None, "hello")
         assert text == ""
+
+    def test_data_flows_with_multibyte_header(self):
+        """Identifiers must stay intact when a multi-byte char precedes code.
+
+        tree-sitter reports byte offsets; a ``©`` (or any non-ASCII byte) in
+        a license header shifts every later offset, so slicing the str
+        directly used to corrupt identifiers (``catPicture`` -> ``atPicture``)
+        and silently drop every data-flow edge for the file. Regression guard.
+        """
+        parser = JavaASTParser()
+        if parser.parser is None:
+            pytest.skip("tree-sitter unavailable; AST path not exercised")
+        code = (
+            "/* Copyright © 2024 Example. All rights reserved. */\n"
+            "public class T {\n"
+            "  void m(String id) {\n"
+            "    String catPicture = build(id);\n"
+            "  }\n"
+            "}\n"
+        )
+        flows = parser.extract_data_flows(code)
+        # The edge must carry the *correct* names, not byte-shifted ones.
+        assert any(
+            f["from_var"] == "id" and f["to_var"] == "catPicture" for f in flows
+        ), flows
+        names = {f["from_var"] for f in flows} | {f["to_var"] for f in flows}
+        assert "atPicture" not in names and "d" not in names
