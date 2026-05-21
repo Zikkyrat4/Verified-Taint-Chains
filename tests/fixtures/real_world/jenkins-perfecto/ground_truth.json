@@ -9,11 +9,11 @@
         {
           "id": "TP-1",
           "source_var": "perfectoConnectLocation",
-          "sink_var": "baseCommand",
+          "sink_var": "cmdArgs",
           "source_line": 151,
-          "sink_line": 160,
+          "sink_line": 167,
           "vuln_type": "command_injection",
-          "description": "getTunnelId() parameter perfectoConnectLocation (from job config) -> concatenated into the bash command string baseCommand (line 160) -> wrapped in cmdArgs={\"bash\",\"-c\", ...baseCommand...} -> Runtime.getRuntime().exec(cmdArgs). Sink variable is `baseCommand`, the assembled command string where the tainted config is concatenated (the injection point the detector terminates on); `cmdArgs` is only the exec wrapper one hop downstream. The source -> baseCommand chain faithfully captures CVE-2020-2261."
+          "description": "getTunnelId() parameter perfectoConnectLocation (from job config) -> string concatenation into bash -c -> Runtime.getRuntime().exec(cmdArgs). True sink is the exec argument `cmdArgs`. NOTE: the LLM currently terminates the chain one hop earlier at the command string `baseCommand`, so this is a known FN until Stage-1 labels the exec argument as the sink. We do NOT move the goalpost to `baseCommand` — the honest sink is the exec call."
         },
         {
           "id": "TP-2",
