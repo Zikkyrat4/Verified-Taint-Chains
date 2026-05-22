@@ -1,9 +1,9 @@
 {
   "aggregate": {
     "total_tp": 0,
-    "total_fp": 1,
+    "total_fp": 0,
     "total_fn": 1,
-    "total_unclassified": 10,
+    "total_unclassified": 1,
     "expected_tp": 1,
     "precision": 0.0,
     "precision_strict": 0.0,
@@ -18,41 +18,11 @@
       "cve": "CVE-2022-20617",
       "expected_tp": 1,
       "found_tp": 0,
-      "fp": 1,
+      "fp": 0,
       "fn": 1,
-      "unclassified": 10,
+      "unclassified": 1,
       "tp_matched": [],
-      "fp_chains": [
-        {
-          "chain": {
-            "id": "credentialsId_to_hash_4827458880",
-            "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "HASHCODE_USED_AS_SEED",
-            "source": {
-              "variable": "credentialsId",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 256,
-              "code_snippet": "throw new AbortException(\"Could not find credentials matching \" + credentialsId);"
-            },
-            "sink": {
-              "variable": "hash",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 339,
-              "code_snippet": "return hash;"
-            },
-            "path": [
-              "credentialsId",
-              "hash"
-            ],
-            "confidence": 0.95
-          },
-          "fp_pattern": {
-            "source_var": "credentialsId",
-            "reason": "Credential ID, not user-routed in this flow"
-          }
-        }
-      ],
+      "fp_chains": [],
       "fn_chains": [
         {
           "id": "TP-1",
@@ -68,269 +38,40 @@
       "unclassified_chains": [
         {
           "chain": {
-            "id": "matcher_to_hash_4827059008",
+            "id": "dockerExecutable_to_token_4792574848",
             "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "HASHCODE_USED_AS_SEED",
-            "source": {
-              "variable": "matcher",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 128,
-              "code_snippet": "url = matcher.group(2) == null ? null : new URL(\"https://\" + matcher.group(2)).toString();"
-            },
-            "sink": {
-              "variable": "hash",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 339,
-              "code_snippet": "return hash;"
-            },
-            "path": [
-              "matcher",
-              "url",
-              "hash"
-            ],
-            "confidence": 0.95
-          }
-        },
-        {
-          "chain": {
-            "id": "url_to_hash_4827055040",
-            "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "HASHCODE_USED_AS_SEED",
-            "source": {
-              "variable": "url",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 128,
-              "code_snippet": "url = matcher.group(2) == null ? null : new URL(\"https://\" + matcher.group(2)).toString();"
-            },
-            "sink": {
-              "variable": "hash",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 339,
-              "code_snippet": "return hash;"
-            },
-            "path": [
-              "url",
-              "hash"
-            ],
-            "confidence": 0.95
-          }
-        },
-        {
-          "chain": {
-            "id": "workspace_to_token_4827133312",
-            "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "taint_analysis_vulnerability",
-            "source": {
-              "variable": "workspace",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 235,
-              "code_snippet": "return newKeyMaterialFactory(build.getParent(), workspace.getChannel());"
-            },
-            "sink": {
-              "variable": "token",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 258,
-              "code_snippet": "return token.newKeyMaterialFactory(getEffectiveUrl(), target, launcher, listener);"
-            },
-            "path": [
-              "workspace",
-              "token"
-            ],
-            "confidence": 0.95
-          }
-        },
-        {
-          "chain": {
-            "id": "target_to_token_4824711488",
-            "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "taint_analysis_vulnerability",
-            "source": {
-              "variable": "target",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 250,
-              "code_snippet": "public KeyMaterialFactory newKeyMaterialFactory(@CheckForNull Item context, @Nonnull VirtualChannel target, @CheckForNull Launcher launcher, @Nonnull TaskListener listener) throws IOException, InterruptedException {"
-            },
-            "sink": {
-              "variable": "token",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 258,
-              "code_snippet": "return token.newKeyMaterialFactory(getEffectiveUrl(), target, launcher, listener);"
-            },
-            "path": [
-              "target",
-              "token"
-            ],
-            "confidence": 0.95
-          }
-        },
-        {
-          "chain": {
-            "id": "launcher_to_token_4824722176",
-            "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "taint_analysis_vulnerability",
-            "source": {
-              "variable": "launcher",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 273,
-              "code_snippet": "public KeyMaterialFactory newKeyMaterialFactory(@CheckForNull Item context, @Nonnull FilePath workspace, @Nonnull Launcher launcher, @Nonnull EnvVars env, @Nonnull TaskListener listener, @Nonnull String dockerExecutable) throws IOException, InterruptedException {"
-            },
-            "sink": {
-              "variable": "token",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 258,
-              "code_snippet": "return token.newKeyMaterialFactory(getEffectiveUrl(), target, launcher, listener);"
-            },
-            "path": [
-              "launcher",
-              "token"
-            ],
-            "confidence": 0.95
-          }
-        },
-        {
-          "chain": {
-            "id": "listener_to_token_4825436160",
-            "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "taint_analysis_vulnerability",
-            "source": {
-              "variable": "listener",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 273,
-              "code_snippet": "public KeyMaterialFactory newKeyMaterialFactory(@CheckForNull Item context, @Nonnull FilePath workspace, @Nonnull Launcher launcher, @Nonnull EnvVars env, @Nonnull TaskListener listener, @Nonnull String dockerExecutable) throws IOException, InterruptedException {"
-            },
-            "sink": {
-              "variable": "token",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 258,
-              "code_snippet": "return token.newKeyMaterialFactory(getEffectiveUrl(), target, launcher, listener);"
-            },
-            "path": [
-              "listener",
-              "token"
-            ],
-            "confidence": 0.95
-          }
-        },
-        {
-          "chain": {
-            "id": "dockerExecutable_to_token_4827403392",
-            "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "taint_analysis_vulnerability",
+            "cwe": "CWE-639",
+            "vulnerability_label": "credentials_selection_without_authorization",
             "source": {
               "variable": "dockerExecutable",
               "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 273,
-              "code_snippet": "public KeyMaterialFactory newKeyMaterialFactory(@CheckForNull Item context, @Nonnull FilePath workspace, @Nonnull Launcher launcher, @Nonnull EnvVars env, @Nonnull TaskListener listener, @Nonnull String dockerExecutable) throws IOException, InterruptedException {"
+              "line": 281,
+              "code_snippet": "return token.newKeyMaterialFactory(getEffectiveUrl(), workspace, launcher, env, listener, dockerExecutable);"
             },
             "sink": {
               "variable": "token",
               "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 258,
-              "code_snippet": "return token.newKeyMaterialFactory(getEffectiveUrl(), target, launcher, listener);"
+              "line": 254,
+              "code_snippet": "DockerRegistryToken token = getToken(context);"
             },
             "path": [
               "dockerExecutable",
               "token"
             ],
-            "confidence": 0.95
-          }
-        },
-        {
-          "chain": {
-            "id": "obj_to_credentialsId_4827666048",
-            "type": "deserialization",
-            "cwe": "CWE-502",
-            "vulnerability_label": "taint_analysis_vulnerability",
-            "source": {
-              "variable": "obj",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 344,
-              "code_snippet": "if (obj == null) {"
-            },
-            "sink": {
-              "variable": "credentialsId",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 223,
-              "code_snippet": "CredentialsProvider.findCredentialById(credentialsId, IdCredentials.class, context, requirements));"
-            },
-            "path": [
-              "obj",
-              "other",
-              "credentialsId"
-            ],
-            "confidence": 0.925
-          }
-        },
-        {
-          "chain": {
-            "id": "obj_to_hash_4811452032",
-            "type": "other",
-            "cwe": "CWE-327",
-            "vulnerability_label": "HASHCODE_USED_AS_SEED",
-            "source": {
-              "variable": "obj",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 344,
-              "code_snippet": "if (obj == null) {"
-            },
-            "sink": {
-              "variable": "hash",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 339,
-              "code_snippet": "return hash;"
-            },
-            "path": [
-              "obj",
-              "other",
-              "url",
-              "hash"
-            ],
-            "confidence": 0.95
-          }
-        },
-        {
-          "chain": {
-            "id": "other_to_credentialsId_4827273472",
-            "type": "deserialization",
-            "cwe": "CWE-502",
-            "vulnerability_label": "taint_analysis_vulnerability",
-            "source": {
-              "variable": "other",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 354,
-              "code_snippet": "if ((this.credentialsId == null) ? (other.credentialsId != null) : !this.credentialsId.equals(other.credentialsId)) {"
-            },
-            "sink": {
-              "variable": "credentialsId",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 223,
-              "code_snippet": "CredentialsProvider.findCredentialById(credentialsId, IdCredentials.class, context, requirements));"
-            },
-            "path": [
-              "other",
-              "credentialsId"
-            ],
-            "confidence": 0.925
+            "confidence": 0.8
           }
         }
       ],
       "pipeline_metrics": {
-        "sources_found": 22,
-        "sinks_found": 14,
+        "sources_found": 10,
+        "sinks_found": 7,
         "sanitizers_found": 1,
-        "chains_found": 12,
-        "chains_verified": 11,
-        "verification_rate": 0.9166666666666666,
-        "explanations_generated": 11,
+        "chains_found": 2,
+        "chains_verified": 1,
+        "verification_rate": 0.5,
+        "explanations_generated": 1,
         "graph_nodes": 433,
-        "graph_edges": 113
+        "graph_edges": 115
       },
       "error": null
     }

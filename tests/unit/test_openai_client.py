@@ -29,6 +29,26 @@ class TestOpenAIClient:
         client = OpenAIClient(api_key="sk-test123")
         assert client.model == "gpt-4-turbo"
 
+    def test_initialization_default_base_url(self):
+        """Without an override, the official OpenAI endpoint is used."""
+        client = OpenAIClient(api_key="sk-test123")
+        assert client.base_url is None
+        assert "api.openai.com" in str(client.client.base_url)
+
+    def test_initialization_custom_base_url(self):
+        """A custom base_url is forwarded to the underlying AsyncOpenAI client."""
+        client = OpenAIClient(
+            api_key="sk-test123", base_url="https://proxy.example.com/v1"
+        )
+        assert client.base_url == "https://proxy.example.com/v1"
+        assert "proxy.example.com" in str(client.client.base_url)
+
+    def test_initialization_blank_base_url_falls_back(self):
+        """An empty base_url is treated as unset (default endpoint)."""
+        client = OpenAIClient(api_key="sk-test123", base_url="")
+        assert client.base_url is None
+        assert "api.openai.com" in str(client.client.base_url)
+
     async def test_make_api_call_success(self):
         """Test successful OpenAI API call."""
         client = OpenAIClient(api_key="sk-test123")

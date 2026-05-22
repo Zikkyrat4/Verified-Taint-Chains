@@ -1,14 +1,14 @@
 {
   "aggregate": {
-    "total_tp": 0,
-    "total_fp": 1,
-    "total_fn": 2,
-    "total_unclassified": 2,
+    "total_tp": 2,
+    "total_fp": 0,
+    "total_fn": 0,
+    "total_unclassified": 0,
     "expected_tp": 2,
-    "precision": 0.0,
-    "precision_strict": 0.0,
-    "recall": 0.0,
-    "f1": 0.0,
+    "precision": 1.0,
+    "precision_strict": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
     "files_analyzed": 1,
     "files_failed": 0
   },
@@ -17,73 +17,17 @@
       "file": "CVE-2019-10076/LinkToTag.java",
       "cve": "CVE-2019-10076",
       "expected_tp": 2,
-      "found_tp": 0,
-      "fp": 1,
-      "fn": 2,
-      "unclassified": 2,
-      "tp_matched": [],
-      "fp_chains": [
+      "found_tp": 2,
+      "fp": 0,
+      "fn": 0,
+      "unclassified": 0,
+      "tp_matched": [
         {
           "chain": {
-            "id": "m_pageName_to_out_4810667584",
-            "type": "other",
-            "cwe": "CWE-904",
-            "vulnerability_label": "unchecked_expression_evaluation",
-            "source": {
-              "variable": "m_pageName",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
-              "line": 86,
-              "code_snippet": "if( m_pageName == null )"
-            },
-            "sink": {
-              "variable": "out",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
-              "line": 102,
-              "code_snippet": "JspWriter out = pageContext.getOut();"
-            },
-            "path": [
-              "m_pageName",
-              "pageName",
-              "url",
-              "out"
-            ],
-            "confidence": 0.8999999999999999
-          },
-          "fp_pattern": {
-            "source_pattern": "pageContext|m_pageName|getVersion",
-            "reason": "Internal JSP context fields"
-          }
-        }
-      ],
-      "fn_chains": [
-        {
-          "id": "TP-1",
-          "source_var": "title",
-          "sink_var": "m_title",
-          "source_line": 69,
-          "sink_line": 127,
-          "vuln_type": "xss",
-          "description": "setTitle(String title) \u2014 attacker-controlled title attribute -> m_title field -> out.print(...m_title...)",
-          "_cwe": "CWE-079"
-        },
-        {
-          "id": "TP-2",
-          "source_var": "access",
-          "sink_var": "m_accesskey",
-          "source_line": 74,
-          "sink_line": 126,
-          "vuln_type": "xss",
-          "description": "setAccesskey(String access) -> m_accesskey field -> out.print(...m_accesskey...)",
-          "_cwe": "CWE-079"
-        }
-      ],
-      "unclassified_chains": [
-        {
-          "chain": {
-            "id": "title_to_out_4827641856",
-            "type": "other",
-            "cwe": "CWE-904",
-            "vulnerability_label": "unchecked_expression_evaluation",
+            "id": "title_to_m_title_4833266176",
+            "type": "xss",
+            "cwe": "CWE-79",
+            "vulnerability_label": "cross_site_scripting",
             "source": {
               "variable": "title",
               "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
@@ -91,25 +35,34 @@
               "code_snippet": "public void setTitle( String title )"
             },
             "sink": {
-              "variable": "out",
+              "variable": "m_title",
               "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
-              "line": 102,
-              "code_snippet": "JspWriter out = pageContext.getOut();"
+              "line": 127,
+              "code_snippet": "+ m_accesskey + \"\\\" title=\\\"\" + m_title + \"\\\">\");"
             },
             "path": [
               "title",
-              "m_title",
-              "out"
+              "m_title"
             ],
-            "confidence": 0.85
+            "confidence": 0.825
+          },
+          "tp": {
+            "id": "TP-1",
+            "source_var": "title",
+            "sink_var": "m_title",
+            "source_line": 69,
+            "sink_line": 127,
+            "vuln_type": "xss",
+            "description": "setTitle(String title) \u2014 attacker-controlled title attribute -> m_title field -> out.print(...m_title...)",
+            "_cwe": "CWE-079"
           }
         },
         {
           "chain": {
-            "id": "access_to_out_4824898880",
-            "type": "other",
-            "cwe": "CWE-904",
-            "vulnerability_label": "unchecked_expression_evaluation",
+            "id": "access_to_m_accesskey_4806590976",
+            "type": "xss",
+            "cwe": "CWE-79",
+            "vulnerability_label": "cross_site_scripting",
             "source": {
               "variable": "access",
               "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
@@ -117,30 +70,42 @@
               "code_snippet": "public void setAccesskey( String access )"
             },
             "sink": {
-              "variable": "out",
+              "variable": "m_accesskey",
               "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
-              "line": 102,
-              "code_snippet": "JspWriter out = pageContext.getOut();"
+              "line": 127,
+              "code_snippet": "+ m_accesskey + \"\\\" title=\\\"\" + m_title + \"\\\">\");"
             },
             "path": [
               "access",
-              "m_accesskey",
-              "out"
+              "m_accesskey"
             ],
-            "confidence": 0.85
+            "confidence": 0.825
+          },
+          "tp": {
+            "id": "TP-2",
+            "source_var": "access",
+            "sink_var": "m_accesskey",
+            "source_line": 74,
+            "sink_line": 126,
+            "vuln_type": "xss",
+            "description": "setAccesskey(String access) -> m_accesskey field -> out.print(...m_accesskey...)",
+            "_cwe": "CWE-079"
           }
         }
       ],
+      "fp_chains": [],
+      "fn_chains": [],
+      "unclassified_chains": [],
       "pipeline_metrics": {
-        "sources_found": 7,
-        "sinks_found": 2,
+        "sources_found": 8,
+        "sinks_found": 4,
         "sanitizers_found": 0,
-        "chains_found": 3,
-        "chains_verified": 3,
+        "chains_found": 2,
+        "chains_verified": 2,
         "verification_rate": 1.0,
-        "explanations_generated": 3,
-        "graph_nodes": 179,
-        "graph_edges": 36
+        "explanations_generated": 2,
+        "graph_nodes": 177,
+        "graph_edges": 35
       },
       "error": null
     }

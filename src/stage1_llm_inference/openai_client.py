@@ -1,6 +1,6 @@
 """OpenAI-specific LLM client implementation."""
 
-from typing import List
+from typing import List, Optional
 
 from openai import AsyncOpenAI, RateLimitError, APITimeoutError
 
@@ -21,12 +21,29 @@ class OpenAIClient(BaseLLMClient):
         model: Name of the OpenAI model to use.
     """
 
-    def __init__(self, api_key: str, model: str = "gpt-4-turbo") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4-turbo",
+        base_url: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> None:
         """Initialize the OpenAI client.
 
         Args:
             api_key: OpenAI API key for authentication.
             model: OpenAI model identifier (default: gpt-4-turbo).
+            base_url: Optional override for the API base URL. Lets you point at
+                an OpenAI-compatible endpoint (Azure OpenAI, a local proxy,
+                LiteLLM, vLLM, etc.). When ``None`` the official OpenAI URL is
+                used.
+            user_agent: Optional override for the ``User-Agent`` header. Some
+                third-party OpenAI-compatible proxies reject the openai SDK's
+                default ``User-Agent`` (``OpenAI/Python``) as automated traffic
+                ("Your request was blocked"). When a custom ``base_url`` is set
+                and no ``user_agent`` is given, a neutral one is sent so such
+                proxies work out of the box. Ignored for the official OpenAI
+                endpoint unless explicitly provided.
 
         Raises:
             ValueError: If api_key is empty.
@@ -37,9 +54,28 @@ class OpenAIClient(BaseLLMClient):
         # Initialize base class
         super().__init__(model=model)
 
-        # Initialize OpenAI client
-        self.client = AsyncOpenAI(api_key=api_key)
-        logger.debug("OpenAI client initialized successfully")
+        # Initialize OpenAI client. Passing base_url=None lets the SDK fall back
+        # to the default OpenAI endpoint, so we only forward a non-empty value.
+        self.base_url = base_url or None
+
+        # Resolve the User-Agent. For a custom (third-party) base_url, default to
+        # a neutral UA so proxies that fingerprint-block the openai SDK accept
+        # the request; for the official endpoint, leave the SDK default intact.
+        effective_ua = user_agent or (None if not self.base_url else "vtc/1.0")
+        self.user_agent = effective_ua
+        default_headers = {"User-Agent": effective_ua} if effective_ua else None
+
+        client_kwargs: dict = {"api_key": api_key}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
+
+        self.client = AsyncOpenAI(**client_kwargs)
+        logger.debug(
+            f"OpenAI client initialized (base_url={self.base_url or 'default'}, "
+            f"user_agent={effective_ua or 'sdk-default'})"
+        )
 
     async def _make_api_call(
         self,

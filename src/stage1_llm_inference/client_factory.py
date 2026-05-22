@@ -56,8 +56,16 @@ def create_llm_client(config: "PipelineConfig") -> BaseLLMClient:
         client = OpenAIClient(
             api_key=config.llm_api_key,
             model=config.llm_model,
+            base_url=config.openai_base_url,
+            user_agent=config.openai_user_agent,
         )
-        logger.info(f"Created OpenAI client with model: {config.llm_model}")
+        if config.openai_base_url:
+            logger.info(
+                f"Created OpenAI client with model: {config.llm_model} "
+                f"at custom base_url: {config.openai_base_url}"
+            )
+        else:
+            logger.info(f"Created OpenAI client with model: {config.llm_model}")
         return client
 
     elif provider == LLMProvider.OLLAMA:

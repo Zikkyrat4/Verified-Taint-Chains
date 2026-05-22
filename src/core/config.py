@@ -35,6 +35,8 @@ class PipelineConfig:
     llm_provider: str = "openai"
     llm_api_key: Optional[str] = None
     llm_model: str = ""  # Will be set based on provider in __post_init__
+    openai_base_url: Optional[str] = None  # override for OpenAI-compatible endpoints
+    openai_user_agent: Optional[str] = None  # override User-Agent (proxies that block the SDK UA)
     ollama_base_url: str = "http://localhost:11434"
     max_path_length: int = 15
     min_confidence: float = 0.6
@@ -122,6 +124,8 @@ def load_config_from_env() -> PipelineConfig:
     Expected environment variables:
         LLM_PROVIDER (optional): LLM provider 'openai' or 'ollama' (default: openai)
         OPENAI_API_KEY (required for OpenAI): OpenAI API key
+        OPENAI_BASE_URL (optional): Override API base URL for OpenAI-compatible
+            endpoints (Azure OpenAI, LiteLLM/vLLM proxy, ...). Default: official OpenAI.
         OPENAI_MODEL (optional): Model name (deprecated, use LLM_MODEL)
         LLM_MODEL (optional): Model name (default depends on provider)
         OLLAMA_BASE_URL (optional): Ollama server URL (default: http://localhost:11434)
@@ -152,6 +156,17 @@ def load_config_from_env() -> PipelineConfig:
 
     # Extract API key (only required for OpenAI)
     api_key = os.getenv("OPENAI_API_KEY")
+
+    # Optional base URL override for OpenAI-compatible endpoints
+    # (Azure OpenAI, LiteLLM/vLLM proxies, self-hosted gateways, ...).
+    # Empty string is treated as "unset" so a blank .env line falls back to the
+    # official OpenAI endpoint.
+    openai_base_url = os.getenv("OPENAI_BASE_URL") or None
+
+    # Optional User-Agent override. Some third-party proxies block the openai
+    # SDK's default UA ("Your request was blocked"); set this to anything
+    # neutral. Empty string = unset.
+    openai_user_agent = os.getenv("OPENAI_USER_AGENT") or None
 
     # Extract model (check both LLM_MODEL and legacy OPENAI_MODEL)
     # Default depends on provider, will be set in __post_init__ if not specified
@@ -235,6 +250,8 @@ def load_config_from_env() -> PipelineConfig:
         llm_provider=provider,
         llm_api_key=api_key,
         llm_model=model,
+        openai_base_url=openai_base_url,
+        openai_user_agent=openai_user_agent,
         ollama_base_url=ollama_base_url,
         max_path_length=max_path_length,
         min_confidence=min_confidence,

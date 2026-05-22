@@ -363,6 +363,128 @@ class SimplePipeline:
             logger.error(f"Project-mode analysis failed: {str(e)}")
             raise TaintAnalysisError(f"Pipeline error: {str(e)}") from e
 
+    async def collect_sinks(
+        self,
+        java_files: List[str],
+        show_progress: bool = False,
+    ) -> Dict[str, Any]:
+        """Stage-1-only sink inventory across an entire project.
+
+        Runs only Stage 1 (LLM specification extraction) on every file and
+        returns the sinks it found — *without* building a graph, discovering
+        taint chains, or requiring a matching source. This surfaces dangerous
+        operations even when no full source→sink chain is confirmed, which is
+        exactly what 0-day triage needs (chain discovery is recall-limited by
+        Stage 1 also extracting the paired source).
+
+        Filtering ("which sinks are dangerous") is left to the caller so it can
+        report how many were dropped; this method returns the raw set.
+
+        Args:
+            java_files: List of paths to Java source files.
+            show_progress: If True, render a progress bar to stderr.
+
+        Returns:
+            Dict with ``files_analyzed`` / ``files_llm_extracted`` /
+            ``files_skipped`` and ``sinks`` — a list of ``(file_path, Sink)``
+            tuples (file path taken from the extraction loop, authoritative).
+
+        Raises:
+            TaintAnalysisError: If extraction fails critically.
+        """
+        # Apply --max-files cap if set (mirror run_project).
+        if self.config.max_files > 0 and len(java_files) > self.config.max_files:
+            logger.info(
+                f"Capping files from {len(java_files)} to "
+                f"{self.config.max_files} (--max-files)"
+            )
+            java_files = java_files[: self.config.max_files]
+
+        logger.info(f"Starting sink-inventory analysis on {len(java_files)} files")
+
+        try:
+            # Partition for ORDERING only (security-matching files first); every
+            # file is analyzed unless VTC_FAST_PREFILTER opts into the old skip.
+            relevant, irrelevant = self._partition_files(java_files)
+            fast_prefilter = os.getenv(
+                "VTC_FAST_PREFILTER", "false"
+            ).lower() in ("true", "1", "yes", "on")
+            if fast_prefilter:
+                logger.info(
+                    f"[fast] Excluding {len(irrelevant)} non-matching files "
+                    f"from Stage 1"
+                )
+            else:
+                relevant = relevant + irrelevant
+                irrelevant = []
+
+            max_concurrent = self.config.max_concurrent_files
+            semaphore = asyncio.Semaphore(max_concurrent)
+            total_relevant = len(relevant)
+            completed = 0
+            start_time = time.monotonic()
+
+            progress: Optional[ProgressReporter] = None
+            if show_progress and total_relevant > 0:
+                progress = ProgressReporter(total_relevant, "Stage 1: Extracting sinks")
+
+            async def extract_one(
+                idx: int, java_file: str, code: str
+            ) -> Tuple[str, Any]:
+                nonlocal completed
+                async with semaphore:
+                    elapsed = time.monotonic() - start_time
+                    avg = elapsed / completed if completed > 0 else 0
+                    remaining = total_relevant - completed
+                    eta = f", ETA ~{avg * remaining:.0f}s" if completed > 0 else ""
+                    file_name = Path(java_file).name
+                    logger.info(
+                        f"Stage 1 [{idx}/{total_relevant}]: "
+                        f"Extracting from {file_name}... "
+                        f"(avg {avg:.1f}s/file{eta})"
+                    )
+                    spec = await self.spec_extractor.extract(
+                        source_code=code,
+                        file_path=java_file,
+                        model=self.config.llm_model,
+                    )
+                    completed += 1
+                    if progress is not None:
+                        progress.update()
+                    return java_file, spec
+
+            tasks = [
+                extract_one(i, fpath, code)
+                for i, (fpath, code) in enumerate(relevant, 1)
+            ]
+            results = await asyncio.gather(*tasks)
+
+            if progress is not None:
+                progress.finish()
+
+            collected: List[Tuple[str, Sink]] = []
+            for java_file, spec in results:
+                for snk in spec.sinks:
+                    collected.append((java_file, snk))
+
+            elapsed_total = time.monotonic() - start_time
+            logger.info(
+                f"✓ Sink inventory complete: {len(collected)} sinks across "
+                f"{total_relevant} files ({len(irrelevant)} skipped) "
+                f"in {elapsed_total:.1f}s"
+            )
+
+            return {
+                "files_analyzed": len(java_files),
+                "files_llm_extracted": total_relevant,
+                "files_skipped": len(irrelevant),
+                "sinks": collected,
+            }
+
+        except Exception as e:
+            logger.error(f"Sink-inventory analysis failed: {str(e)}")
+            raise TaintAnalysisError(f"Pipeline error: {str(e)}") from e
+
     async def _build_scoped_graph(
         self,
         file_code_map: Dict[str, str],
