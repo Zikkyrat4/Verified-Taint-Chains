@@ -9,10 +9,12 @@ from src.pipeline.main import (
     cli,
     _display_results,
     _save_results,
+    _save_results_stage1_snapshot,
     _find_java_files,
     _filter_dangerous_sinks,
     _display_sinks,
     _save_sinks,
+    _save_sinks_snapshot,
     _sink_to_dict,
 )
 from src.core.config import PipelineConfig
@@ -429,6 +431,80 @@ class TestSaveResults:
         assert vuln["source"]["file"] == "test.java"
         assert vuln["sink"]["file"] == "test.java"
 
+    def test_save_results_marks_final_not_partial(self, tmp_path, sample_result):
+        """Final analyze save: partial=False, stage_completed=4."""
+        output_path = str(tmp_path / "out.json")
+        _save_results(sample_result, output_path)
+        data = json.loads((tmp_path / "out.json").read_text())
+        assert data["partial"] is False
+        assert data["stage_completed"] == 4
+
+    def test_save_results_atomic_no_tmp_leftover(self, tmp_path, sample_result):
+        """Atomic write via .tmp + os.replace — no .tmp lingers."""
+        output_path = str(tmp_path / "out.json")
+        _save_results(sample_result, output_path)
+        assert (tmp_path / "out.json").exists()
+        assert not (tmp_path / "out.json.tmp").exists()
+
+    def test_stage1_snapshot_project_schema(self, tmp_path):
+        """Project-mode Stage 1 snapshot: partial, stage1_inventory, empty vulns."""
+        source = Source(
+            location=CodeLocation(file_path="A.java", line_number=5),
+            variable_name="x", type="HTTP",
+            confidence=0.9, code_snippet="x = req.getParameter()",
+        )
+        sink = Sink(
+            location=CodeLocation(file_path="A.java", line_number=10),
+            variable_name="y", type="SQL",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+            confidence=0.9, code_snippet="exec(y)",
+        )
+        snapshot = {
+            "files_analyzed": 2,
+            "files_llm_extracted": 2,
+            "files_skipped": 0,
+            "file_list": ["A.java", "B.java"],
+            "sources": [source],
+            "sinks": [sink],
+            "sanitizers": [],
+        }
+        out = tmp_path / "snap.json"
+        _save_results_stage1_snapshot(str(out), snapshot, is_multi_file=True)
+
+        data = json.loads(out.read_text())
+        assert data["analysis_mode"] == "project"
+        assert data["partial"] is True
+        assert data["stage_completed"] == 1
+        assert data["files_analyzed"] == 2
+        assert data["file_list"] == ["A.java", "B.java"]
+        assert data["vulnerabilities"] == []
+        assert data["total_chains"] == 0
+        assert data["metrics"]["sources_found"] == 1
+        assert data["metrics"]["sinks_found"] == 1
+        assert data["stage1_inventory"]["sources"][0]["variable"] == "x"
+        assert data["stage1_inventory"]["sinks"][0]["variable"] == "y"
+
+    def test_stage1_snapshot_single_file_schema(self, tmp_path):
+        """Single-file Stage 1 snapshot uses 'file' instead of 'file_list'."""
+        snapshot = {
+            "files_analyzed": 1,
+            "files_llm_extracted": 1,
+            "files_skipped": 0,
+            "file_list": ["only.java"],
+            "sources": [],
+            "sinks": [],
+            "sanitizers": [],
+        }
+        out = tmp_path / "snap.json"
+        _save_results_stage1_snapshot(str(out), snapshot, is_multi_file=False)
+
+        data = json.loads(out.read_text())
+        assert data["file"] == "only.java"
+        assert "file_list" not in data
+        assert "analysis_mode" not in data
+        assert data["partial"] is True
+        assert data["stage_completed"] == 1
+
 
 def _make_sink(category, conf=0.9, var="x", line=1, file_path="A.java"):
     return Sink(
@@ -536,6 +612,61 @@ class TestSinkInventory:
         assert data["total_sinks_dangerous"] == 1
         assert data["filter"]["exclude_benign"] is True
         assert all(s["sink_category"] != "benign" for s in data["sinks"])
+
+    def test_save_sinks_marks_final_not_partial(self, tmp_path):
+        """Final save sets partial=False and files_done == files_analyzed."""
+        result = {
+            "files_analyzed": 3,
+            "files_llm_extracted": 3,
+            "files_skipped": 0,
+            "sinks": [
+                ("A.java", _make_sink(SinkCategory.DIRECT_EXECUTION)),
+            ],
+        }
+        dangerous = _filter_dangerous_sinks(result["sinks"], 0.6)
+        out = tmp_path / "sinks.json"
+        _save_sinks(result, dangerous, 0.6, str(out))
+
+        data = json.loads(out.read_text())
+        assert data["partial"] is False
+        assert data["files_done"] == 3
+
+    def test_save_sinks_snapshot_writes_partial_state(self, tmp_path):
+        """Snapshot reflects mid-run state with partial=True and files_done."""
+        running = [
+            ("A.java", _make_sink(SinkCategory.DIRECT_EXECUTION)),
+            ("A.java", _make_sink(SinkCategory.BENIGN)),
+        ]
+        out = tmp_path / "sinks.json"
+        _save_sinks_snapshot(
+            str(out),
+            running,
+            files_total=5,
+            files_done=2,
+            min_confidence=0.6,
+            partial=True,
+        )
+        data = json.loads(out.read_text())
+        assert data["partial"] is True
+        assert data["files_analyzed"] == 5
+        assert data["files_done"] == 2
+        assert data["total_sinks_raw"] == 2
+        assert data["total_sinks_dangerous"] == 1
+        assert data["sinks"][0]["sink_category"] == "direct_execution"
+
+    def test_save_sinks_snapshot_is_atomic(self, tmp_path):
+        """Atomic write: no .tmp file lingers after a successful snapshot."""
+        out = tmp_path / "sinks.json"
+        _save_sinks_snapshot(
+            str(out),
+            [],
+            files_total=1,
+            files_done=0,
+            min_confidence=0.6,
+            partial=True,
+        )
+        assert out.exists()
+        assert not (tmp_path / "sinks.json.tmp").exists()
 
     def test_sinks_command_end_to_end(self, runner, tmp_path):
         """sinks command: mocked collect_sinks → filtered display + JSON save."""

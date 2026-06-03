@@ -5,7 +5,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import networkx as nx
 
@@ -86,7 +86,11 @@ class SimplePipeline:
             f"use_joern={config.use_joern}"
         )
 
-    async def run(self, source_file: str) -> Dict[str, Any]:
+    async def run(
+        self,
+        source_file: str,
+        on_stage1_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
         """Execute complete pipeline on source file.
 
         Runs all 4 stages in sequence:
@@ -97,6 +101,11 @@ class SimplePipeline:
 
         Args:
             source_file: Path to Java source file to analyze.
+            on_stage1_complete: Optional callback fired after Stage 1 with a
+                snapshot dict ``{files_analyzed, file_list, sources, sinks,
+                sanitizers}``. Used by the CLI to write an incremental JSON
+                snapshot so a Stage 2-4 crash leaves the LLM-extracted
+                source/sink inventory durable on disk.
 
         Returns:
             Dictionary containing results from all stages with metrics.
@@ -129,6 +138,22 @@ class SimplePipeline:
                 f"✓ Stage 1 complete: Found {len(sources)} sources, {len(sinks)} sinks, "
                 f"{len(sanitizers)} sanitizers"
             )
+
+            if on_stage1_complete is not None:
+                try:
+                    on_stage1_complete({
+                        "files_analyzed": 1,
+                        "files_llm_extracted": 1,
+                        "files_skipped": 0,
+                        "file_list": [source_file],
+                        "sources": list(sources),
+                        "sinks": list(sinks),
+                        "sanitizers": list(sanitizers),
+                    })
+                except Exception as cb_err:
+                    logger.warning(
+                        f"on_stage1_complete callback failed: {cb_err}"
+                    )
 
             # ============ STAGES 2-4: Path Discovery, Verification, Explanation ============
             result = await self._run_stages(source_code, sources, sinks, sanitizers)
@@ -223,6 +248,7 @@ class SimplePipeline:
         self,
         java_files: List[str],
         show_progress: bool = False,
+        on_stage1_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Execute pipeline in project mode with per-file graph scoping.
 
@@ -234,6 +260,11 @@ class SimplePipeline:
         Args:
             java_files: List of paths to Java source files.
             show_progress: If True, render a progress bar to stderr.
+            on_stage1_complete: Optional callback fired after Stage 1 with a
+                snapshot dict ``{files_analyzed, files_llm_extracted,
+                files_skipped, file_list, sources, sinks, sanitizers}``. Used by
+                the CLI to write an incremental JSON snapshot so a Stage 2-4
+                crash leaves the LLM-extracted inventory durable on disk.
 
         Returns:
             Dictionary containing unified results with metrics.
@@ -346,6 +377,22 @@ class SimplePipeline:
                 f"({len(irrelevant)} skipped) in {elapsed_total:.1f}s"
             )
 
+            if on_stage1_complete is not None:
+                try:
+                    on_stage1_complete({
+                        "files_analyzed": len(java_files),
+                        "files_llm_extracted": total_relevant,
+                        "files_skipped": len(irrelevant),
+                        "file_list": java_files,
+                        "sources": list(all_sources),
+                        "sinks": list(all_sinks),
+                        "sanitizers": list(all_sanitizers),
+                    })
+                except Exception as cb_err:
+                    logger.warning(
+                        f"on_stage1_complete callback failed: {cb_err}"
+                    )
+
             # Stages 2-4: scoped graph analysis
             result = await self._run_stages_project(
                 file_code_map, file_sources, file_sinks,
@@ -367,6 +414,7 @@ class SimplePipeline:
         self,
         java_files: List[str],
         show_progress: bool = False,
+        on_file_done: Optional[Callable[[str, List[Sink]], None]] = None,
     ) -> Dict[str, Any]:
         """Stage-1-only sink inventory across an entire project.
 
@@ -383,6 +431,11 @@ class SimplePipeline:
         Args:
             java_files: List of paths to Java source files.
             show_progress: If True, render a progress bar to stderr.
+            on_file_done: Optional callback ``(file_path, sinks)`` invoked after
+                each file finishes Stage 1. Used by the CLI to write incremental
+                JSON snapshots so partial results survive interruption on long
+                project runs. Asyncio is single-threaded so concurrent extracts
+                cannot interleave callbacks — no locking required.
 
         Returns:
             Dict with ``files_analyzed`` / ``files_llm_extracted`` /
@@ -451,6 +504,14 @@ class SimplePipeline:
                     completed += 1
                     if progress is not None:
                         progress.update()
+                    if on_file_done is not None:
+                        try:
+                            on_file_done(java_file, list(spec.sinks))
+                        except Exception as cb_err:
+                            logger.warning(
+                                f"on_file_done callback failed for "
+                                f"{java_file}: {cb_err}"
+                            )
                     return java_file, spec
 
             tasks = [

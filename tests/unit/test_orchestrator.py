@@ -421,6 +421,70 @@ class TestRunProject:
         # Only 3 files should be analyzed
         assert result["files_analyzed"] == 3
 
+    @pytest.mark.asyncio
+    async def test_run_project_fires_stage1_callback_before_stage2(
+        self, test_config, tmp_path
+    ):
+        """on_stage1_complete fires after Stage 1 extracts, before Stages 2-4.
+
+        Critical for incremental save: if Stage 2-4 crashes, the snapshot has
+        the full extracted inventory on disk.
+        """
+        file_a = tmp_path / "A.java"
+        file_a.write_text('String x = request.getParameter("q"); stmt.execute(x);')
+
+        mock_spec = MagicMock()
+        mock_spec.sources = []
+        mock_spec.sinks = []
+        mock_spec.sanitizers = []
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract = AsyncMock(return_value=mock_spec)
+
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor = mock_extractor
+
+        captured = []
+
+        def _on_stage1(snap):
+            captured.append(snap)
+
+        await pipeline.run_project([str(file_a)], on_stage1_complete=_on_stage1)
+
+        assert len(captured) == 1
+        snap = captured[0]
+        assert snap["files_analyzed"] == 1
+        assert snap["file_list"] == [str(file_a)]
+        assert "sources" in snap and "sinks" in snap and "sanitizers" in snap
+
+    @pytest.mark.asyncio
+    async def test_run_project_stage1_callback_error_does_not_abort(
+        self, test_config, tmp_path
+    ):
+        """A throwing Stage 1 callback is swallowed — Stages 2-4 still run."""
+        file_a = tmp_path / "A.java"
+        file_a.write_text('String x = request.getParameter("q"); stmt.execute(x);')
+
+        mock_spec = MagicMock()
+        mock_spec.sources = []
+        mock_spec.sinks = []
+        mock_spec.sanitizers = []
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract = AsyncMock(return_value=mock_spec)
+
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor = mock_extractor
+
+        def _boom(snap):
+            raise RuntimeError("disk full")
+
+        # Should NOT raise — error is logged and swallowed.
+        result = await pipeline.run_project(
+            [str(file_a)], on_stage1_complete=_boom
+        )
+        assert result["files_analyzed"] == 1
+
 
 # ============================================================================
 # Quality filter — generic LLM-hallucination guard

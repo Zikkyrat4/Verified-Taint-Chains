@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -271,15 +272,35 @@ async def _analyze(
         # Create pipeline (reused for all files)
         pipeline = SimplePipeline(config)
 
+        # Stage 1 snapshot: after the longest (LLM) stage completes, dump the
+        # source/sink inventory so a Stage 2-4 crash leaves a triagable file on
+        # disk. The final _save_results overwrites this with the full result.
+        stage1_callback = None
+        if output:
+            def _on_stage1(snapshot: Dict[str, Any]):
+                try:
+                    _save_results_stage1_snapshot(
+                        output, snapshot, is_multi_file=is_multi_file
+                    )
+                except OSError as snap_err:
+                    logger.warning(
+                        f"Failed to write Stage 1 snapshot: {snap_err}"
+                    )
+            stage1_callback = _on_stage1
+
         if is_multi_file:
             # Project mode: unified cross-file analysis
             result = await pipeline.run_project(
                 java_files,
                 show_progress=sys.stderr.isatty(),
+                on_stage1_complete=stage1_callback,
             )
         else:
             # Single-file mode
-            result = await pipeline.run(java_files[0])
+            result = await pipeline.run(
+                java_files[0],
+                on_stage1_complete=stage1_callback,
+            )
 
         _display_results(result, verbose)
 
@@ -427,9 +448,36 @@ async def _sinks(
         click.echo(f"{'='*70}\n")
 
         pipeline = SimplePipeline(config)
+
+        # Incremental save: after each file's Stage 1 finishes, rewrite the
+        # output JSON atomically (.tmp + os.replace) so a Ctrl-C or crash on a
+        # long real-project run leaves a valid partial result on disk.
+        collected_running: List[Any] = []
+        files_done = [0]
+
+        def _on_file_done(file_path: str, sinks: list):
+            files_done[0] += 1
+            for snk in sinks:
+                collected_running.append((file_path, snk))
+            if output:
+                try:
+                    _save_sinks_snapshot(
+                        output,
+                        collected_running,
+                        files_total=len(java_files),
+                        files_done=files_done[0],
+                        min_confidence=config.min_confidence,
+                        partial=True,
+                    )
+                except OSError as snap_err:
+                    logger.warning(
+                        f"Failed to write partial snapshot: {snap_err}"
+                    )
+
         result = await pipeline.collect_sinks(
             java_files,
             show_progress=sys.stderr.isatty(),
+            on_file_done=_on_file_done if output else None,
         )
 
         dangerous = _filter_dangerous_sinks(result["sinks"], config.min_confidence)
@@ -657,10 +705,12 @@ def _sink_to_dict(file_path: str, sink) -> dict:
 def _save_sinks(
     result: dict, dangerous: list, min_confidence: float, output_path: str
 ):
-    """Save the dangerous-sink inventory to a JSON file."""
+    """Save the final dangerous-sink inventory to a JSON file (atomic)."""
     output_data = {
         "analysis_mode": "sinks",
+        "partial": False,
         "files_analyzed": result["files_analyzed"],
+        "files_done": result["files_analyzed"],
         "filter": {
             "exclude_benign": True,
             "min_confidence": min_confidence,
@@ -669,18 +719,57 @@ def _save_sinks(
         "total_sinks_dangerous": len(dangerous),
         "sinks": [_sink_to_dict(file_path, sink) for file_path, sink in dangerous],
     }
+    _atomic_write_json(output_path, output_data)
 
-    with open(output_path, "w") as f:
-        json.dump(output_data, f, indent=2)
+
+def _save_sinks_snapshot(
+    output_path: str,
+    collected_running: list,
+    *,
+    files_total: int,
+    files_done: int,
+    min_confidence: float,
+    partial: bool,
+):
+    """Write a mid-run snapshot of the sink inventory atomically.
+
+    Filtering matches ``_filter_dangerous_sinks`` so the on-disk file always
+    reflects the same shape readers expect from the final output.
+    """
+    dangerous = _filter_dangerous_sinks(collected_running, min_confidence)
+    snapshot = {
+        "analysis_mode": "sinks",
+        "partial": partial,
+        "files_analyzed": files_total,
+        "files_done": files_done,
+        "filter": {
+            "exclude_benign": True,
+            "min_confidence": min_confidence,
+        },
+        "total_sinks_raw": len(collected_running),
+        "total_sinks_dangerous": len(dangerous),
+        "sinks": [_sink_to_dict(fp, s) for fp, s in dangerous],
+    }
+    _atomic_write_json(output_path, snapshot)
+
+
+def _atomic_write_json(output_path: str, data: dict):
+    """Write JSON via tmp + os.replace so readers never see a partial file."""
+    tmp_path = f"{output_path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, output_path)
 
 
 def _save_results(result: dict, output_path: str):
-    """Save results to JSON file."""
+    """Save final analyze results to JSON file (atomic, partial=false)."""
     is_project = "files_analyzed" in result
 
     if is_project:
         output_data = {
             "analysis_mode": "project",
+            "partial": False,
+            "stage_completed": 4,
             "files_analyzed": result["files_analyzed"],
             "file_list": result.get("file_list", []),
             "total_chains": result["total_chains"],
@@ -693,6 +782,8 @@ def _save_results(result: dict, output_path: str):
     else:
         output_data = {
             "file": result["file"],
+            "partial": False,
+            "stage_completed": 4,
             "total_chains": result["total_chains"],
             "metrics": result["metrics"],
             "vulnerabilities": [
@@ -701,9 +792,76 @@ def _save_results(result: dict, output_path: str):
             ],
         }
 
-    # Write to file
-    with open(output_path, "w") as f:
-        json.dump(output_data, f, indent=2)
+    _atomic_write_json(output_path, output_data)
+
+
+def _source_to_dict(source) -> dict:
+    """Convert a Source to a JSON-serializable dict for Stage 1 inventory."""
+    category = getattr(source, "source_category", None)
+    return {
+        "file": source.location.file_path,
+        "line": source.location.line_number,
+        "variable": source.variable_name,
+        "type": source.type,
+        "source_category": category.value if category else None,
+        "confidence": source.confidence,
+        "code_snippet": source.code_snippet,
+    }
+
+
+def _save_results_stage1_snapshot(
+    output_path: str, snapshot: dict, *, is_multi_file: bool
+):
+    """Write a Stage-1-boundary snapshot of analyze results (partial=true).
+
+    Matches the final ``_save_results`` schema (so readers don't switch
+    schemas mid-run): same keys, plus ``stage1_inventory`` with the raw
+    extracted sources and sinks. ``vulnerabilities`` is empty until Stages
+    2-4 run; on success the final write replaces this snapshot.
+    """
+    sources = snapshot["sources"]
+    sinks = snapshot["sinks"]
+    sanitizers = snapshot["sanitizers"]
+
+    metrics = {
+        "sources_found": len(sources),
+        "sinks_found": len(sinks),
+        "sanitizers_found": len(sanitizers),
+        "chains_found": 0,
+        "chains_verified": 0,
+        "verification_rate": 0.0,
+        "explanations_generated": 0,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+    }
+    inventory = {
+        "sources": [_source_to_dict(s) for s in sources],
+        "sinks": [_sink_to_dict(s.location.file_path, s) for s in sinks],
+    }
+
+    if is_multi_file:
+        data = {
+            "analysis_mode": "project",
+            "partial": True,
+            "stage_completed": 1,
+            "files_analyzed": snapshot["files_analyzed"],
+            "file_list": snapshot["file_list"],
+            "total_chains": 0,
+            "metrics": metrics,
+            "stage1_inventory": inventory,
+            "vulnerabilities": [],
+        }
+    else:
+        data = {
+            "file": snapshot["file_list"][0],
+            "partial": True,
+            "stage_completed": 1,
+            "total_chains": 0,
+            "metrics": metrics,
+            "stage1_inventory": inventory,
+            "vulnerabilities": [],
+        }
+    _atomic_write_json(output_path, data)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,56 @@ async def test_collect_sinks_no_chain_pipeline(tmp_path, test_config):
 
 
 @pytest.mark.asyncio
+async def test_collect_sinks_invokes_on_file_done_per_file(tmp_path, test_config):
+    """Callback fires once per file with that file's sinks — enables incremental saves."""
+    pipeline = SimplePipeline(test_config)
+
+    fa = tmp_path / "A.java"
+    fa.write_text("class A {}")
+    fb = tmp_path / "B.java"
+    fb.write_text("class B {}")
+
+    def fake_extract(source_code="", file_path="", model=""):
+        spec = MagicMock()
+        spec.sinks = [_make_sink(file_path)]
+        return spec
+
+    pipeline.spec_extractor.extract = AsyncMock(side_effect=fake_extract)
+
+    callbacks = []
+
+    def _on_done(file_path, sinks):
+        callbacks.append((file_path, len(sinks)))
+
+    await pipeline.collect_sinks([str(fa), str(fb)], on_file_done=_on_done)
+
+    assert len(callbacks) == 2
+    assert {fp for fp, _ in callbacks} == {str(fa), str(fb)}
+    assert all(n == 1 for _, n in callbacks)
+
+
+@pytest.mark.asyncio
+async def test_collect_sinks_callback_error_does_not_abort(tmp_path, test_config):
+    """A throwing callback is logged and swallowed — extraction must still complete."""
+    pipeline = SimplePipeline(test_config)
+
+    fa = tmp_path / "A.java"
+    fa.write_text("class A {}")
+
+    spec = MagicMock()
+    spec.sinks = [_make_sink(str(fa))]
+    pipeline.spec_extractor.extract = AsyncMock(return_value=spec)
+
+    def _on_done(file_path, sinks):
+        raise RuntimeError("disk full")
+
+    result = await pipeline.collect_sinks([str(fa)], on_file_done=_on_done)
+
+    assert result["files_analyzed"] == 1
+    assert len(result["sinks"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_collect_sinks_respects_max_files(tmp_path, test_config):
     """--max-files caps the number of files handed to Stage 1."""
     test_config.max_files = 1
