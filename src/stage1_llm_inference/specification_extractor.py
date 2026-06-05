@@ -22,6 +22,7 @@ from src.stage1_llm_inference.prompt_templates import (
     build_combined_prompt,
 )
 from src.stage1_llm_inference.sanitizer_detector import StaticSanitizerDetector
+from src.stage1_llm_inference.spec_cache import SpecCache
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -39,13 +40,24 @@ class SimpleSpecificationExtractor:
     """
 
     def __init__(
-        self, llm_client: SimpleLLMClient, confidence_threshold: float = 0.5
+        self,
+        llm_client: SimpleLLMClient,
+        confidence_threshold: float = 0.5,
+        spec_cache: Optional[SpecCache] = None,
+        llm_provider: str = "",
     ) -> None:
         """Initialize the specification extractor.
 
         Args:
             llm_client: SimpleLLMClient instance for LLM-based analysis.
             confidence_threshold: Minimum confidence score (0.0-1.0) to include items.
+            spec_cache: Optional ``SpecCache`` for persistent per-file caching.
+                When provided, ``extract`` returns cached results on content
+                match and writes new results back. Pass ``None`` to disable.
+            llm_provider: Provider identifier (``"openai"`` / ``"ollama"``).
+                Used as part of the cache key so the same model on different
+                providers (e.g. OpenAI vs local proxy) can't collide. Required
+                when ``spec_cache`` is set; ignored otherwise.
 
         Raises:
             ValueError: If confidence_threshold is not in [0.0, 1.0].
@@ -57,6 +69,8 @@ class SimpleSpecificationExtractor:
         self.confidence_threshold = confidence_threshold
         self.ast_parser = JavaASTParser()
         self.sanitizer_detector = StaticSanitizerDetector()
+        self.spec_cache = spec_cache
+        self.llm_provider = llm_provider
 
         logger.info(
             f"Initialized SimpleSpecificationExtractor with threshold={confidence_threshold}"
@@ -109,14 +123,63 @@ class SimpleSpecificationExtractor:
         statements = [s for s in body.split(";") if s.strip()]
         return len(statements) <= 2
 
+    def _has_potential_sinks(self, source_code: str) -> bool:
+        """True if the file structurally COULD contain a sink.
+
+        A sink is, by definition, a method invocation (or constructor call)
+        that consumes tainted data. A file with **zero** method invocations
+        / object creations anywhere — pure DTOs, marker interfaces, enums
+        without methods, ``package-info.java``, empty class shells —
+        provably cannot contain a sink.
+
+        We therefore skip the entire LLM call on such files. This is strict-
+        ly stronger than the keyword regex prefilter (which guards 0-day
+        coverage by definition): "no method invocations" is an AST fact, not
+        a heuristic. It cannot hide a sink that uses an unfamiliar API.
+
+        Falls back to ``True`` (analyze) when tree-sitter is unavailable so
+        the prefilter never introduces false negatives in degraded mode.
+        """
+        parser = self.ast_parser.parser
+        if parser is None:
+            # No AST → be conservative: pretend it could have sinks.
+            return True
+        try:
+            tree = parser.parse(source_code.encode("utf-8"))
+        except Exception as e:  # noqa: BLE001 — never block extraction on this
+            logger.debug(f"AST parse for prefilter failed: {e}; assuming sinks possible")
+            return True
+
+        # Iterative BFS — Python recursion limit could bite on deeply nested
+        # generics or lambdas. The call set is small; either we find a call
+        # node quickly or there are truly zero.
+        stack = [tree.root_node]
+        # ``method_invocation`` and ``object_creation_expression`` cover
+        # ``foo.bar(x)`` and ``new Foo(x)`` — the only ways to consume tainted
+        # data in Java. Annotations are intentionally NOT counted: they're
+        # syntactically calls but don't execute application code.
+        call_node_types = {"method_invocation", "object_creation_expression"}
+        while stack:
+            node = stack.pop()
+            if node.type in call_node_types:
+                return True
+            stack.extend(node.children)
+        return False
+
     async def extract(
         self, source_code: str, file_path: str = "", model: str = "gpt-4-turbo"
     ) -> Specification:
         """Extract security specification from Java source code.
 
-        Uses a **single combined prompt** per function (sources + sinks together)
-        to halve the number of LLM calls compared to separate prompts.
-        Functions without security-relevant patterns are skipped entirely.
+        Cache- and prefilter-aware wrapper. Order of checks (cheap→expensive):
+
+        1. ``spec_cache.get`` — if a prior identical run cached this file's
+           specification, replay it verbatim (no LLM call).
+        2. ``_has_potential_sinks`` — if the file structurally has no method
+           invocations, return an empty specification (no LLM call). The
+           result is cached so subsequent runs short-circuit at step 1.
+        3. ``_extract_uncached`` — the original full LLM-driven pipeline. The
+           result is cached for next time.
 
         Args:
             source_code: Java source code to analyze.
@@ -133,6 +196,59 @@ class SimpleSpecificationExtractor:
         if not source_code or not source_code.strip():
             raise ValueError("source_code cannot be empty")
 
+        cache_kwargs = self._cache_kwargs(model)
+
+        # Step 1: cache hit?
+        if self.spec_cache is not None and cache_kwargs is not None:
+            cached = self.spec_cache.get(source_code, **cache_kwargs)
+            if cached is not None:
+                logger.info(
+                    f"Cache hit for {file_path or 'inline code'} "
+                    f"(skipping Stage 1 LLM)"
+                )
+                return cached
+
+        # Step 2: AST prefilter — zero possibility of a sink in this file.
+        if not self._has_potential_sinks(source_code):
+            logger.info(
+                f"Skipping {file_path or 'inline code'}: AST prefilter "
+                f"found no method invocations (sink impossible)"
+            )
+            empty = Specification(
+                sources=[], sinks=[], sanitizers=[], llm_model=model,
+            )
+            if self.spec_cache is not None and cache_kwargs is not None:
+                self.spec_cache.put(source_code, empty, **cache_kwargs)
+            return empty
+
+        # Step 3: the full LLM-driven extraction (original logic).
+        spec = await self._extract_uncached(source_code, file_path, model)
+        if self.spec_cache is not None and cache_kwargs is not None:
+            self.spec_cache.put(source_code, spec, **cache_kwargs)
+        return spec
+
+    def _cache_kwargs(self, model: str) -> Optional[Dict[str, Any]]:
+        """Build the keyword args used to compute a stable cache key.
+
+        Returns ``None`` if no provider was wired in — caching is skipped
+        rather than producing keys that could collide across providers.
+        """
+        if not self.llm_provider:
+            return None
+        return {
+            "llm_provider": self.llm_provider,
+            "llm_model": model,
+            "min_confidence": self.confidence_threshold,
+        }
+
+    async def _extract_uncached(
+        self, source_code: str, file_path: str = "", model: str = "gpt-4-turbo"
+    ) -> Specification:
+        """Original LLM-driven extraction pipeline (no cache, no prefilter).
+
+        Split out from ``extract`` so the cache/prefilter layer can wrap it
+        without touching the LLM logic.
+        """
         logger.info(f"Starting extraction from {file_path or 'inline code'}")
 
         # Extract global context (imports, classes)

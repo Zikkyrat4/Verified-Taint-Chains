@@ -13,6 +13,7 @@ import click
 from src.core.config import load_config_from_env
 from src.core.models import SinkCategory
 from src.pipeline.orchestrator import SimplePipeline
+from src.stage1_llm_inference.spec_cache import default_cache_dir
 from src.utils.logger import enable_stderr, get_logger
 
 logger = get_logger()
@@ -77,6 +78,50 @@ def _count_all_java(path: str) -> int:
     if p.is_file():
         return 1
     return sum(1 for _ in p.rglob("*.java"))
+
+
+def _apply_cache_settings(
+    config, source_path: str, no_cache: bool, cache_dir: Optional[str]
+) -> None:
+    """Resolve final cache settings into ``config``.
+
+    CLI flags win over env, env wins over defaults. Default cache_dir is
+    resolved against the *target* source path (`<source_path>/.vtc-cache`)
+    because the orchestrator doesn't know the source path at __init__ time.
+    """
+    if no_cache:
+        config.cache_enabled = False
+        config.cache_dir = None
+        return
+    if not config.cache_enabled:
+        # Env says off and no CLI override turns it on; leave as is.
+        return
+    if cache_dir:
+        config.cache_dir = cache_dir
+    elif not config.cache_dir:
+        config.cache_dir = str(default_cache_dir(source_path))
+
+
+def _cache_status_line(config) -> str:
+    """Human-readable Cache: ... line for the CONFIGURATION block."""
+    if not config.cache_enabled:
+        return "disabled"
+    where = config.cache_dir or "(unset)"
+    return f"enabled ({where})"
+
+
+def _display_cache_summary(pipeline) -> None:
+    """Print cache hit/miss/write stats after a run.
+
+    Silent when no cache was wired or no Stage 1 calls happened.
+    """
+    cache = getattr(pipeline, "spec_cache", None)
+    if cache is None:
+        return
+    total = cache.stats.hits + cache.stats.misses
+    if total == 0:
+        return
+    click.echo(f"\n{cache.summary_line()}")
 
 
 @click.group()
@@ -154,6 +199,17 @@ def cli():
     help="Анализировать также тест-код (src/test/**, *Test.java). По умолчанию пропускается.",
 )
 @click.option(
+    "--no-cache",
+    is_flag=True,
+    help="Отключить persistent кэш Stage 1 (.vtc-cache/). По умолчанию включён.",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(),
+    default=None,
+    help="Путь к каталогу кэша. По умолчанию <source_path>/.vtc-cache.",
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -169,6 +225,8 @@ def analyze(
     max_files: int,
     max_concurrent: int,
     include_tests: bool,
+    no_cache: bool,
+    cache_dir: Optional[str],
     verbose: bool,
 ):
     """Анализ Java-файла или директории на уязвимости.
@@ -199,6 +257,8 @@ def analyze(
             max_files,
             max_concurrent,
             include_tests,
+            no_cache,
+            cache_dir,
             verbose,
         )
     )
@@ -214,6 +274,8 @@ async def _analyze(
     max_files: int,
     max_concurrent: int,
     include_tests: bool,
+    no_cache: bool,
+    cache_dir: Optional[str],
     verbose: bool,
 ):
     """Внутренняя async-функция анализа."""
@@ -243,6 +305,10 @@ async def _analyze(
         if max_concurrent > 0:
             config.max_concurrent_files = max_concurrent
 
+        # Resolve cache settings. CLI flags override env. cache_dir default
+        # depends on the target source path, so it can only be picked here.
+        _apply_cache_settings(config, source_path, no_cache, cache_dir)
+
         # Find Java files (skips build/generated/vendor/test code by default)
         java_files = _find_java_files(source_path, include_tests=include_tests)
         if not java_files:
@@ -262,6 +328,7 @@ async def _analyze(
         click.echo(f"Verification: {config.verification_level}")
         click.echo(f"Graph builder: {'LLM-enriched' if config.use_llm_graph_builder else 'regex-only'}")
         click.echo(f"Min confidence: {config.min_confidence}")
+        click.echo(f"Cache: {_cache_status_line(config)}")
         click.echo(f"Source: {source_path}")
         if is_multi_file:
             click.echo(f"Files to analyze: {len(java_files)}")
@@ -303,6 +370,7 @@ async def _analyze(
             )
 
         _display_results(result, verbose)
+        _display_cache_summary(pipeline)
 
         if output:
             _save_results(result, output)
@@ -356,6 +424,17 @@ async def _analyze(
     help="Анализировать также тест-код (src/test/**, *Test.java). По умолчанию пропускается.",
 )
 @click.option(
+    "--no-cache",
+    is_flag=True,
+    help="Отключить persistent кэш Stage 1 (.vtc-cache/). По умолчанию включён.",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(),
+    default=None,
+    help="Путь к каталогу кэша. По умолчанию <source_path>/.vtc-cache.",
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -369,6 +448,8 @@ def sinks(
     max_files: int,
     max_concurrent: int,
     include_tests: bool,
+    no_cache: bool,
+    cache_dir: Optional[str],
     verbose: bool,
 ):
     """Собрать инвентарь ОПАСНЫХ синков по всему проекту (только Stage 1).
@@ -399,6 +480,8 @@ def sinks(
             max_files,
             max_concurrent,
             include_tests,
+            no_cache,
+            cache_dir,
             verbose,
         )
     )
@@ -412,6 +495,8 @@ async def _sinks(
     max_files: int,
     max_concurrent: int,
     include_tests: bool,
+    no_cache: bool,
+    cache_dir: Optional[str],
     verbose: bool,
 ):
     """Внутренняя async-функция инвентаря синков."""
@@ -427,6 +512,8 @@ async def _sinks(
         if max_concurrent > 0:
             config.max_concurrent_files = max_concurrent
 
+        _apply_cache_settings(config, source_path, no_cache, cache_dir)
+
         java_files = _find_java_files(source_path, include_tests=include_tests)
         if not java_files:
             click.echo("No .java files found.")
@@ -441,6 +528,7 @@ async def _sinks(
         click.echo(f"LLM Model: {config.llm_model}")
         click.echo(f"Min confidence: {config.min_confidence}")
         click.echo(f"Mode: sink inventory (Stage 1 only)")
+        click.echo(f"Cache: {_cache_status_line(config)}")
         click.echo(f"Source: {source_path}")
         click.echo(f"Files to analyze: {len(java_files)}")
         if skipped > 0:
@@ -483,6 +571,7 @@ async def _sinks(
         dangerous = _filter_dangerous_sinks(result["sinks"], config.min_confidence)
 
         _display_sinks(result, dangerous, verbose)
+        _display_cache_summary(pipeline)
 
         if output:
             _save_sinks(result, dangerous, config.min_confidence, output)

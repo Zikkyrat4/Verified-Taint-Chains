@@ -696,3 +696,72 @@ class TestSinkInventory:
         data = json.loads(out.read_text())
         assert data["total_sinks_raw"] == 2
         assert data["total_sinks_dangerous"] == 1
+
+
+class TestCacheCLIFlags:
+    """--no-cache / --cache-dir flags on both analyze and sinks."""
+
+    def _config(self):
+        return PipelineConfig(
+            llm_provider="ollama", min_confidence=0.6, use_llm_graph_builder=False
+        )
+
+    def test_no_cache_flag_disables_cache(self, runner, tmp_path):
+        """--no-cache → config.cache_enabled becomes False before pipeline init."""
+        from src.pipeline.main import _apply_cache_settings
+        config = self._config()
+        _apply_cache_settings(
+            config, str(tmp_path), no_cache=True, cache_dir=None
+        )
+        assert config.cache_enabled is False
+        assert config.cache_dir is None
+
+    def test_default_cache_dir_resolves_against_source(self, tmp_path):
+        """Without --cache-dir, default is <source_path>/.vtc-cache."""
+        from src.pipeline.main import _apply_cache_settings
+        config = self._config()
+        _apply_cache_settings(
+            config, str(tmp_path), no_cache=False, cache_dir=None
+        )
+        assert config.cache_enabled is True
+        assert config.cache_dir == str(tmp_path / ".vtc-cache")
+
+    def test_cache_dir_flag_wins_over_default(self, tmp_path):
+        from src.pipeline.main import _apply_cache_settings
+        config = self._config()
+        explicit = tmp_path / "custom-cache"
+        _apply_cache_settings(
+            config, str(tmp_path), no_cache=False, cache_dir=str(explicit)
+        )
+        assert config.cache_dir == str(explicit)
+
+    def test_no_cache_overrides_explicit_cache_dir(self, tmp_path):
+        """--no-cache disables caching even if --cache-dir is also given."""
+        from src.pipeline.main import _apply_cache_settings
+        config = self._config()
+        _apply_cache_settings(
+            config, str(tmp_path), no_cache=True, cache_dir=str(tmp_path / "x")
+        )
+        assert config.cache_enabled is False
+        assert config.cache_dir is None
+
+    def test_env_disabled_cache_stays_disabled(self, tmp_path):
+        """Env says off and no CLI override → cache stays off."""
+        from src.pipeline.main import _apply_cache_settings
+        config = self._config()
+        config.cache_enabled = False
+        _apply_cache_settings(
+            config, str(tmp_path), no_cache=False, cache_dir=None
+        )
+        assert config.cache_enabled is False
+        assert config.cache_dir is None
+
+    def test_cache_status_line(self, tmp_path):
+        from src.pipeline.main import _cache_status_line
+        config = self._config()
+        config.cache_enabled = False
+        assert _cache_status_line(config) == "disabled"
+        config.cache_enabled = True
+        config.cache_dir = str(tmp_path)
+        assert "enabled" in _cache_status_line(config)
+        assert str(tmp_path) in _cache_status_line(config)

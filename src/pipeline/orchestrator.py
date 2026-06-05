@@ -13,6 +13,7 @@ from src.core.config import PipelineConfig
 from src.core.models import Source, Sink, TaintChain, SourceCategory, SinkCategory
 from src.core.exceptions import TaintAnalysisError
 from src.stage1_llm_inference.client_factory import create_llm_client
+from src.stage1_llm_inference.spec_cache import SpecCache, default_cache_dir
 from src.stage1_llm_inference.specification_extractor import SimpleSpecificationExtractor
 from src.stage2_path_discovery.simple_path_finder import (
     SimpleGraphBuilder,
@@ -62,9 +63,22 @@ class SimplePipeline:
         # Initialize Stage 1 components (use factory to support multiple providers)
         self.llm_client = create_llm_client(config)
 
+        # Optional persistent cache for Stage 1 specifications. Resolved here
+        # (not in __init__ args) because the default location depends on the
+        # *target* source path, which is only known at run-time. Callers that
+        # need a specific dir set ``config.cache_dir``; otherwise it's
+        # resolved against the source path on the first run_* call.
+        self.spec_cache: Optional[SpecCache] = None
+        if config.cache_enabled and config.cache_dir:
+            self.spec_cache = SpecCache(
+                cache_dir=Path(config.cache_dir), enabled=True
+            )
+
         self.spec_extractor = SimpleSpecificationExtractor(
             llm_client=self.llm_client,
             confidence_threshold=config.min_confidence,
+            spec_cache=self.spec_cache,
+            llm_provider=config.llm_provider,
         )
 
         # Stage 2-3 components initialized in run()

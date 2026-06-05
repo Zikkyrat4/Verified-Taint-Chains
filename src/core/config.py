@@ -52,6 +52,11 @@ class PipelineConfig:
     max_files: int = 0  # max files for project mode (0 = unlimited)
     use_llm_graph_builder: bool = True  # use LLM-driven graph builder (AST + LLM enrichment)
     llm_graph_enrichment_confidence: float = 0.7  # min confidence for LLM-inferred edges
+    # Persistent Stage 1 cache — turns weeks-long restarts into seconds. See
+    # src/stage1_llm_inference/spec_cache.py. Defaults: enabled, dir resolved
+    # at pipeline-init time to ``<source_path>/.vtc-cache``.
+    cache_enabled: bool = True
+    cache_dir: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -234,6 +239,11 @@ def load_config_from_env() -> PipelineConfig:
         logger.warning("Invalid LLM_GRAPH_ENRICHMENT_CONFIDENCE, using default 0.7")
         llm_graph_enrichment_confidence = 0.7
 
+    cache_enabled = os.getenv("VTC_CACHE_ENABLED", "true").lower() in (
+        "true", "1", "yes", "on"
+    )
+    cache_dir = os.getenv("VTC_CACHE_DIR") or None
+
     # Extract Ollama-specific settings
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
@@ -267,4 +277,6 @@ def load_config_from_env() -> PipelineConfig:
         max_files=max_files,
         use_llm_graph_builder=use_llm_graph_builder,
         llm_graph_enrichment_confidence=llm_graph_enrichment_confidence,
+        cache_enabled=cache_enabled,
+        cache_dir=cache_dir,
     )

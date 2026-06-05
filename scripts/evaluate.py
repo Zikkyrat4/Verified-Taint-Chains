@@ -526,6 +526,10 @@ async def _run_project_evaluation(
     ``_route_chain_to_file``.
     """
     config = load_config_from_env()
+    # Eval runs must always make fresh LLM calls — caching would mask
+    # extractor regressions and break F1 reproducibility.
+    config.cache_enabled = False
+    config.cache_dir = None
     pipeline = SimplePipeline(config)
     report = EvaluationReport()
 
@@ -620,6 +624,9 @@ async def _run_evaluation(
         return await _run_project_evaluation(fixtures_dir, truth)
 
     config = load_config_from_env()
+    # Eval runs must always make fresh LLM calls — see note above.
+    config.cache_enabled = False
+    config.cache_dir = None
     pipeline = SimplePipeline(config)
     report = EvaluationReport()
 

@@ -815,3 +815,173 @@ class TestCorrectVulnTypeFromSnippet:
             snippet, context
         )
         assert result == VulnerabilityType.UNSAFE_DESERIALIZATION
+
+
+class TestHasPotentialSinks:
+    """AST-based zero-sink prefilter.
+
+    These tests assume tree-sitter Java is installed; if not, the prefilter
+    falls back to True (conservative) and the False-cases will fail — that's
+    intentional, because without AST the prefilter doesn't gain anything.
+    """
+
+    def _extractor(self):
+        client = SimpleLLMClient(api_key="test-key")
+        return SimpleSpecificationExtractor(client)
+
+    def test_enum_without_methods_returns_false(self):
+        ext = self._extractor()
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+        code = "public enum Color { RED, GREEN, BLUE; }"
+        assert ext._has_potential_sinks(code) is False
+
+    def test_marker_interface_returns_false(self):
+        ext = self._extractor()
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+        code = "public interface Marker {}"
+        assert ext._has_potential_sinks(code) is False
+
+    def test_pure_dto_returns_false(self):
+        ext = self._extractor()
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+        # Fields only, no method bodies — cannot contain a sink.
+        code = (
+            "public class UserDto { "
+            "  private String name; "
+            "  private int age; "
+            "}"
+        )
+        assert ext._has_potential_sinks(code) is False
+
+    def test_package_info_returns_false(self):
+        ext = self._extractor()
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+        code = "@Deprecated\npackage com.example.api;"
+        assert ext._has_potential_sinks(code) is False
+
+    def test_empty_class_shell_returns_false(self):
+        ext = self._extractor()
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+        code = "public class Foo extends Bar {}"
+        assert ext._has_potential_sinks(code) is False
+
+    def test_single_method_call_returns_true(self):
+        ext = self._extractor()
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+        code = (
+            "public class A { "
+            "  public void m(String s) { "
+            "    System.out.println(s); "
+            "  } "
+            "}"
+        )
+        assert ext._has_potential_sinks(code) is True
+
+    def test_constructor_call_returns_true(self):
+        ext = self._extractor()
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+        code = (
+            "public class A { "
+            "  public Object m() { return new File(\"x\"); } "
+            "}"
+        )
+        assert ext._has_potential_sinks(code) is True
+
+    def test_falls_back_to_true_without_ast(self):
+        """When tree-sitter is unavailable, prefilter must NOT skip files.
+
+        We can't reliably detect sinks without AST, and false negatives are
+        the worst possible outcome (silently missed vulnerabilities). So when
+        parser=None, return True (analyze the file) regardless of content.
+        """
+        ext = self._extractor()
+        ext.ast_parser.parser = None  # simulate missing tree-sitter
+        assert ext._has_potential_sinks("public enum E {}") is True
+
+
+class TestExtractCacheIntegration:
+    """Cache and prefilter integration with extract()."""
+
+    def _make_extractor(self, spec_cache=None):
+        client = SimpleLLMClient(api_key="test-key")
+        # Use a real LLM-shaped mock so we can assert it was (or wasn't) called.
+        client.chat_with_json_prompt = AsyncMock(return_value={"sources": [], "sinks": []})
+        return SimpleSpecificationExtractor(
+            client,
+            spec_cache=spec_cache,
+            llm_provider="openai",
+        )
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_llm_call(self, tmp_path):
+        from src.stage1_llm_inference.spec_cache import SpecCache
+        from src.core.models import Specification
+
+        cache = SpecCache(cache_dir=tmp_path)
+        # Pre-populate with a known spec for content "X".
+        cached_spec = Specification(
+            sources=[], sinks=[], sanitizers=[], llm_model="gpt-4-turbo",
+        )
+        cache.put(
+            "public class X { void m() { System.out.println(\"hi\"); } }",
+            cached_spec,
+            llm_provider="openai",
+            llm_model="gpt-4-turbo",
+            min_confidence=0.5,
+        )
+
+        ext = self._make_extractor(spec_cache=cache)
+        spec = await ext.extract(
+            "public class X { void m() { System.out.println(\"hi\"); } }",
+            file_path="X.java",
+            model="gpt-4-turbo",
+        )
+
+        assert spec is not None
+        # LLM must NOT have been called — replay from cache.
+        ext.llm_client.chat_with_json_prompt.assert_not_called()
+        assert cache.stats.hits == 1
+
+    @pytest.mark.asyncio
+    async def test_prefilter_skips_llm_call_for_declarative_file(self, tmp_path):
+        from src.stage1_llm_inference.spec_cache import SpecCache
+
+        cache = SpecCache(cache_dir=tmp_path)
+        ext = self._make_extractor(spec_cache=cache)
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+
+        spec = await ext.extract(
+            "public enum Color { RED, GREEN, BLUE; }",
+            file_path="Color.java",
+            model="gpt-4-turbo",
+        )
+
+        assert spec.sources == []
+        assert spec.sinks == []
+        ext.llm_client.chat_with_json_prompt.assert_not_called()
+        # Result was cached for next time.
+        assert cache.stats.writes == 1
+
+    @pytest.mark.asyncio
+    async def test_no_cache_no_provider_still_works(self):
+        """Without a cache, extract proceeds normally."""
+        ext = self._make_extractor(spec_cache=None)
+        if ext.ast_parser.parser is None:
+            pytest.skip("tree-sitter unavailable")
+
+        # A declarative file still bypasses the LLM via the prefilter.
+        spec = await ext.extract(
+            "public enum E { A, B; }",
+            file_path="E.java",
+            model="gpt-4-turbo",
+        )
+        assert spec.sources == []
+        ext.llm_client.chat_with_json_prompt.assert_not_called()
