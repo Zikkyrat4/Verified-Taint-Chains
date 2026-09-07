@@ -3,7 +3,7 @@
     "total_tp": 0,
     "total_fp": 0,
     "total_fn": 1,
-    "total_unclassified": 1,
+    "total_unclassified": 0,
     "expected_tp": 1,
     "precision": 0.0,
     "precision_strict": 0.0,
@@ -20,7 +20,7 @@
       "found_tp": 0,
       "fp": 0,
       "fn": 1,
-      "unclassified": 1,
+      "unclassified": 0,
       "tp_matched": [],
       "fp_chains": [],
       "fn_chains": [
@@ -35,43 +35,17 @@
           "_cwe": "CWE-078"
         }
       ],
-      "unclassified_chains": [
-        {
-          "chain": {
-            "id": "dockerExecutable_to_token_4792574848",
-            "type": "other",
-            "cwe": "CWE-639",
-            "vulnerability_label": "credentials_selection_without_authorization",
-            "source": {
-              "variable": "dockerExecutable",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 281,
-              "code_snippet": "return token.newKeyMaterialFactory(getEffectiveUrl(), workspace, launcher, env, listener, dockerExecutable);"
-            },
-            "sink": {
-              "variable": "token",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
-              "line": 254,
-              "code_snippet": "DockerRegistryToken token = getToken(context);"
-            },
-            "path": [
-              "dockerExecutable",
-              "token"
-            ],
-            "confidence": 0.8
-          }
-        }
-      ],
+      "unclassified_chains": [],
       "pipeline_metrics": {
-        "sources_found": 10,
-        "sinks_found": 7,
+        "sources_found": 0,
+        "sinks_found": 0,
         "sanitizers_found": 1,
-        "chains_found": 2,
-        "chains_verified": 1,
-        "verification_rate": 0.5,
-        "explanations_generated": 1,
-        "graph_nodes": 433,
-        "graph_edges": 115
+        "chains_found": 0,
+        "chains_verified": 0,
+        "verification_rate": 0.0,
+        "explanations_generated": 0,
+        "graph_nodes": 429,
+        "graph_edges": 107
       },
       "error": null
     }

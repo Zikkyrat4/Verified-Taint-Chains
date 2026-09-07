@@ -12,9 +12,10 @@ import click
 
 from src.core.config import load_config_from_env
 from src.core.models import SinkCategory
+from src.evaluation.engine import run_evaluation_command
 from src.pipeline.orchestrator import SimplePipeline
 from src.stage1_llm_inference.spec_cache import default_cache_dir
-from src.utils.logger import enable_stderr, get_logger
+from src.utils.logger import configure_logging, get_logger
 
 logger = get_logger()
 
@@ -142,7 +143,7 @@ def cli():
       Path Traversal, XXE, SSRF
 
     \b
-    Логи: stderr (INFO) + vtc.log (DEBUG, полный лог)
+    Логи: stderr + ~/.local/state/vtc/vtc.log (уровень задаёт LOG_LEVEL)
 
     \b
     Примеры:
@@ -151,6 +152,119 @@ def cli():
       vtc analyze code.java --llm-provider ollama
     """
     pass
+
+
+@cli.command()
+@click.option(
+    "--project",
+    type=str,
+    help="Проект из tests/fixtures/real_world/.",
+)
+@click.option(
+    "--all-projects",
+    is_flag=True,
+    help="Запустить benchmark для всех проектов.",
+)
+@click.option(
+    "--fixtures-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Явный каталог с ground_truth.json и Java-фикстурами.",
+)
+@click.option(
+    "--save",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Путь для JSON-отчёта.",
+)
+@click.option(
+    "--report-md",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Путь для Markdown-отчёта.",
+)
+@click.option(
+    "--baseline",
+    is_flag=True,
+    help="Использовать метку baseline для автоматически сохранённых отчётов.",
+)
+@click.option(
+    "--phase-label",
+    type=str,
+    help="Безопасная метка имени автоматически сохранённых отчётов.",
+)
+@click.option(
+    "--diff",
+    "diff_paths",
+    nargs=2,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    metavar="BASELINE AFTER",
+    help="Сравнить два JSON-отчёта без запуска анализа.",
+)
+@click.option(
+    "--refresh-specs",
+    is_flag=True,
+    help="Не читать Stage 1 cache и получить свежие LLM-ответы.",
+)
+@click.option(
+    "--analysis-backend",
+    "--backend",
+    type=click.Choice(["llm", "static", "hybrid"]),
+    help="Источник endpoints: llm, static или hybrid.",
+)
+@click.option(
+    "--llm-analysis-mode",
+    type=click.Choice(["targeted", "exhaustive"]),
+    help="Охват LLM; для static игнорируется.",
+)
+def evaluate(
+    project: Optional[str],
+    all_projects: bool,
+    fixtures_dir: Optional[Path],
+    save: Optional[Path],
+    report_md: Optional[Path],
+    baseline: bool,
+    phase_label: Optional[str],
+    diff_paths: Optional[tuple[Path, Path]],
+    refresh_specs: bool,
+    analysis_backend: Optional[str],
+    llm_analysis_mode: Optional[str],
+) -> None:
+    """Запустить строгую оценку VTC по размеченным Java-фикстурам.
+
+    \b
+    Примеры:
+      vtc evaluate --all-projects --backend llm --phase-label llm-honest
+      vtc evaluate --project keycloak --backend static
+      vtc evaluate --diff baseline.json candidate.json
+    """
+    configure_logging()
+    target = (
+        str(fixtures_dir)
+        if fixtures_dir
+        else project or ("all-projects" if all_projects else "diff")
+    )
+    with logger.contextualize(command="evaluate", target=target):
+        try:
+            exit_code = run_evaluation_command(
+                fixtures_dir=fixtures_dir,
+                project=project,
+                all_projects=all_projects,
+                save=save,
+                report_md=report_md,
+                baseline=baseline,
+                phase_label=phase_label,
+                diff_paths=diff_paths,
+                refresh_specs=refresh_specs,
+                analysis_backend=analysis_backend,
+                llm_analysis_mode=llm_analysis_mode,
+            )
+        except SystemExit as error:
+            if str(error):
+                raise click.ClickException(str(error)) from error
+            raise click.exceptions.Exit(error.code or 1) from error
+        except (OSError, ValueError) as error:
+            raise click.ClickException(str(error)) from error
+
+    if exit_code:
+        raise click.exceptions.Exit(exit_code)
 
 
 @cli.command()
@@ -213,7 +327,7 @@ def cli():
     "--verbose",
     "-v",
     is_flag=True,
-    help="Подробный вывод: пути, объяснения, CWE.",
+    help="Подробный вывод и DEBUG-логи: пути, объяснения, CWE.",
 )
 def analyze(
     source_path: str,
@@ -232,7 +346,7 @@ def analyze(
     """Анализ Java-файла или директории на уязвимости.
 
     \b
-    Логи автоматически пишутся в vtc.log (DEBUG) и stderr (INFO).
+    Логи пишутся в stderr и пользовательский state-каталог; `-v` включает DEBUG.
 
     \b
     Примеры:
@@ -243,25 +357,25 @@ def analyze(
       vtc analyze code.java --verification-level both --pathfinding-algorithm bfs
       vtc analyze src/ --max-files 50 --max-concurrent 2
     """
-    # Enable terminal output only for the analyze command
-    enable_stderr()
+    configure_logging(level="DEBUG" if verbose else None)
 
-    asyncio.run(
-        _analyze(
-            source_path,
-            output,
-            verification_level,
-            pathfinding_algorithm,
-            llm_provider,
-            llm_model,
-            max_files,
-            max_concurrent,
-            include_tests,
-            no_cache,
-            cache_dir,
-            verbose,
+    with logger.contextualize(command="analyze", target=source_path):
+        asyncio.run(
+            _analyze(
+                source_path,
+                output,
+                verification_level,
+                pathfinding_algorithm,
+                llm_provider,
+                llm_model,
+                max_files,
+                max_concurrent,
+                include_tests,
+                no_cache,
+                cache_dir,
+                verbose,
+            )
         )
-    )
 
 
 async def _analyze(
@@ -438,7 +552,7 @@ async def _analyze(
     "--verbose",
     "-v",
     is_flag=True,
-    help="Подробный вывод: code snippet, CWE, reasoning.",
+    help="Подробный вывод и DEBUG-логи: code snippet, CWE, reasoning.",
 )
 def sinks(
     source_path: str,
@@ -469,22 +583,23 @@ def sinks(
       vtc sinks src/ -o sinks.json -v
       vtc sinks Foo.java --llm-provider ollama
     """
-    enable_stderr()
+    configure_logging(level="DEBUG" if verbose else None)
 
-    asyncio.run(
-        _sinks(
-            source_path,
-            output,
-            llm_provider,
-            llm_model,
-            max_files,
-            max_concurrent,
-            include_tests,
-            no_cache,
-            cache_dir,
-            verbose,
+    with logger.contextualize(command="sinks", target=source_path):
+        asyncio.run(
+            _sinks(
+                source_path,
+                output,
+                llm_provider,
+                llm_model,
+                max_files,
+                max_concurrent,
+                include_tests,
+                no_cache,
+                cache_dir,
+                verbose,
+            )
         )
-    )
 
 
 async def _sinks(
@@ -527,7 +642,7 @@ async def _sinks(
         click.echo(f"LLM Provider: {config.llm_provider}")
         click.echo(f"LLM Model: {config.llm_model}")
         click.echo(f"Min confidence: {config.min_confidence}")
-        click.echo(f"Mode: sink inventory (Stage 1 only)")
+        click.echo("Mode: sink inventory (Stage 1 only)")
         click.echo(f"Cache: {_cache_status_line(config)}")
         click.echo(f"Source: {source_path}")
         click.echo(f"Files to analyze: {len(java_files)}")
@@ -639,7 +754,7 @@ def _display_results(result: dict, verbose: bool):
     verified_chains = result["verified_chains"]
 
     if not verified_chains:
-        click.echo(f"\n✓ No vulnerabilities found")
+        click.echo("\n✓ No vulnerabilities found")
         return
 
     click.echo(f"\n{'='*70}")
@@ -676,7 +791,7 @@ def _display_chain(index: int, chain, result: dict, verbose: bool):
 
         explanation = result["explanations"].get(chain.id)
         if explanation:
-            click.echo(f"\n  Explanation:")
+            click.echo("\n  Explanation:")
             click.echo(f"  Why vulnerable: {explanation.why_vulnerable}")
             click.echo(f"  How to fix: {explanation.how_to_fix}")
             click.echo(f"  Severity: {explanation.severity}")
@@ -739,7 +854,7 @@ def _display_sinks(result: dict, dangerous: list, verbose: bool):
     click.echo(f"Dropped (benign / below confidence): {dropped}")
 
     if not dangerous:
-        click.echo(f"\n✓ No dangerous sinks found")
+        click.echo("\n✓ No dangerous sinks found")
         return
 
     # Group by file, ordered by (file, line) for stable, scannable output.

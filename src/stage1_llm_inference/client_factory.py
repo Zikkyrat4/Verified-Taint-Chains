@@ -58,6 +58,11 @@ def create_llm_client(config: "PipelineConfig") -> BaseLLMClient:
             model=config.llm_model,
             base_url=config.openai_base_url,
             user_agent=config.openai_user_agent,
+            timeout=config.openai_timeout,
+            json_mode=config.openai_json_mode,
+            thinking=config.openai_thinking,
+            max_retries=config.llm_max_retries,
+            max_tokens=config.llm_max_tokens,
         )
         if config.openai_base_url:
             logger.info(

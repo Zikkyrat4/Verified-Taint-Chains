@@ -1,5 +1,6 @@
 """Enhanced prompt templates for LLM-based source and sink detection with AST context."""
 
+import json
 from typing import Optional, List, Dict, Any
 
 # ============================================================================
@@ -163,7 +164,7 @@ If no sinks found: `{{"sinks": []}}`"""
 # ============================================================================
 # ENHANCED COMBINED ANALYSIS PROMPT
 # ============================================================================
-ENHANCED_COMBINED_PROMPT = """# Security Analysis: Source and Sink Detection
+ENHANCED_COMBINED_PROMPT = """# Security Analysis: Source, Sink, and Sanitizer Detection
 
 You are a security expert analyzing Java code for taint-analysis vulnerabilities.
 
@@ -192,9 +193,15 @@ from any of these.
 
 NOT a source:
 - Internal JDBC/IO objects (result sets, connections, statements) and generic in-memory data structures
-- Constants, hardcoded values, configuration objects
-- Server-side session/identity accessors and framework configuration getters whose value the server (not the attacker) controls
+- Constants and hardcoded values
+- Configuration/session/identity values only when the code proves they are
+  server-controlled. CI job settings, tenant/client configuration, redirect
+  state, and values previously stored from a request remain externally
+  influenced and must be reported.
 - Return values of internal service/DAO calls that do not depend on external input
+- Constants, field names, parameter-name constants, and API key strings are
+  never the data they name. A constant key is not a source; the runtime value
+  read from external state using that key may be one.
 
 ### SINK — definition (reason from capability)
 Any operation that interprets, executes, transmits, or renders a value such
@@ -213,11 +220,68 @@ NOT a sink:
 - Passing data to a view layer known to auto-escape it
 - Logging — unless rendered back to users
 - Internal builders/setters that only store data on framework state objects, framework object constructors, and event/audit logging calls
+- Speculative downstream risk based only on a method/variable name. Report the
+  concrete operation shown in this snippet, not what another unknown method
+  might eventually do.
 
 ## IMPORTANT
-- The source variable HOLDS the untrusted data; the sink variable CARRIES it
-  INTO the dangerous operation — never the API/operation object itself
+- Extract sources and sinks independently. Do not omit a source merely because
+  its sink is in another method/file, and do not omit a sink merely because its
+  source is outside this snippet.
+- Scan every shown method and enumerate every distinct concrete source and sink;
+  do not stop after finding the first vulnerability.
+- If your sink reasoning says a parameter, field, session value, configuration
+  value, archive entry, uploaded file, or other value is attacker/user
+  controlled, emit that value in top-level `sources` and repeat its exact
+  identifier and line in that sink's `taint_sources`. The JSON must agree with
+  your reasoning.
+- Public/framework callback parameters and container-populated bean/tag
+  setters can be external boundaries even without request annotations. Infer
+  this from class/import/method context rather than requiring a known annotation.
+- Track cross-method flows through fields when a class-level snippet is shown
+  (for example `setValue(x) -> this.value -> render(this.value)`).
+- Report the earliest boundary variable, not only its propagated field. For
+  `setValue(String value) {{ this.field = value; }}`, emit source `value` at
+  the setter. For `dangerous(String input)`, emit formal parameter `input` in
+  that method when it is externally influenced, even if a same-named field or
+  constructor parameter appears elsewhere. Prefer the occurrence in the
+  sink-bearing flow over an unrelated same-name declaration.
+- For rendering/output calls, emit every untrusted value consumed by the call
+  as a separate sink. For example, report each tainted argument passed to a
+  raw response writer rather than an unrelated builder created earlier.
+- The source variable HOLDS the untrusted data; never report the API object
+  (`request`, `runtime`, `serializer`, `writer`) as the source or sink
+- For consumer calls such as `exec(command)` or `executeQuery(statement)`,
+  report the dangerous argument as the sink.
+- For value-producing security operations such as
+  `File f = new File(dir, name)`, `Object x = deserialize(data)`, or a redirect
+  builder, report the assignment/return-flow target (`f`, `x`, builder value)
+  as the sink. This keeps the endpoint distinct from its source and aligned
+  with the data-flow graph
+- For dynamic class loading, emit the assigned class variable in
+  `Class<?> clazz = classForName(untrustedName)` as a code-injection sink. For
+  deserialization, emit the assigned result variable and the untrusted data as
+  a source, even when both operations occur in the same method.
+- A URL taken from external/session/client state and used to initialize a
+  redirect builder is a source-to-sink flow: emit the input value as source and
+  the builder/result consumed by `build()` or response rendering as sink.
+- A setter that only stores state is not itself a redirect/output sink. Report
+  a redirect only where the destination is sent to a client, unless the shown
+  code proves that the setter performs that operation.
+- If an identifier is declared in multiple methods, emit each relevant
+  occurrence separately at its exact line. Never substitute an unrelated
+  same-named parameter or field from another method.
+- Report a sanitizer only when the shown operation actually prevents a named
+  vulnerability on that value. File existence/readability/type checks such as
+  `exists()`, `canRead()`, and `isFile()` do not prevent path traversal.
+- For each sanitizer, list the vulnerability classes it prevents and estimate
+  effectiveness. Mere observation, normalization without an allowed-root
+  boundary check, and validation whose rejecting branch is not shown must have
+  effectiveness below 0.9.
 - Only report findings you are confident about (>= 0.7)
+- Keep each `reasoning` value to one short sentence (at most 20 words), and do
+  not describe non-findings. Concise output prevents otherwise valid JSON from
+  being truncated on large files.
 - Use your own concise snake_case `vulnerability_type` (a well-known name when
   one fits; a precise novel one otherwise — do NOT force-fit into an unrelated
   category) plus the best-fitting `cwe_id`
@@ -244,15 +308,34 @@ Return ONLY valid JSON with NO additional text:
             "type": "<sink_type>",
             "vulnerability_type": "<your_snake_case_class>",
             "cwe_id": "<CWE-NNN or CWE-UNKNOWN>",
+            "taint_sources": [
+                {{
+                    "line": <line_number>,
+                    "variable": "<exact_source_identifier>",
+                    "type": "<source_type>",
+                    "confidence": <0.0_to_1.0>
+                }}
+            ],
             "pattern": "<method_or_operation>",
             "confidence": <0.0_to_1.0>,
             "reasoning": "<why attacker-controlled data here is dangerous>"
+        }}
+    ],
+    "sanitizers": [
+        {{
+            "line": <line_number>,
+            "variable": "<sanitized_or_validated_variable>",
+            "type": "<sanitizer_type>",
+            "vulnerability_types": ["<snake_case_vulnerability>"],
+            "confidence": <0.0_to_1.0>,
+            "effectiveness": <0.0_to_1.0>,
+            "reasoning": "<why this operation prevents the vulnerability>"
         }}
     ]
 }}
 ```
 
-If no findings: `{{"sources": [], "sinks": []}}`"""
+If no findings: `{{"sources": [], "sinks": [], "sanitizers": []}}`"""
 
 
 # ============================================================================
@@ -550,6 +633,33 @@ def build_combined_prompt(
 
     context = _build_context_section(function_info, class_info, imports)
     return ENHANCED_COMBINED_PROMPT.format(context=context, code=code)
+
+
+def build_missing_source_repair_prompt(code: str, sinks: list[dict]) -> str:
+    """Build a compact second-pass prompt for internally inconsistent output."""
+    return f"""# Taint Source Consistency Repair
+
+The first security-analysis pass found the sinks below but emitted no sources.
+Re-read the Java code and identify every concrete attacker-influenced value that
+feeds those sinks. A value obtained from uploaded/archive contents (including a
+ZipEntry name), a request, network input, deserialization, or externally set
+configuration is a source. Do not invent a source when none is shown.
+For a redirect operation, report the value that controls its destination URI,
+not an unrelated query parameter appended to that destination.
+
+## Reported sinks
+```json
+{json.dumps(sinks, ensure_ascii=True)}
+```
+
+## Java code
+```java
+{code}
+```
+
+Return ONLY JSON:
+{{"sources":[{{"line":1,"variable":"name","type":"source_type","confidence":0.9,"reasoning":"at most 20 words"}}]}}
+If no source is present, return {{"sources":[]}}."""
 
 
 def build_sanitizer_prompt(

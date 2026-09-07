@@ -112,9 +112,10 @@ class TestChatCompletion:
 
             with patch.object(client.client.chat.completions, "create", new_callable=AsyncMock) as mock_create:
                 mock_create.return_value = mock_response
-                result = await client.chat_completion(messages)
+                with pytest.raises(LLMError, match="content is empty"):
+                    await client.chat_completion(messages)
 
-            assert result == ""
+            assert mock_create.call_count == 2
 
     @pytest.mark.asyncio
     async def test_chat_completion_with_custom_params(self) -> None:

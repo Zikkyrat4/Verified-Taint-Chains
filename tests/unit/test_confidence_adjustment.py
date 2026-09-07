@@ -1,4 +1,4 @@
-"""Unit tests for confidence adjustment via source/sink category risk matrix."""
+"""Unit tests for confidence preservation after graph verification."""
 
 import pytest
 
@@ -83,73 +83,64 @@ class TestAdjustChainConfidence:
         assert len(result) == 1
         assert result[0].confidence == pytest.approx(0.9)
 
-    def test_session_data_to_framework_api_heavy_penalty(self) -> None:
-        """SESSION_DATA -> FRAMEWORK_API applies a heavy multiplier (≤0.15)."""
+    def test_session_data_to_framework_api_is_filtered(self) -> None:
         chain = _make_chain(SourceCategory.SESSION_DATA, SinkCategory.FRAMEWORK_API, 0.8)
-        # min_confidence=0.05 keeps the chain visible so we can assert the multiplier
-        result = SimplePipeline._adjust_chain_confidence([chain], 0.05)
-        assert len(result) == 1
-        # The exact multiplier is tuned to suppress framework FPs on session sources.
-        assert result[0].confidence < 0.8 * 0.2
+        result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
+        assert result == []
 
-    def test_internal_api_to_framework_api_filtered(self) -> None:
-        """INTERNAL_API -> FRAMEWORK_API on 0.8 conf falls below the 0.5 threshold."""
+    def test_internal_api_to_framework_api_is_filtered(self) -> None:
         chain = _make_chain(SourceCategory.INTERNAL_API, SinkCategory.FRAMEWORK_API, 0.8)
         result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
-        assert len(result) == 0
+        assert result == []
 
-    def test_internal_api_to_data_storage_filtered(self) -> None:
-        """INTERNAL_API -> DATA_STORAGE (0.2 mult) on 0.8 conf -> 0.16, below 0.5."""
+    def test_internal_api_to_data_storage_is_filtered(self) -> None:
         chain = _make_chain(SourceCategory.INTERNAL_API, SinkCategory.DATA_STORAGE, 0.8)
         result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
-        assert len(result) == 0
+        assert result == []
 
-    def test_unknown_categories_no_penalty(self) -> None:
-        """UNKNOWN categories should apply no penalty (backward compat)."""
+    def test_unknown_categories_keep_model_confidence(self) -> None:
         chain = _make_chain(SourceCategory.UNKNOWN, SinkCategory.UNKNOWN, 0.8)
         result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
         assert len(result) == 1
-        assert result[0].confidence == pytest.approx(0.8)
 
-    def test_unknown_source_no_penalty(self) -> None:
-        """If source is UNKNOWN, no penalty regardless of sink."""
+    def test_unknown_source_keeps_model_selected_framework_api(self) -> None:
         chain = _make_chain(SourceCategory.UNKNOWN, SinkCategory.FRAMEWORK_API, 0.8)
         result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
         assert len(result) == 1
-        assert result[0].confidence == pytest.approx(0.8)
 
-    def test_unknown_sink_no_penalty(self) -> None:
-        """If sink is UNKNOWN, no penalty regardless of source."""
+    def test_user_input_to_framework_api_keeps_model_confidence(self) -> None:
+        chain = _make_chain(SourceCategory.USER_INPUT, SinkCategory.FRAMEWORK_API, 0.9)
+        result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
+        assert len(result) == 1
+
+    def test_unknown_sink_keeps_model_confidence(self) -> None:
         chain = _make_chain(SourceCategory.INTERNAL_API, SinkCategory.UNKNOWN, 0.8)
         result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
         assert len(result) == 1
-        assert result[0].confidence == pytest.approx(0.8)
 
     def test_none_categories_treated_as_unknown(self) -> None:
-        """Source/Sink without category fields should not be penalized."""
         chain = _make_chain(confidence=0.8)
         chain.source.source_category = None
         chain.sink.sink_category = None
         result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
         assert len(result) == 1
-        assert result[0].confidence == pytest.approx(0.8)
 
     def test_external_data_to_direct_execution(self) -> None:
-        """EXTERNAL_DATA -> DIRECT_EXECUTION should apply 0.9 multiplier."""
+        """EXTERNAL_DATA -> DIRECT_EXECUTION keeps model confidence."""
         chain = _make_chain(SourceCategory.EXTERNAL_DATA, SinkCategory.DIRECT_EXECUTION, 0.8)
         result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
         assert len(result) == 1
-        assert result[0].confidence == pytest.approx(0.8 * 0.9)
+        assert result[0].confidence == pytest.approx(0.8)
 
     def test_database_to_output_rendering(self) -> None:
-        """DATABASE -> OUTPUT_RENDERING should apply 0.5 multiplier."""
+        """DATABASE -> OUTPUT_RENDERING keeps model confidence."""
         chain = _make_chain(SourceCategory.DATABASE, SinkCategory.OUTPUT_RENDERING, 0.8)
         result = SimplePipeline._adjust_chain_confidence([chain], 0.3)
         assert len(result) == 1
-        assert result[0].confidence == pytest.approx(0.8 * 0.5)
+        assert result[0].confidence == pytest.approx(0.8)
 
     def test_multiple_chains_mixed_filtering(self) -> None:
-        """Some chains survive, others filtered."""
+        """Security-capable sinks survive regardless of source category."""
         chain_keep = _make_chain(
             SourceCategory.USER_INPUT, SinkCategory.DIRECT_EXECUTION, 0.8,
             source_var="param", sink_var="sqlQuery",
@@ -163,6 +154,13 @@ class TestAdjustChainConfidence:
         )
         assert len(result) == 1
         assert result[0].source.variable_name == "param"
+
+    def test_event_logging_sink_is_filtered(self) -> None:
+        chain = _make_chain(
+            SourceCategory.USER_INPUT, SinkCategory.EVENT_LOGGING, 0.8
+        )
+        result = SimplePipeline._adjust_chain_confidence([chain], 0.5)
+        assert result == []
 
     def test_empty_chains_list(self) -> None:
         """Empty input returns empty output."""

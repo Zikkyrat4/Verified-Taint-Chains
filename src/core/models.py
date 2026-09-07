@@ -271,6 +271,7 @@ class Specification(BaseModel):
         sinks: List of identified taint sinks.
         sanitizers: List of identified sanitizers.
         llm_model: Name of the LLM model used for inference.
+        extraction_backend: Endpoint producer: llm, static, or hybrid.
         timestamp: ISO format timestamp when analysis was performed.
     """
 
@@ -278,6 +279,9 @@ class Specification(BaseModel):
     sinks: List[Sink]
     sanitizers: List[Sanitizer] = Field(default_factory=list)
     llm_model: str
+    extraction_backend: str = "llm"
+    extraction_complete: bool = True
+    extraction_errors: List[str] = Field(default_factory=list)
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 

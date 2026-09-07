@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from openai import RateLimitError, APITimeoutError
 
 from src.stage1_llm_inference.openai_client import OpenAIClient
-from src.core.exceptions import LLMError
+from src.core.exceptions import (
+    EmptyLLMResponseError,
+    LLMError,
+    TruncatedLLMResponseError,
+)
 
 
 @pytest.mark.asyncio
@@ -72,7 +76,24 @@ class TestOpenAIClient:
                 messages=messages,
                 temperature=0.0,
                 max_tokens=100,
+                response_format={"type": "json_object"},
             )
+
+    async def test_glm_disables_thinking_by_default(self):
+        client = OpenAIClient(api_key="sk-test123", model="glm-5.3-flash")
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "{}"
+
+        with patch.object(
+            client.client.chat.completions, "create", new_callable=AsyncMock
+        ) as mock_create:
+            mock_create.return_value = mock_response
+            await client._make_api_call([], temperature=0.0, max_tokens=100)
+
+        assert mock_create.call_args.kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
 
     async def test_make_api_call_empty_response(self):
         """Test API call with empty response content."""
@@ -89,9 +110,64 @@ class TestOpenAIClient:
             mock_create.return_value = mock_response
 
             messages = [{"role": "user", "content": "test"}]
-            result = await client._make_api_call(messages, temperature=0.0, max_tokens=100)
+            with pytest.raises(EmptyLLMResponseError, match="content is empty"):
+                await client._make_api_call(
+                    messages, temperature=0.0, max_tokens=100
+                )
 
-            assert result == ""
+    async def test_make_api_call_uses_json_from_reasoning_content(self):
+        client = OpenAIClient(api_key="sk-test123")
+        message = MagicMock()
+        message.content = None
+        message.reasoning_content = 'analysis... {"sources": [], "sinks": []}'
+        message.model_extra = {}
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock(message=message)]
+
+        with patch.object(
+            client.client.chat.completions, "create", new_callable=AsyncMock
+        ) as mock_create:
+            mock_create.return_value = mock_response
+            result = await client._make_api_call(
+                [{"role": "user", "content": "test"}], 0.0, 100
+            )
+
+        assert result == '{"sources": [], "sinks": []}'
+
+    async def test_truncated_response_is_not_retried(self):
+        client = OpenAIClient(api_key="sk-test123")
+        message = MagicMock(content=None, reasoning_content=None, model_extra={})
+        choice = MagicMock(message=message, finish_reason="length")
+        mock_response = MagicMock(choices=[choice], usage=None)
+
+        with patch.object(
+            client.client.chat.completions, "create", new_callable=AsyncMock
+        ) as mock_create:
+            mock_create.return_value = mock_response
+            with pytest.raises(LLMError, match="exceeded max_tokens"):
+                await client.chat_completion(
+                    [{"role": "user", "content": "test"}], max_retries=3
+                )
+
+        assert mock_create.call_count == 1
+        assert client._should_retry(
+            TruncatedLLMResponseError("truncated")
+        ) is False
+
+    async def test_nonempty_truncated_response_is_rejected(self):
+        client = OpenAIClient(api_key="sk-test123")
+        message = MagicMock(content='{"sources": [', reasoning_content=None)
+        choice = MagicMock(message=message, finish_reason="length")
+        mock_response = MagicMock(choices=[choice])
+
+        with patch.object(
+            client.client.chat.completions, "create", new_callable=AsyncMock
+        ) as mock_create:
+            mock_create.return_value = mock_response
+            with pytest.raises(TruncatedLLMResponseError, match="max_tokens=100"):
+                await client._make_api_call(
+                    [{"role": "user", "content": "test"}], 0.0, 100
+                )
 
     def test_should_retry_rate_limit(self):
         """Test retry logic for RateLimitError."""

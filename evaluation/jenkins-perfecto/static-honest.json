@@ -1,0 +1,185 @@
+{
+  "analysis": {
+    "backend": "static",
+    "llm_analysis_mode": "n/a",
+    "llm_provider": "n/a",
+    "llm_model": "n/a",
+    "min_confidence": 0.6,
+    "max_path_length": 15,
+    "pathfinding_algorithm": "astar",
+    "verification_enabled": true,
+    "verification_level": "both",
+    "symbolic_execution_enabled": true,
+    "use_joern": true,
+    "use_semantic_heuristic": true,
+    "use_astar": true,
+    "use_llm_graph_builder": true,
+    "llm_graph_enrichment_enabled": false,
+    "llm_graph_enrichment_confidence": 0.7,
+    "llm_batch_max_chars": 8000,
+    "max_concurrent_files": 4,
+    "max_concurrent_functions": 2,
+    "max_files": 0,
+    "cache_enabled": true,
+    "cache_read_enabled": true,
+    "openai_timeout": "n/a",
+    "llm_max_retries": "n/a",
+    "llm_max_tokens": "n/a",
+    "openai_json_mode": "n/a",
+    "openai_thinking": "n/a",
+    "evaluation_policy": {
+      "all_labelled_true_positives": true,
+      "exact_endpoint_identifiers": true,
+      "exact_vulnerability_type": true,
+      "line_tolerance": 5,
+      "unmatched_findings_count_as_fp": true,
+      "one_to_one_matching": true
+    }
+  },
+  "aggregate": {
+    "total_tp": 1,
+    "total_fp": 0,
+    "total_fn": 1,
+    "total_unclassified": 2,
+    "expected_tp": 2,
+    "precision": 0.3333,
+    "precision_known": 1.0,
+    "precision_lower_bound": 0.3333,
+    "precision_strict": 0.3333,
+    "recall": 0.5,
+    "f1": 0.4,
+    "f1_lower_bound": 0.4,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2020-2261/PerfectoBuildWrapper.java",
+      "cve": "CVE-2020-2261",
+      "expected_tp": 2,
+      "found_tp": 1,
+      "fp": 0,
+      "fn": 1,
+      "unclassified": 2,
+      "tp_matched": [
+        {
+          "chain": {
+            "id": "perfectoConnectLocation_to_cmdArgs_123634002521216",
+            "type": "command_injection",
+            "cwe": "",
+            "vulnerability_label": "",
+            "source": {
+              "variable": "perfectoConnectLocation",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 151,
+              "code_snippet": "private String getTunnelId(String perfectoConnectLocation, String cloudName, String apiKey, BuildListener listener) throws IOException {"
+            },
+            "sink": {
+              "variable": "cmdArgs",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 167,
+              "code_snippet": "process = Runtime.getRuntime().exec(cmdArgs);"
+            },
+            "path": [
+              "perfectoConnectLocation",
+              "cmdArgs"
+            ],
+            "confidence": 0.81
+          },
+          "tp": {
+            "id": "TP-1",
+            "source_var": "perfectoConnectLocation",
+            "sink_var": "cmdArgs",
+            "source_line": 151,
+            "sink_line": 167,
+            "vuln_type": "command_injection",
+            "description": "getTunnelId() parameter perfectoConnectLocation (from job config) -> string concatenation into bash -c -> Runtime.getRuntime().exec(cmdArgs). True sink is the exec argument `cmdArgs`. NOTE: the LLM currently terminates the chain one hop earlier at the command string `baseCommand`, so this is a known FN until Stage-1 labels the exec argument as the sink. We do NOT move the goalpost to `baseCommand` \u2014 the honest sink is the exec call."
+          }
+        }
+      ],
+      "fp_chains": [],
+      "fn_chains": [
+        {
+          "id": "TP-2",
+          "source_var": "pcParameters",
+          "sink_var": "cmdArgs",
+          "source_line": 146,
+          "sink_line": 167,
+          "vuln_type": "command_injection",
+          "description": "pcParameters (job config field) -> baseCommand -> Runtime.getRuntime().exec",
+          "expected_realistic": false
+        }
+      ],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "cloudName_to_cmdArgs_123634001792512",
+            "type": "command_injection",
+            "cwe": "",
+            "vulnerability_label": "",
+            "source": {
+              "variable": "cloudName",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 151,
+              "code_snippet": "private String getTunnelId(String perfectoConnectLocation, String cloudName, String apiKey, BuildListener listener) throws IOException {"
+            },
+            "sink": {
+              "variable": "cmdArgs",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 167,
+              "code_snippet": "process = Runtime.getRuntime().exec(cmdArgs);"
+            },
+            "path": [
+              "cloudName",
+              "baseCommand",
+              "cmdArgs"
+            ],
+            "confidence": 0.81
+          }
+        },
+        {
+          "chain": {
+            "id": "apiKey_to_cmdArgs_123634002521216",
+            "type": "command_injection",
+            "cwe": "",
+            "vulnerability_label": "",
+            "source": {
+              "variable": "apiKey",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 151,
+              "code_snippet": "private String getTunnelId(String perfectoConnectLocation, String cloudName, String apiKey, BuildListener listener) throws IOException {"
+            },
+            "sink": {
+              "variable": "cmdArgs",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/jenkins-perfecto/CVE-2020-2261/PerfectoBuildWrapper.java",
+              "line": 167,
+              "code_snippet": "process = Runtime.getRuntime().exec(cmdArgs);"
+            },
+            "path": [
+              "apiKey",
+              "baseCommand",
+              "cmdArgs"
+            ],
+            "confidence": 0.81
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 3,
+        "sinks_found": 1,
+        "sanitizers_found": 0,
+        "chains_found": 3,
+        "chains_verified": 3,
+        "verification_rate": 1.0,
+        "explanations_generated": 3,
+        "graph_nodes": 363,
+        "graph_edges": 65,
+        "extraction_complete": true,
+        "extraction_errors": [],
+        "analysis_backend": "static",
+        "llm_analysis_mode": "targeted"
+      },
+      "error": null
+    }
+  ]
+}

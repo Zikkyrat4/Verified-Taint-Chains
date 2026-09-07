@@ -142,6 +142,10 @@ class TestClassifySourceFromTypeField:
         src = _make_source("", source_type="file_read")
         assert classify_source(src) == SourceCategory.EXTERNAL_DATA
 
+    def test_type_parsed_xml_object(self) -> None:
+        src = _make_source("", source_type="parsed_xml_object")
+        assert classify_source(src) == SourceCategory.EXTERNAL_DATA
+
     def test_type_session_attribute(self) -> None:
         src = _make_source("", source_type="session_attribute")
         assert classify_source(src) == SourceCategory.SESSION_DATA
@@ -152,6 +156,14 @@ class TestClassifySourceFromTypeField:
 
     def test_type_http_request(self) -> None:
         src = _make_source("", source_type="http_request_parameter")
+        assert classify_source(src) == SourceCategory.USER_INPUT
+
+    def test_type_user_controlled_configuration(self) -> None:
+        src = _make_source("", source_type="user_controlled_config")
+        assert classify_source(src) == SourceCategory.USER_INPUT
+
+    def test_type_jsp_tag_attribute(self) -> None:
+        src = _make_source("", source_type="jsp_tag_attribute")
         assert classify_source(src) == SourceCategory.USER_INPUT
 
 
@@ -223,10 +235,6 @@ class TestClassifySinkDataStorage:
         sink = _make_sink('session.setAttribute("user", user);')
         assert classify_sink(sink) == SinkCategory.DATA_STORAGE
 
-    def test_set_auth_note(self) -> None:
-        sink = _make_sink('authSession.setAuthNote("key", value);')
-        assert classify_sink(sink) == SinkCategory.DATA_STORAGE
-
     def test_persist(self) -> None:
         sink = _make_sink("em.persist(entity);")
         assert classify_sink(sink) == SinkCategory.DATA_STORAGE
@@ -247,4 +255,9 @@ class TestClassifySinkFrameworkApi:
 
     def test_empty_snippet(self) -> None:
         sink = _make_sink("")
+        assert classify_sink(sink) == SinkCategory.DIRECT_EXECUTION
+
+    def test_empty_snippet_unknown_vulnerability(self) -> None:
+        sink = _make_sink("")
+        sink.vulnerability_type = VulnerabilityType.OTHER
         assert classify_sink(sink) == SinkCategory.UNKNOWN

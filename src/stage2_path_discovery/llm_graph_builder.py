@@ -1,7 +1,6 @@
 """LLM-driven data flow graph builder using tree-sitter AST + LLM enrichment."""
 
-import json
-from typing import Any, Dict, List, Optional
+from typing import Any, List
 
 import networkx as nx
 
@@ -69,6 +68,8 @@ class LLMGraphBuilder:
 
         # Extract all variables for intermediate nodes
         variables = self._fallback._extract_variables(source_code)
+        field_names = set(self.ast_parser.extract_field_names(source_code))
+        local_names = self.ast_parser.extract_local_names_by_function(source_code)
 
         # Add source nodes
         for source in sources:
@@ -91,7 +92,13 @@ class LLMGraphBuilder:
         # Add intermediate variable nodes
         for var in variables:
             if var not in graph:
-                graph.add_node(var, type="intermediate")
+                graph.add_node(
+                    var,
+                    type="intermediate",
+                    is_field=var in field_names,
+                )
+            elif var in field_names:
+                graph.nodes[var]["is_field"] = True
 
         # Extract explicit data flows from AST (or regex fallback)
         ast_flows = self.ast_parser.extract_data_flows(source_code)
@@ -101,12 +108,31 @@ class LLMGraphBuilder:
             from_var = flow["from_var"]
             to_var = flow["to_var"]
             if from_var in graph and to_var in graph and from_var != to_var:
+                existing = graph.get_edge_data(from_var, to_var, default={})
+                function_names = set(existing.get("function_names", []))
+                if existing.get("function_name"):
+                    function_names.add(existing["function_name"])
+                if flow.get("function_name"):
+                    function_names.add(flow["function_name"])
+                function_name = flow.get("function_name")
+                locals_in_function = local_names.get(function_name or "", set())
+                field_flow_functions = set(
+                    existing.get("field_flow_functions", [])
+                )
+                if function_name and (
+                    (from_var in field_names and from_var not in locals_in_function)
+                    or (to_var in field_names and to_var not in locals_in_function)
+                ):
+                    field_flow_functions.add(function_name)
                 graph.add_edge(
                     from_var,
                     to_var,
                     edge_type="ast_explicit",
                     flow_type=flow.get("flow_type", "unknown"),
                     line=flow.get("line", 0),
+                    function_name=flow.get("function_name"),
+                    function_names=sorted(function_names),
+                    field_flow_functions=sorted(field_flow_functions),
                 )
                 ast_edge_count += 1
 

@@ -1,6 +1,6 @@
 # VTC — Verified Taint Chains
 
-Инструмент статического анализа безопасности Java-кода. Использует LLM для обнаружения уязвимостей через построение и верификацию цепочек распространения данных (taint chains).
+LLM-first инструмент анализа безопасности Java-кода. LLM обнаруживает границы taint-потока, после чего детерминированные этапы строят и верифицируют цепочки распространения данных (taint chains).
 
 ## Как это работает
 
@@ -70,23 +70,28 @@ vtc analyze code.java --verification-level both
 vtc analyze code.java --pathfinding-algorithm bfs
 ```
 
-Полный список опций: `vtc analyze --help`
+Полный список команд: `vtc --help`; опции анализа: `vtc analyze --help`.
 
 ### Оценка на реальных CVE
 
 Набор фикстур с реальными уязвимостями лежит в `tests/fixtures/real_world/`
-(7 проектов, 6 классов CWE). Запуск оценочного прогона:
+(5 проектов). Запуск оценочного прогона:
 
 ```bash
-# Одиночный проект — результаты в evaluation/<project>/after.{json,md}
-python scripts/evaluate.py --project keycloak
+# Основной LLM-прогон; отдельная метка не перезаписывает after.*
+vtc evaluate --project keycloak --backend llm --phase-label llm-honest
 
 # Все проекты сразу + агрегированная таблица
-python scripts/evaluate.py --all-projects
+vtc evaluate --all-projects --backend llm --phase-label llm-honest
 
-# Сравнение двух прогонов (baseline vs after)
-python scripts/evaluate.py --diff evaluation/keycloak/baseline.json \
-                                  evaluation/keycloak/after.json
+# Принудительно обновить кэш извлечённых LLM-спецификаций
+vtc evaluate --all-projects --backend llm \
+  --phase-label llm-honest --refresh-specs
+
+# Статический baseline запускается и публикуется только отдельно
+vtc evaluate --all-projects --backend static --phase-label static-honest
+
+# Повторный запуск той же команды использует кэш LLM-спецификаций
 ```
 
 Добавление нового проекта = новая директория под
@@ -102,6 +107,16 @@ python scripts/evaluate.py --diff evaluation/keycloak/baseline.json \
 |-----------|----------|-------------|
 | `LLM_PROVIDER` | `openai` или `ollama` | `openai` |
 | `OPENAI_API_KEY` | API-ключ OpenAI | — |
+| `OPENAI_TIMEOUT` | Таймаут одного OpenAI-запроса, сек. | `60` |
+| `OPENAI_JSON_MODE` | Запрашивать структурированный JSON-ответ | `true` |
+| `OPENAI_THINKING` | `enabled`/`disabled`; для `glm-*` автоматически `disabled` | auto |
+| `LLM_MAX_RETRIES` | Максимум попыток LLM-запроса | `2` |
+| `LLM_BATCH_MAX_CHARS` | Максимальный размер файлового LLM-batch | `8000` |
+| `ANALYSIS_BACKEND` | `llm`, `static` или `hybrid`; метрики режимов не смешиваются | `llm` |
+| `LLM_ANALYSIS_MODE` | `targeted` или `exhaustive` | `targeted` |
+| `MAX_CONCURRENT_FUNCTIONS` | Параллельные функции внутри файла | `2` |
+| `LOG_LEVEL` | Уровень stderr и файлового лога | `INFO` |
+| `LOG_FILE` | Путь к логу; `off` отключает файл | `~/.local/state/vtc/vtc.log` |
 | `LLM_MODEL` | Название модели | `gpt-4-turbo` / `llama3:latest` |
 | `PATHFINDING_ALGORITHM` | `astar` или `bfs` | `astar` |
 | `VERIFICATION_LEVEL` | `cfg`, `symbolic` или `both` | `cfg` |
@@ -109,6 +124,10 @@ python scripts/evaluate.py --diff evaluation/keycloak/baseline.json \
 | `MAX_PATH_LENGTH` | Макс. длина пути | `15` |
 
 Подробнее: [docs/configuration.md](docs/configuration.md)
+
+В режиме по умолчанию `ANALYSIS_BACKEND=llm` статические эвристики не создают
+`source` или `sink`. `static` предназначен только для отдельного baseline,
+`hybrid` — для явно помеченного ablation-эксперимента.
 
 ## Структура проекта
 

@@ -44,7 +44,10 @@ class TestEndToEndWithGroundTruth:
         async def mock_chat_prompt(prompt: str) -> Dict:
             """Mock LLM response based on ground truth."""
             # Combined prompt contains both source and sink detection
-            if "Source and Sink Detection" in prompt or "Source Detection" in prompt:
+            if (
+                "Source, Sink, and Sanitizer Detection" in prompt
+                or "Source Detection" in prompt
+            ):
                 sources = []
                 sinks = []
                 for vuln in vulnerabilities:
@@ -64,7 +67,7 @@ class TestEndToEndWithGroundTruth:
                         "line": sink_info.get("line_number", 0),
                         "confidence": 0.85,
                     })
-                return {"sources": sources, "sinks": sinks}
+                return {"sources": sources, "sinks": sinks, "sanitizers": []}
 
             elif "sanitizer" in prompt.lower():
                 # Return sanitizers if any
@@ -110,6 +113,7 @@ class TestEndToEndWithGroundTruth:
                 verification_level="cfg",
                 min_confidence=0.5,
                 use_llm_graph_builder=False,
+                cache_enabled=False,
             )
 
             pipeline = SimplePipeline(config)
@@ -178,6 +182,7 @@ class TestEndToEndWithGroundTruth:
                 verification_enabled=True,
                 min_confidence=0.5,
                 use_llm_graph_builder=False,
+                cache_enabled=False,
             )
 
             pipeline = SimplePipeline(config)
@@ -281,6 +286,7 @@ class TestEndToEndWithGroundTruth:
                 verification_enabled=True,
                 min_confidence=0.5,
                 use_llm_graph_builder=False,
+                cache_enabled=False,
             )
 
             pipeline = SimplePipeline(config)
@@ -389,8 +395,9 @@ class TestSpecificVulnerabilityTypes:
         mock_llm = Mock()
 
         async def mock_analyze(prompt: str) -> Dict:
-            if "Source Detection" in prompt:
-                return {
+            combined = "Source, Sink, and Sanitizer Detection" in prompt
+            if combined or "Source Detection" in prompt:
+                response = {
                     "sources": [
                         {
                             "variable": "userId",
@@ -400,6 +407,18 @@ class TestSpecificVulnerabilityTypes:
                         }
                     ]
                 }
+                if combined:
+                    response["sinks"] = [
+                        {
+                            "variable": "query",
+                            "type": "SQL",
+                            "vulnerability_type": "sql_injection",
+                            "line": 10,
+                            "confidence": 0.90,
+                        }
+                    ]
+                    response["sanitizers"] = []
+                return response
             elif "Sink Detection" in prompt:
                 return {
                     "sinks": [
@@ -417,7 +436,11 @@ class TestSpecificVulnerabilityTypes:
         mock_llm.chat_with_json_prompt = AsyncMock(side_effect=mock_analyze)
 
         # Create pipeline
-        config = PipelineConfig(llm_api_key="test-key", use_llm_graph_builder=False)
+        config = PipelineConfig(
+            llm_api_key="test-key",
+            use_llm_graph_builder=False,
+            cache_enabled=False,
+        )
         pipeline = SimplePipeline(config)
         pipeline.llm_client = mock_llm
         pipeline.spec_extractor.llm_client = mock_llm
@@ -449,8 +472,9 @@ class TestSpecificVulnerabilityTypes:
         mock_llm = Mock()
 
         async def mock_analyze(prompt: str) -> Dict:
-            if "Source Detection" in prompt:
-                return {
+            combined = "Source, Sink, and Sanitizer Detection" in prompt
+            if combined or "Source Detection" in prompt:
+                response = {
                     "sources": [
                         {
                             "variable": "name",
@@ -460,6 +484,18 @@ class TestSpecificVulnerabilityTypes:
                         }
                     ]
                 }
+                if combined:
+                    response["sinks"] = [
+                        {
+                            "variable": "name",
+                            "type": "HTML Output",
+                            "vulnerability_type": "xss",
+                            "line": 10,
+                            "confidence": 0.85,
+                        }
+                    ]
+                    response["sanitizers"] = []
+                return response
             elif "Sink Detection" in prompt:
                 return {
                     "sinks": [
@@ -477,7 +513,11 @@ class TestSpecificVulnerabilityTypes:
         mock_llm.chat_with_json_prompt = AsyncMock(side_effect=mock_analyze)
 
         # Create pipeline
-        config = PipelineConfig(llm_api_key="test-key", use_llm_graph_builder=False)
+        config = PipelineConfig(
+            llm_api_key="test-key",
+            use_llm_graph_builder=False,
+            cache_enabled=False,
+        )
         pipeline = SimplePipeline(config)
         pipeline.llm_client = mock_llm
         pipeline.spec_extractor.llm_client = mock_llm
@@ -516,8 +556,9 @@ class TestLongPathDetection:
         mock_llm = Mock()
 
         async def mock_analyze(prompt: str) -> Dict:
-            if "Source Detection" in prompt:
-                return {
+            combined = "Source, Sink, and Sanitizer Detection" in prompt
+            if combined or "Source Detection" in prompt:
+                response = {
                     "sources": [
                         {
                             "variable": "userInput",
@@ -527,6 +568,18 @@ class TestLongPathDetection:
                         }
                     ]
                 }
+                if combined:
+                    response["sinks"] = [
+                        {
+                            "variable": "query",
+                            "type": "SQL",
+                            "vulnerability_type": "sql_injection",
+                            "line": 23,
+                            "confidence": 0.85,
+                        }
+                    ]
+                    response["sanitizers"] = []
+                return response
             elif "Sink Detection" in prompt:
                 return {
                     "sinks": [
@@ -549,6 +602,7 @@ class TestLongPathDetection:
             max_path_length=20,  # Allow longer paths
             min_confidence=0.5,
             use_llm_graph_builder=False,
+            cache_enabled=False,
         )
 
         pipeline = SimplePipeline(config)
@@ -590,8 +644,9 @@ class TestControlFlowAnalysis:
         mock_llm = Mock()
 
         async def mock_analyze(prompt: str) -> Dict:
-            if "Source Detection" in prompt:
-                return {
+            combined = "Source, Sink, and Sanitizer Detection" in prompt
+            if combined or "Source Detection" in prompt:
+                response = {
                     "sources": [
                         {
                             "variable": "category",
@@ -601,6 +656,18 @@ class TestControlFlowAnalysis:
                         }
                     ]
                 }
+                if combined:
+                    response["sinks"] = [
+                        {
+                            "variable": "query",
+                            "type": "SQL",
+                            "vulnerability_type": "sql_injection",
+                            "line": 29,
+                            "confidence": 0.85,
+                        }
+                    ]
+                    response["sanitizers"] = []
+                return response
             elif "Sink Detection" in prompt:
                 return {
                     "sinks": [
@@ -623,6 +690,7 @@ class TestControlFlowAnalysis:
             verification_enabled=True,
             verification_level="cfg",
             use_llm_graph_builder=False,
+            cache_enabled=False,
         )
 
         pipeline = SimplePipeline(config)

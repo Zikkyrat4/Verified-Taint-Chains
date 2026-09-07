@@ -5,7 +5,8 @@ from typing import List
 from unittest.mock import AsyncMock, patch
 
 from src.stage1_llm_inference.base_client import BaseLLMClient
-from src.core.exceptions import LLMError
+from src.core.exceptions import LLMError, ParsingError
+from src.utils.logger import configure_logging, get_logger, shutdown_logging
 
 
 class MockLLMClient(BaseLLMClient):
@@ -228,6 +229,27 @@ class TestBaseLLMClient:
 
             with pytest.raises(Exception):  # ParsingError
                 await client.chat_with_json_prompt("test prompt")
+
+    async def test_invalid_json_does_not_log_raw_response(self, tmp_path):
+        """Malformed model output must not be persisted in diagnostic logs."""
+        client = MockLLMClient()
+        log_file = tmp_path / "llm.log"
+        raw_response = "PRIVATE_SOURCE_PAYLOAD that is not valid JSON"
+        configure_logging(level="DEBUG", log_file=log_file, stderr=False)
+
+        try:
+            with patch.object(client, "chat_completion", new_callable=AsyncMock) as mock_chat:
+                mock_chat.return_value = raw_response
+
+                with pytest.raises(ParsingError):
+                    await client.chat_with_json_prompt("test prompt")
+
+            get_logger().complete()
+            contents = log_file.read_text()
+            assert raw_response not in contents
+            assert "Discarding malformed LLM response" in contents
+        finally:
+            shutdown_logging()
 
     async def test_chat_with_json_prompt_with_markdown(self):
         """Test chat_with_json_prompt extracts JSON from markdown blocks."""

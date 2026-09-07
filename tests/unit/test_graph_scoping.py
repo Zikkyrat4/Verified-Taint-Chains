@@ -72,8 +72,8 @@ class TestBuildScopedGraph:
         assert scope_map[id(snk_b)] == "B.java:query"
 
     @pytest.mark.asyncio
-    async def test_cross_file_bridge_edges(self, test_config):
-        """Bridge edges should connect same variable_name across files."""
+    async def test_same_name_without_call_does_not_create_bridge(self, test_config):
+        """Equal variable names alone must not create inter-file data flow."""
         pipeline = SimplePipeline(test_config)
 
         code_a = "String data = input;"
@@ -103,7 +103,7 @@ class TestBuildScopedGraph:
             file_code_map, file_sources, file_sinks,
         )
 
-        assert graph.has_edge("A.java:data", "B.java:data")
+        assert not graph.has_edge("A.java:data", "B.java:data")
 
     @pytest.mark.asyncio
     async def test_no_bridge_within_same_file(self, test_config):
@@ -189,7 +189,10 @@ class TestBuildScopedGraph:
         pipeline = SimplePipeline(test_config)
 
         code_a = "AttackResult h(String fullName) { return base.execute(file, fullName, user); }"
-        code_b = "void execute(String fullName) { File uploadedFile = new File(dir, fullName); }"
+        code_b = (
+            "void execute(File file, String fullName, String user) { "
+            "File uploadedFile = new File(dir, fullName); }"
+        )
 
         loc_a = CodeLocation(file_path="/project/Sub.java", line_number=1)
         loc_b = CodeLocation(file_path="/project/Base.java", line_number=1)
@@ -217,6 +220,36 @@ class TestBuildScopedGraph:
         assert graph.has_edge("Sub.java:fullName", "Base.java:fullName")
         # and the full cross-file flow reaches the base sink.
         assert nx.has_path(graph, "Sub.java:fullName", "Base.java:uploadedFile")
+
+    @pytest.mark.asyncio
+    async def test_bridge_does_not_borrow_source_from_another_method(self, test_config):
+        pipeline = SimplePipeline(test_config)
+        code_a = (
+            "class Sub { "
+            "void source(String username) { audit(username); } "
+            "void delegate(String username) { base.execute(username); } "
+            "}"
+        )
+        code_b = "class Base { void execute(String username) { use(username); } }"
+        src = Source(
+            location=CodeLocation(
+                file_path="/project/Sub.java",
+                line_number=1,
+                function_name="source",
+            ),
+            variable_name="username",
+            type="user_input",
+            confidence=0.9,
+            code_snippet="void source(String username)",
+        )
+
+        graph, _ = await pipeline._build_scoped_graph(
+            {"/project/Sub.java": code_a, "/project/Base.java": code_b},
+            {"/project/Sub.java": [src], "/project/Base.java": []},
+            {"/project/Sub.java": [], "/project/Base.java": []},
+        )
+
+        assert not graph.has_edge("Sub.java:username", "Base.java:username")
 
 
 class TestRunProjectScoping:

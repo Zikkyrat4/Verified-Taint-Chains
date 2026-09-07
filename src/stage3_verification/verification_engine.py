@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from src.core.models import TaintChain, VerificationStatus
 from src.core.config import PipelineConfig
 from src.stage3_verification.cfg_verifier import CFGVerifier
-from src.stage3_verification.symbolic_executor import SymbolicExecutor, SymbolicBackend
+from src.stage3_verification.symbolic_executor import SymbolicExecutor
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -150,19 +150,20 @@ class VerificationEngine:
         # ========== LEVEL 1: CFG Check (Fast) ==========
         cfg_status = self.cfg_verifier.verify_chain(chain, source_code)
 
-        # Fast reject: If CFG says unreachable, no need for symbolic execution
+        # The lightweight CFG parser is conservative and incomplete. Failure
+        # to find a route is not proof that the route is impossible.
         if cfg_status == VerificationStatus.FALSE:
             logger.info(
-                f"✗ CFG fast reject: {chain.source.variable_name} -> "
-                f"{chain.sink.variable_name} UNREACHABLE"
+                f"? CFG could not establish reachability: "
+                f"{chain.source.variable_name} -> {chain.sink.variable_name}"
             )
             result = VerificationResult(
-                status=VerificationStatus.FALSE,
+                status=VerificationStatus.UNVERIFIABLE,
                 cfg_status=cfg_status,
                 symbolic_status=None,
-                confidence=0.9,  # High confidence in CFG-based rejection
+                confidence=0.4,
                 method_used="cfg",
-                details="CFG analysis shows path is unreachable"
+                details="Lightweight CFG could not establish reachability"
             )
             chain.verification_status = result.status
             return result

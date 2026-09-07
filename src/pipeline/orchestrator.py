@@ -60,8 +60,11 @@ class SimplePipeline:
 
         self.config = config
 
-        # Initialize Stage 1 components (use factory to support multiple providers)
-        self.llm_client = create_llm_client(config)
+        # The static backend is a standalone baseline and must not initialize,
+        # authenticate, or accidentally call an LLM provider.
+        self.llm_client = (
+            None if config.analysis_backend == "static" else create_llm_client(config)
+        )
 
         # Optional persistent cache for Stage 1 specifications. Resolved here
         # (not in __init__ args) because the default location depends on the
@@ -79,6 +82,11 @@ class SimplePipeline:
             confidence_threshold=config.min_confidence,
             spec_cache=self.spec_cache,
             llm_provider=config.llm_provider,
+            max_concurrent_functions=config.max_concurrent_functions,
+            batch_max_chars=config.llm_batch_max_chars,
+            analysis_backend=config.analysis_backend,
+            analysis_mode=config.llm_analysis_mode,
+            cache_read_enabled=config.cache_read_enabled,
         )
 
         # Stage 2-3 components initialized in run()
@@ -93,12 +101,30 @@ class SimplePipeline:
 
         logger.info(
             f"Initialized SimplePipeline with config: "
+            f"analysis_backend={config.analysis_backend}, "
             f"model={config.llm_model}, "
             f"max_path_length={config.max_path_length}, "
             f"min_confidence={config.min_confidence}, "
             f"pathfinding_algorithm={config.pathfinding_algorithm}, "
             f"use_joern={config.use_joern}"
         )
+
+    def _ensure_spec_cache(self, source_path: str) -> None:
+        """Resolve and wire the default cache once the analysis target is known."""
+        if not self.config.cache_enabled or self.spec_cache is not None:
+            return
+        cache_path = (
+            Path(self.config.cache_dir)
+            if self.config.cache_dir
+            else default_cache_dir(source_path)
+        )
+        self.spec_cache = SpecCache(cache_dir=cache_path, enabled=True)
+        self.spec_extractor.spec_cache = self.spec_cache
+
+    async def aclose(self) -> None:
+        """Release the LLM client's persistent HTTP resources."""
+        if self.llm_client is not None:
+            await self.llm_client.aclose()
 
     async def run(
         self,
@@ -129,6 +155,7 @@ class SimplePipeline:
             FileNotFoundError: If source file not found.
         """
         logger.info(f"Starting pipeline execution on {source_file}")
+        self._ensure_spec_cache(source_file)
 
         try:
             # Read source file
@@ -157,7 +184,9 @@ class SimplePipeline:
                 try:
                     on_stage1_complete({
                         "files_analyzed": 1,
-                        "files_llm_extracted": 1,
+                        "files_llm_extracted": int(
+                            self.config.analysis_backend != "static"
+                        ),
                         "files_skipped": 0,
                         "file_list": [source_file],
                         "sources": list(sources),
@@ -172,10 +201,16 @@ class SimplePipeline:
             # ============ STAGES 2-4: Path Discovery, Verification, Explanation ============
             result = await self._run_stages(source_code, sources, sinks, sanitizers)
             result["file"] = source_file
+            result["metrics"]["extraction_complete"] = specification.extraction_complete
+            result["metrics"]["extraction_errors"] = list(
+                specification.extraction_errors
+            )
+            result["metrics"]["analysis_backend"] = self.config.analysis_backend
+            result["metrics"]["llm_analysis_mode"] = self.config.llm_analysis_mode
 
             return result
 
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             logger.error(f"Source file not found: {source_file}")
             raise
 
@@ -295,6 +330,12 @@ class SimplePipeline:
 
         logger.info(f"Starting project-mode analysis on {len(java_files)} files")
 
+        if java_files:
+            common_path = os.path.commonpath(java_files)
+            if Path(common_path).suffix:
+                common_path = str(Path(common_path).parent)
+            self._ensure_spec_cache(common_path)
+
         try:
             # Partition files by security relevance — used for ORDERING, not
             # exclusion. Analyzing only keyword-matching files blinds the
@@ -323,6 +364,7 @@ class SimplePipeline:
             file_code_map: Dict[str, str] = {}
             file_sources: Dict[str, List[Source]] = {}
             file_sinks: Dict[str, List[Sink]] = {}
+            extraction_errors: Dict[str, List[str]] = {}
 
             max_concurrent = self.config.max_concurrent_files
             semaphore = asyncio.Semaphore(max_concurrent)
@@ -376,6 +418,8 @@ class SimplePipeline:
                 file_code_map[java_file] = code
                 file_sources[java_file] = list(spec.sources)
                 file_sinks[java_file] = list(spec.sinks)
+                if not spec.extraction_complete:
+                    extraction_errors[java_file] = list(spec.extraction_errors)
 
             # Include irrelevant files' code for graph building (no LLM calls)
             for java_file, code in irrelevant:
@@ -395,7 +439,11 @@ class SimplePipeline:
                 try:
                     on_stage1_complete({
                         "files_analyzed": len(java_files),
-                        "files_llm_extracted": total_relevant,
+                        "files_llm_extracted": (
+                            total_relevant
+                            if self.config.analysis_backend != "static"
+                            else 0
+                        ),
                         "files_skipped": len(irrelevant),
                         "file_list": java_files,
                         "sources": list(all_sources),
@@ -414,9 +462,15 @@ class SimplePipeline:
             )
             result["file"] = f"project ({len(java_files)} files)"
             result["files_analyzed"] = len(java_files)
-            result["files_llm_extracted"] = total_relevant
+            result["files_llm_extracted"] = (
+                total_relevant if self.config.analysis_backend != "static" else 0
+            )
             result["files_skipped"] = len(irrelevant)
             result["file_list"] = java_files
+            result["metrics"]["extraction_complete"] = not extraction_errors
+            result["metrics"]["extraction_errors"] = extraction_errors
+            result["metrics"]["analysis_backend"] = self.config.analysis_backend
+            result["metrics"]["llm_analysis_mode"] = self.config.llm_analysis_mode
 
             return result
 
@@ -468,6 +522,12 @@ class SimplePipeline:
             java_files = java_files[: self.config.max_files]
 
         logger.info(f"Starting sink-inventory analysis on {len(java_files)} files")
+
+        if java_files:
+            common_path = os.path.commonpath(java_files)
+            if Path(common_path).suffix:
+                common_path = str(Path(common_path).parent)
+            self._ensure_spec_cache(common_path)
 
         try:
             # Partition for ORDERING only (security-matching files first); every
@@ -538,9 +598,12 @@ class SimplePipeline:
                 progress.finish()
 
             collected: List[Tuple[str, Sink]] = []
+            extraction_errors: Dict[str, List[str]] = {}
             for java_file, spec in results:
                 for snk in spec.sinks:
                     collected.append((java_file, snk))
+                if not spec.extraction_complete:
+                    extraction_errors[java_file] = list(spec.extraction_errors)
 
             elapsed_total = time.monotonic() - start_time
             logger.info(
@@ -551,9 +614,13 @@ class SimplePipeline:
 
             return {
                 "files_analyzed": len(java_files),
-                "files_llm_extracted": total_relevant,
+                "files_llm_extracted": (
+                    total_relevant if self.config.analysis_backend != "static" else 0
+                ),
                 "files_skipped": len(irrelevant),
                 "sinks": collected,
+                "extraction_complete": not extraction_errors,
+                "extraction_errors": extraction_errors,
             }
 
         except Exception as e:
@@ -586,9 +653,9 @@ class SimplePipeline:
             the merged graph.
         """
         use_llm_builder = self.config.use_llm_graph_builder
+        joern = JoernWrapper() if self.config.use_joern else None
 
-        # Choose the right builder class (don't touch Joern — it builds its own)
-        if not use_llm_builder:
+        if not use_llm_builder and (joern is None or not joern.joern_available):
             if self.config.pathfinding_algorithm == "astar":
                 builder_cls = EnhancedGraphBuilder
             else:
@@ -608,20 +675,49 @@ class SimplePipeline:
 
         graphs: List[nx.DiGraph] = []
         scope_map: Dict[int, str] = {}  # id(Source/Sink obj) -> scoped node id
+        graph_semaphore = asyncio.Semaphore(self.config.max_concurrent_files)
 
-        for fpath, code in file_code_map.items():
+        async def _build_one(fpath: str, code: str) -> Tuple[str, nx.DiGraph]:
             sources_f = file_sources.get(fpath, [])
             sinks_f = file_sinks.get(fpath, [])
 
-            if use_llm_builder:
-                builder = LLMGraphBuilder(
-                    llm_client=self.llm_client, config=self.config
-                )
-                g = builder.build_graph(code, sources_f, sinks_f)
-                g = await builder.enrich_graph(g, code, sources_f, sinks_f)
-            else:
-                builder = builder_cls()
-                g = builder.build_graph(code, sources_f, sinks_f)
+            async with graph_semaphore:
+                if joern is not None and joern.joern_available:
+                    g = await asyncio.to_thread(
+                        joern.build_graph, code, sources_f, sinks_f
+                    )
+                elif use_llm_builder:
+                    llm_builder = LLMGraphBuilder(
+                        llm_client=self.llm_client, config=self.config
+                    )
+                    g = llm_builder.build_graph(code, sources_f, sinks_f)
+                else:
+                    builder = builder_cls()
+                    g = builder.build_graph(code, sources_f, sinks_f)
+
+                # Enrichment cannot create a useful taint chain when either
+                # endpoint class is absent, so avoid an expensive no-op call.
+                if (
+                    use_llm_builder
+                    and self.config.llm_graph_enrichment_enabled
+                    and sources_f
+                    and sinks_f
+                ):
+                    llm_builder = LLMGraphBuilder(
+                        llm_client=self.llm_client, config=self.config
+                    )
+                    g = await llm_builder.enrich_graph(
+                        g, code, sources_f, sinks_f
+                    )
+                return fpath, g
+
+        built_graphs = await asyncio.gather(
+            *(_build_one(fpath, code) for fpath, code in file_code_map.items())
+        )
+
+        for fpath, g in built_graphs:
+            sources_f = file_sources.get(fpath, [])
+            sinks_f = file_sinks.get(fpath, [])
 
             prefix = _short_name(fpath)
             mapping = {n: f"{prefix}:{n}" for n in g.nodes()}
@@ -640,60 +736,97 @@ class SimplePipeline:
         else:
             merged = nx.DiGraph()
 
-        # Add cross-file bridge edges where same variable_name is a source
-        # output in one file and a sink input in another.
-        src_by_var: Dict[str, List[Tuple[str, Source]]] = {}
-        snk_by_var: Dict[str, List[Tuple[str, Sink]]] = {}
-        for fpath, sources_f in file_sources.items():
-            for src in sources_f:
-                src_by_var.setdefault(src.variable_name, []).append((fpath, src))
-        for fpath, sinks_f in file_sinks.items():
-            for snk in sinks_f:
-                snk_by_var.setdefault(snk.variable_name, []).append((fpath, snk))
+        # Inter-file bridges are derived from actual call sites and positional
+        # formal parameters. Equal variable names alone are not data flow.
+        ast_parser = self.spec_extractor.ast_parser
+        method_defs: Dict[str, List[Tuple[str, List[str], Optional[str]]]] = {}
+        class_to_file: Dict[str, str] = {}
+        superclass_by_file: Dict[str, Optional[str]] = {}
+        for fpath, code in file_code_map.items():
+            classes = ast_parser.extract_classes(code)
+            if classes:
+                class_name = classes[0].get("name")
+                if class_name:
+                    class_to_file[class_name] = fpath
+                superclass_by_file[fpath] = classes[0].get("superclass")
+            for method in ast_parser.extract_functions(code):
+                params: List[str] = []
+                for raw in method.get("parameters", []):
+                    cleaned = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", raw)
+                    names = re.findall(r"\b[A-Za-z_$][\w$]*\b", cleaned)
+                    if names:
+                        params.append(names[-1])
+                method_defs.setdefault(method.get("name", ""), []).append(
+                    (fpath, params, method.get("class_name"))
+                )
 
-        for var_name in set(src_by_var) & set(snk_by_var):
-            for src_fpath, src_obj in src_by_var[var_name]:
-                for snk_fpath, snk_obj in snk_by_var[var_name]:
-                    if src_fpath == snk_fpath:
-                        continue  # same file — already connected inside the graph
-                    src_node = scope_map[id(src_obj)]
-                    snk_node = scope_map[id(snk_obj)]
-                    if src_node in merged and snk_node in merged:
-                        merged.add_edge(src_node, snk_node, weight=1.0, bridge=True)
-                        logger.debug(
-                            f"Bridge edge: {src_node} -> {snk_node}"
-                        )
-
-        # Bridge 2 (parameter pass-through): a source variable in file A often
-        # re-appears as a same-named formal parameter in file B (inheritance /
-        # delegation — a subclass passes ``fullName`` into
-        # ``super.execute(file, fullName, ..)`` and the base method then builds
-        # ``new File(dir, fullName)`` assigned to ``uploadedFile``). Bridge 1
-        # only fires when the *same name* is also a sink in B; when B's sink is
-        # the assignment target (``uploadedFile``) the cross-file flow is lost.
-        # Connect the source to B's same-named node when that node actually
-        # propagates onward (out-degree > 0), so taint reaches B's own sinks.
-        # Restricted to source variables to bound the number of false bridges.
-        bridged = set()
-        for var_name, occurrences in src_by_var.items():
-            for src_fpath, src_obj in occurrences:
-                src_node = scope_map[id(src_obj)]
-                if src_node not in merged:
+        bridge_count = 0
+        for caller_path, code in file_code_map.items():
+            caller_prefix = _short_name(caller_path)
+            for call in ast_parser.extract_method_calls(code):
+                targets = [
+                    target for target in method_defs.get(call["name"], [])
+                    if target[0] != caller_path
+                ]
+                if call.get("receiver") == "super":
+                    superclass = superclass_by_file.get(caller_path)
+                    super_file = class_to_file.get(superclass or "")
+                    targets = [target for target in targets if target[0] == super_file]
+                elif len(targets) > 1:
+                    # Without type resolution, multiple overload owners are
+                    # ambiguous and must not be connected speculatively.
                     continue
-                for bfpath in file_code_map:
-                    if bfpath == src_fpath:
-                        continue
-                    b_node = f"{_short_name(bfpath)}:{var_name}"
-                    if b_node == src_node or (src_node, b_node) in bridged:
-                        continue
-                    if b_node in merged and merged.out_degree(b_node) > 0:
-                        merged.add_edge(src_node, b_node, weight=1.0, bridge=True)
-                        bridged.add((src_node, b_node))
-                        logger.debug(f"Param bridge edge: {src_node} -> {b_node}")
+
+                for target_path, params, _class_name in targets:
+                    target_prefix = _short_name(target_path)
+                    for argument, parameter in zip(call["arguments"], params):
+                        identifiers = re.findall(r"\b[A-Za-z_$][\w$]*\b", argument)
+                        if not identifiers:
+                            continue
+                        argument_sources = [
+                            source
+                            for source in file_sources.get(caller_path, [])
+                            if source.variable_name == identifiers[0]
+                            and source.location.function_name
+                        ]
+                        call_function = call.get("function_name")
+                        if (
+                            argument_sources
+                            and call_function
+                            and not any(
+                                source.location.function_name == call_function
+                                for source in argument_sources
+                            )
+                        ):
+                            # File-level graph nodes merge equal identifiers.
+                            # Do not let a source from another method borrow this
+                            # call site merely because its variable has the same name.
+                            continue
+                        # The first identifier is the tainted value/receiver in
+                        # both `name` and `file.getOriginalFilename()`.
+                        argument_node = f"{caller_prefix}:{identifiers[0]}"
+                        parameter_node = f"{target_prefix}:{parameter}"
+                        if argument_node not in merged or parameter_node not in merged:
+                            continue
+                        merged.add_edge(
+                            argument_node,
+                            parameter_node,
+                            weight=1.0,
+                            bridge=True,
+                            bridge_type="argument_binding",
+                            caller_function=call_function,
+                            caller_file=caller_path,
+                            call_line=call.get("line", 0),
+                        )
+                        bridge_count += 1
+                        logger.debug(
+                            f"Argument bridge: {argument_node} -> {parameter_node}"
+                        )
 
         logger.info(
             f"Scoped graph: {merged.number_of_nodes()} nodes, "
-            f"{merged.number_of_edges()} edges across {len(file_code_map)} files"
+            f"{merged.number_of_edges()} edges across {len(file_code_map)} files "
+            f"({bridge_count} call-binding bridges)"
         )
         return merged, scope_map
 
@@ -753,6 +886,7 @@ class SimplePipeline:
         )
 
         # Drop hallucinated chains whose snippets don't match the variable name
+        chains = self._filter_cross_function_chains(chains, graph, scope_map)
         chains = self._filter_low_quality_chains(chains)
 
         # Deduplicate chains
@@ -787,7 +921,10 @@ class SimplePipeline:
                     chains, node_id_map=scope_map,
                 )
 
-            verified_chains = verification_results["verified"]
+            verified_chains = (
+                verification_results["verified"]
+                + verification_results.get("unverifiable", [])
+            )
             verification_rate = verification_results["verification_rate"]
 
             if "unverifiable" in verification_results:
@@ -846,13 +983,52 @@ class SimplePipeline:
         return result
 
     @staticmethod
+    def _filter_cross_function_chains(
+        chains: List[TaintChain],
+        graph: Optional[nx.DiGraph] = None,
+        node_id_map: Optional[Dict[int, str]] = None,
+    ) -> List[TaintChain]:
+        """Reject cross-method name collisions unless a class field carries flow."""
+        kept: List[TaintChain] = []
+        node_id_map = node_id_map or {}
+        for chain in chains:
+            source_location = chain.source.location
+            sink_location = chain.sink.location
+            same_file = (
+                source_location.file_path
+                and source_location.file_path == sink_location.file_path
+            )
+            different_functions = (
+                source_location.function_name
+                and sink_location.function_name
+                and source_location.function_name != sink_location.function_name
+            )
+            endpoint_nodes = (
+                node_id_map.get(id(chain.source), chain.source.variable_name),
+                node_id_map.get(id(chain.sink), chain.sink.variable_name),
+            )
+            has_field_bridge = bool(graph) and any(
+                node in graph and graph.nodes[node].get("is_field", False)
+                for node in endpoint_nodes
+            )
+            if same_file and different_functions and not has_field_bridge:
+                logger.info(
+                    "Filtered cross-function name collision: "
+                    f"{source_location.function_name}:{chain.source.variable_name} -> "
+                    f"{sink_location.function_name}:{chain.sink.variable_name}"
+                )
+                continue
+            kept.append(chain)
+        return kept
+
+    @staticmethod
     def _filter_low_quality_chains(chains: List[TaintChain]) -> List[TaintChain]:
         """Drop chains where BOTH source and sink snippets fail to mention their variables.
 
         When the LLM hallucinates line numbers, the populated ``code_snippets``
         end up unrelated to the reported variables on **both** sides
-        (e.g., ``source: var='samlRequest' snip='SAML2Object samlObject = ...'``
-        paired with ``sink: var='issuerNameId' snip='event.detail(...)'``).
+        For example, a model may report endpoint names that occur nowhere in
+        the snippets attached to either side of a chain.
         Such chains escape category classification (both fall back to UNKNOWN)
         and bypass the risk-matrix multiplier.
 
@@ -944,23 +1120,21 @@ class SimplePipeline:
         if removed > 0:
             logger.info(f"Deduplication: removed {removed} duplicate chains")
 
-        # Secondary pass — collapse `same-source-name × same-sink-name × same-vuln`
-        # chains that differ only in line numbers. SAML/HTML-render code declares
-        # the same parameter name (`artifact`, `samlRequest`, ...) in 5+ method
-        # signatures; each of those flows to the same logical sink (`samlClient`,
-        # `response`, ...) called from many call-sites. Without this collapse a
-        # single logical flow inflates into N×M near-identical chains in the
-        # unclassified bucket. Within the same file, we treat them as one flow
-        # and keep the shortest / most confident representative.
+        # Secondary pass: collapse chains with identical scoped endpoints and
+        # vulnerability type that differ only in line metadata.
         coalesced: Dict[tuple, TaintChain] = {}
         for chain in deduped:
             src_file, _src_line = _loc(chain.source)
             sink_file, _sink_line = _loc(chain.sink)
+            src_function = getattr(chain.source.location, "function_name", None)
+            sink_function = getattr(chain.sink.location, "function_name", None)
             key = (
                 chain.source.variable_name,
                 src_file,
+                src_function,
                 chain.sink.variable_name,
                 sink_file,
+                sink_function,
                 chain.vulnerability_type,
             )
             existing = coalesced.get(key)
@@ -982,39 +1156,7 @@ class SimplePipeline:
                 f"duplicates"
             )
 
-        # Hub-node filter: drop chains whose path travels through framework
-        # container objects (session, responseBuilder, ...) AS INTERMEDIATE
-        # nodes. These are class fields shared across every method body —
-        # path discovery routes spurious cross-method "flows" through them
-        # because the graph treats them as connectors. Endpoint usage
-        # (source or sink) is fine; only the intermediate role is suspect.
-        # Generic shared-connector field names common to many Java web/MVC
-        # frameworks (not specific to any product).
-        _HUB_NODES = frozenset({
-            "session", "responseBuilder", "clientSession", "clientSessionCtx",
-            "userSession", "event", "auditEvent", "context", "builder",
-        })
-        kept: List[TaintChain] = []
-        hub_dropped = 0
-        for chain in coalesced_chains:
-            path = chain.path or []
-            if len(path) >= 4:
-                # `path` is List[PathNode]; PathNode has .variable_name
-                names = [
-                    getattr(n, "variable_name", None) or str(n)
-                    for n in path
-                ]
-                intermediates = names[1:-1]
-                if any(name in _HUB_NODES for name in intermediates):
-                    hub_dropped += 1
-                    continue
-            kept.append(chain)
-        if hub_dropped > 0:
-            logger.info(
-                f"Hub-node filter: dropped {hub_dropped} chains routed "
-                f"through framework containers"
-            )
-        return kept
+        return coalesced_chains
 
     # Confidence multiplier matrix: (SourceCategory, SinkCategory) -> multiplier
     #
@@ -1087,11 +1229,23 @@ class SimplePipeline:
             src_cat = getattr(chain.source, "source_category", None) or SourceCategory.UNKNOWN
             sink_cat = getattr(chain.sink, "sink_category", None) or SinkCategory.UNKNOWN
 
-            # UNKNOWN categories get no penalty (backward-compatible)
-            if src_cat == SourceCategory.UNKNOWN or sink_cat == SinkCategory.UNKNOWN:
-                multiplier = 1.0
+            # Once the LLM selected both endpoints and the graph proved a data
+            # path, origin categories such as session/configuration must not
+            # erase the finding. Only explicitly benign/logging operations get
+            # a strong penalty; all security-capable sinks retain LLM confidence.
+            if sink_cat in (SinkCategory.BENIGN, SinkCategory.EVENT_LOGGING):
+                multiplier = 0.1
+            elif (
+                sink_cat in (SinkCategory.DATA_STORAGE, SinkCategory.FRAMEWORK_API)
+                and src_cat in (
+                    SourceCategory.SESSION_DATA,
+                    SourceCategory.INTERNAL_API,
+                    SourceCategory.DATABASE,
+                )
+            ):
+                multiplier = 0.3
             else:
-                multiplier = SimplePipeline._RISK_MATRIX.get((src_cat, sink_cat), 0.8)
+                multiplier = 1.0
 
             new_confidence = chain.confidence * multiplier
             if new_confidence >= min_confidence:
@@ -1135,21 +1289,67 @@ class SimplePipeline:
             f"(algorithm: {self.config.pathfinding_algorithm})..."
         )
 
+        if not sources or not sinks:
+            logger.info("Stage 2 skipped: at least one endpoint class is empty")
+            return {
+                "total_chains": 0,
+                "verified_chains": [],
+                "explanations": {},
+                "metrics": {
+                    "sources_found": len(sources),
+                    "sinks_found": len(sinks),
+                    "sanitizers_found": len(sanitizers),
+                    "chains_found": 0,
+                    "chains_verified": 0,
+                    "verification_rate": 0.0,
+                    "explanations_generated": 0,
+                    "graph_nodes": 0,
+                    "graph_edges": 0,
+                },
+            }
+
         # Build control/data flow graph
-        if self.config.use_llm_graph_builder:
+        if self.config.use_joern:
+            logger.debug("Using JoernWrapper for graph building")
+            joern = JoernWrapper()
+            if joern.joern_available:
+                graph = await asyncio.to_thread(
+                    joern.build_graph, source_code, sources, sinks
+                )
+                self.graph_builder = joern
+            elif self.config.use_llm_graph_builder:
+                self.graph_builder = LLMGraphBuilder(
+                    llm_client=self.llm_client, config=self.config
+                )
+                graph = self.graph_builder.build_graph(source_code, sources, sinks)
+            elif self.config.pathfinding_algorithm == "astar":
+                self.graph_builder = EnhancedGraphBuilder()
+                graph = self.graph_builder.build_graph(source_code, sources, sinks)
+            else:
+                self.graph_builder = SimpleGraphBuilder()
+                graph = self.graph_builder.build_graph(source_code, sources, sinks)
+
+            if (
+                self.config.use_llm_graph_builder
+                and self.config.llm_graph_enrichment_enabled
+                and joern.joern_available
+            ):
+                enricher = LLMGraphBuilder(
+                    llm_client=self.llm_client, config=self.config
+                )
+                graph = await enricher.enrich_graph(
+                    graph, source_code, sources, sinks
+                )
+        elif self.config.use_llm_graph_builder:
             logger.debug("Using LLMGraphBuilder (AST + LLM enrichment)")
             self.graph_builder = LLMGraphBuilder(
                 llm_client=self.llm_client, config=self.config
             )
             graph = self.graph_builder.build_graph(source_code, sources, sinks)
-            graph = await self.graph_builder.enrich_graph(
-                graph, source_code, sources, sinks
-            )
-        elif self.config.use_joern:
-            logger.debug("Using JoernWrapper for graph building")
-            joern = JoernWrapper()
-            graph = joern.build_graph(source_code, sources, sinks)
-            self.graph_builder = joern
+            if self.config.llm_graph_enrichment_enabled:
+                graph = await self.graph_builder.enrich_graph(
+                    graph, source_code, sources, sinks
+                )
         elif self.config.pathfinding_algorithm == "astar":
             logger.debug("Using EnhancedGraphBuilder for A* pathfinding")
             self.graph_builder = EnhancedGraphBuilder()
@@ -1192,6 +1392,7 @@ class SimplePipeline:
         )
 
         # Drop hallucinated chains whose snippets don't match the variable name
+        chains = self._filter_cross_function_chains(chains, graph)
         chains = self._filter_low_quality_chains(chains)
 
         # Deduplicate chains
@@ -1222,7 +1423,10 @@ class SimplePipeline:
                 self.verifier = SimpleCFGVerifier(graph)
                 verification_results = self.verifier.verify_all_chains(chains)
 
-            verified_chains = verification_results["verified"]
+            verified_chains = (
+                verification_results["verified"]
+                + verification_results.get("unverifiable", [])
+            )
             verification_rate = verification_results["verification_rate"]
 
             if "unverifiable" in verification_results:

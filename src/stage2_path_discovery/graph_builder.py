@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import networkx as nx
 
 from src.core.models import Source, Sink
-from src.core.types import DataFlowPath, Variables
+from src.core.types import Variables
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -258,7 +258,7 @@ class EnhancedGraphBuilder:
         # ternary (``new File(dir, id == null ? a : b)``, ``var ok = (a != b)``,
         # ``String s = (x <= 5) ? "low" : "high"``). Allow ``=`` in the RHS.
         # The optional ``[]`` after the name captures C-style array
-        # declarations ``String cmdArgs[] = {...}`` whose bracket would
+        # declarations ``String commandParts[] = {...}`` whose bracket would
         # otherwise sit between the name and ``=`` and skip the whole match.
         assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\[\s*\])?\s*=\s*([^;]+);"
 

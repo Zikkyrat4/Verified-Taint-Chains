@@ -94,9 +94,12 @@ check_installation.py
 # Ad-hoc evaluation outputs at repo root (use evaluation/ subdir for tracked artifacts)
 /evaluation_*.json
 /evaluation_*.md
+.vtc-cache/
 
 # Temporary analysis outputs
 *.cpg
 *.bin
 
 .claude
+.codex
+CLAUDE.md

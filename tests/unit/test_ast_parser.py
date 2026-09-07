@@ -92,6 +92,24 @@ class TestJavaASTParser:
         assert func_map["executeQuery"]["return_type"] == "void"
         assert func_map["getName"]["return_type"] == "String"
 
+    def test_annotations_do_not_replace_method_metadata(self):
+        code = """
+public class UploadController {
+    @PostMapping(path = "/upload")
+    public String upload(@RequestParam("file") MultipartFile file) {
+        return file.getOriginalFilename();
+    }
+}
+"""
+        parser = JavaASTParser()
+        functions = parser.extract_functions(code)
+
+        assert len(functions) == 1
+        assert functions[0]["name"] == "upload"
+        assert functions[0]["return_type"] == "String"
+        assert functions[0]["class_name"] == "UploadController"
+        assert "MultipartFile file" in functions[0]["parameters"][0]
+
     def test_extract_functions_empty_code(self):
         parser = JavaASTParser()
         functions = parser.extract_functions("")
@@ -218,3 +236,15 @@ public class Outer {
         ), flows
         names = {f["from_var"] for f in flows} | {f["to_var"] for f in flows}
         assert "atPicture" not in names and "d" not in names
+
+    def test_method_calls_include_enclosing_function(self):
+        parser = JavaASTParser()
+        if parser.parser is None:
+            pytest.skip("tree-sitter unavailable; AST path not exercised")
+
+        calls = parser.extract_method_calls(
+            "class T { void delegate(String value) { service.consume(value); } }"
+        )
+
+        consume = next(call for call in calls if call["name"] == "consume")
+        assert consume["function_name"] == "delegate"

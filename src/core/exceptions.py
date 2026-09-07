@@ -13,6 +13,18 @@ class LLMError(TaintAnalysisError):
     pass
 
 
+class EmptyLLMResponseError(LLMError):
+    """Raised when a provider returns a successful response without content."""
+
+    pass
+
+
+class TruncatedLLMResponseError(LLMError):
+    """Raised when output tokens are exhausted before a usable answer."""
+
+    pass
+
+
 class ParsingError(TaintAnalysisError):
     """Exception raised when parsing code or LLM output fails."""
 

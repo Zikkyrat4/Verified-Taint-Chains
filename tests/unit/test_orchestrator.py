@@ -54,6 +54,20 @@ class TestSimplePipeline:
         assert pipeline.spec_extractor is not None
         assert pipeline.explainer is not None
 
+    @patch("src.pipeline.orchestrator.create_llm_client")
+    def test_static_backend_does_not_create_llm_client(self, mock_create_llm):
+        config = PipelineConfig(
+            llm_api_key=None,
+            analysis_backend="static",
+            use_llm_graph_builder=False,
+        )
+
+        pipeline = SimplePipeline(config)
+
+        mock_create_llm.assert_not_called()
+        assert pipeline.llm_client is None
+        assert pipeline.spec_extractor.analysis_backend == "static"
+
     def test_init_no_config(self):
         with pytest.raises(ValueError, match="config is required"):
             SimplePipeline(None)
@@ -494,10 +508,15 @@ class TestRunProject:
 def _chain_with_snippets(
     src_var: str, src_snip: str, sink_var: str, sink_snip: str,
     src_line: int = 10, sink_line: int = 20,
+    src_function: str | None = None, sink_function: str | None = None,
 ) -> TaintChain:
     """Helper: build a minimal TaintChain with explicit code_snippets."""
-    src_loc = CodeLocation(file_path="X.java", line_number=src_line)
-    sink_loc = CodeLocation(file_path="X.java", line_number=sink_line)
+    src_loc = CodeLocation(
+        file_path="X.java", line_number=src_line, function_name=src_function
+    )
+    sink_loc = CodeLocation(
+        file_path="X.java", line_number=sink_line, function_name=sink_function
+    )
     source = Source(
         location=src_loc, variable_name=src_var, type="user_input",
         confidence=0.8, code_snippet=src_snip,
@@ -589,3 +608,39 @@ class TestFilterLowQualityChains:
 
     def test_empty_input(self) -> None:
         assert SimplePipeline._filter_low_quality_chains([]) == []
+
+
+class TestFilterCrossFunctionChains:
+    def test_same_file_different_functions_is_dropped(self) -> None:
+        chain = _chain_with_snippets(
+            "username", "String username = request.getParameter(\"u\");",
+            "path", "File path = new File(root, username);",
+            src_function="unrelatedEndpoint", sink_function="readFile",
+        )
+
+        assert SimplePipeline._filter_cross_function_chains([chain]) == []
+
+    def test_same_function_is_kept(self) -> None:
+        chain = _chain_with_snippets(
+            "input", "String input = request.getParameter(\"q\");",
+            "query", "stmt.execute(query);",
+            src_function="search", sink_function="search",
+        )
+
+        assert SimplePipeline._filter_cross_function_chains([chain]) == [chain]
+
+    def test_class_field_bridge_is_kept(self) -> None:
+        import networkx as nx
+
+        chain = _chain_with_snippets(
+            "title", "void setTitle(String title)",
+            "m_title", "out.print(m_title);",
+            src_function="setTitle", sink_function="render",
+        )
+        graph = nx.DiGraph()
+        graph.add_node("title")
+        graph.add_node("m_title", is_field=True)
+
+        assert SimplePipeline._filter_cross_function_chains(
+            [chain], graph
+        ) == [chain]

@@ -23,6 +23,11 @@ class TestPipelineConfig:
         assert config.symbolic_execution_enabled is False
         assert config.verification_level == "cfg"
         assert config.symbolic_timeout == 60
+        assert config.llm_batch_max_chars == 8000
+        assert config.analysis_backend == "llm"
+        assert config.llm_analysis_mode == "targeted"
+        assert config.cache_read_enabled is True
+        assert config.openai_json_mode is True
 
     def test_config_creation_full(self) -> None:
         """Test creating config with all fields."""
@@ -57,6 +62,31 @@ class TestPipelineConfig:
         """Test that confidence > 1.0 raises ValueError."""
         with pytest.raises(ValueError, match="min_confidence must be between"):
             PipelineConfig(llm_api_key="test", min_confidence=1.5)
+
+    def test_config_validation_invalid_llm_batch_size(self) -> None:
+        with pytest.raises(ValueError, match="llm_batch_max_chars"):
+            PipelineConfig(llm_api_key="test", llm_batch_max_chars=-1)
+
+    def test_config_validation_invalid_llm_analysis_mode(self) -> None:
+        with pytest.raises(ValueError, match="llm_analysis_mode"):
+            PipelineConfig(llm_api_key="test", llm_analysis_mode="fastish")
+
+    def test_config_validation_invalid_analysis_backend(self) -> None:
+        with pytest.raises(ValueError, match="analysis_backend"):
+            PipelineConfig(llm_api_key="test", analysis_backend="magic")
+
+    def test_static_backend_does_not_require_openai_key(self) -> None:
+        config = PipelineConfig(llm_api_key=None, analysis_backend="static")
+
+        assert config.analysis_backend == "static"
+
+    def test_static_backend_rejects_llm_graph_enrichment(self) -> None:
+        with pytest.raises(ValueError, match="incompatible"):
+            PipelineConfig(
+                llm_api_key=None,
+                analysis_backend="static",
+                llm_graph_enrichment_enabled=True,
+            )
 
     def test_config_validation_invalid_confidence_low(self) -> None:
         """Test that confidence < 0.0 raises ValueError."""

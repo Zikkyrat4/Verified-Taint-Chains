@@ -138,7 +138,7 @@ class TestVerificationEngine:
         assert sample_chain.verification_status == result.status
 
     @patch("src.stage3_verification.verification_engine.CFGVerifier")
-    def test_verify_chain_cfg_false_fast_reject(self, mock_cfg_cls, cfg_config, sample_chain):
+    def test_verify_chain_cfg_false_is_inconclusive(self, mock_cfg_cls, cfg_config, sample_chain):
         mock_verifier = MagicMock()
         mock_verifier.verify_chain.return_value = VerificationStatus.FALSE
         mock_cfg_cls.return_value = mock_verifier
@@ -147,8 +147,8 @@ class TestVerificationEngine:
         engine.cfg_verifier = mock_verifier
         result = engine.verify_chain(sample_chain, SAMPLE_CODE)
 
-        assert result.status == VerificationStatus.FALSE
-        assert result.confidence == 0.9
+        assert result.status == VerificationStatus.UNVERIFIABLE
+        assert result.confidence == 0.4
         assert result.method_used == "cfg"
 
     @patch("src.stage3_verification.verification_engine.CFGVerifier")

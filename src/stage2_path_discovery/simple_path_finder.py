@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import networkx as nx
 
 from src.core.models import Source, Sink, Sanitizer, TaintChain, PathNode, CodeLocation
-from src.core.types import DataFlowPath, Variables
+from src.core.types import Variables
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -167,7 +167,7 @@ class SimpleGraphBuilder:
         # losing the data-flow edge entirely. Real Java code hits this
         # constantly (e.g. ``var f = new File(dir, id == null ? def : id);``).
         # The optional ``[]`` after the name captures C-style array
-        # declarations ``String cmdArgs[] = {...}`` — without it the bracket
+        # declarations ``String commandParts[] = {...}`` — without it the bracket
         # sits between the name and ``=`` and the whole assignment is missed,
         # so nothing flows INTO the array (e.g. the args to Runtime.exec).
         assignment_pattern = r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\[\s*\])?\s*=\s*([^;]+);"
@@ -307,7 +307,7 @@ class SimpleBFSPathFinder:
             logger.debug(f"No path found from {source_node} to {sink_node}")
             return None
         except nx.NodeNotFound:
-            logger.debug(f"Node not found in graph")
+            logger.debug("Node not found in graph")
             return None
 
     def find_all_chains(

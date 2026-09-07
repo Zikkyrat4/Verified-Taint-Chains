@@ -65,7 +65,7 @@ single-file набор; такие сценарии измеряются project
 ## Методология детекции (для защиты — train/test leakage)
 
 Эталонные `ground_truth.json` детектор **не видит**: они подаются только
-`scripts/evaluate.py` для подсчёта TP/FP/FN/Unclassified *после* прогона
+`src/evaluation/` для подсчёта TP/FP/FN/Unclassified *после* прогона
 пайплайна. Вход Stage 1 — исключительно `.java`-файл.
 
 «Что является опасной операцией» определяется так:
@@ -86,17 +86,13 @@ single-file набор; такие сценарии измеряются project
    уверенный ярлык LLM. Нераспознанный класс → `OTHER` (не молчаливый
    `SQL_INJECTION`), CWE берётся от LLM → новый/0-day класс остаётся видимым
    и попадает в **Unclassified**, а не теряется.
-3. **Приоритизация, не исключение.** Регекс-паттерны известных API больше
-   не *отбраковывают* код перед LLM (это слепило детектор на незнакомых
-   API). Анализируются все структурно-нетривиальные функции/файлы;
-   паттерны лишь задают порядок. `VTC_FAST_PREFILTER=true` — только
-   debug/CI.
-4. **Универсальность содержательная, не только формальная.** Из ядра
-   (`src/`) убраны не только литералы продукта, но и product-flavored
-   anti-FP подсказки (обобщены до «server-side session/identity
-   accessors», «framework config getters»). Инвариант:
-   `grep -rinE "keycloak|authSession|getAuthNote|AuthenticationFlow" src/`
-   → пусто.
+3. **Два явно разных уровня охвата.** Режим `targeted` отправляет LLM только
+   методы с общими security-boundary/API признаками и поэтому может пропустить
+   незнакомый API. Режим `exhaustive` отправляет все структурно-нетривиальные
+   методы и стоит дороже. Backend и режим охвата записываются в отчёт.
+4. **Контроль утечки.** В ядре `src/` нет имён проектов, CVE, классов или
+   переменных из этого benchmark. Статический baseline использует только
+   общие Java/security capabilities и никогда не включается неявно в `llm`.
 
 **Известное ограничение (озвучивать первым):** покрываемые *классы*
 фиксированы калибровочной таксономией; принципиально новый класс выявится
@@ -124,8 +120,9 @@ Stage 2 строит граф приближённо (регекс-эврист�
    *разноимённый* параметр (`super.execute(file, file.getOriginalFilename(),
    ..)`), именованного узла `fullName` в подклассе нет, а позиционной
    привязки аргументов к формальным параметрам (`file → fullName`) мост не
-   делает — это уже полноценный межпроцедурный анализ. Такие кейсы помечены
-   `expected_realistic: false` (см. WebGoat TP-2) и исключены из recall.
+   делает — это уже полноценный межпроцедурный анализ. Старый флаг
+   `expected_realistic: false` сохраняется как описание сложности, но такие
+   кейсы всё равно входят в основной recall и становятся FN при пропуске.
 2. **`source_var == sink_var` в одном scope недетектируем как self-loop.**
    Узлы графа ключуются по имени переменной, поэтому если заражённый ввод
    *сам* является аргументом стока без промежуточного присваивания (источник и
@@ -156,20 +153,20 @@ Stage 2 строит граф приближённо (регекс-эврист�
           "id": "TP-1",                  // unique within file
           "source_var": "redirect",      // имя source-переменной
           "sink_var": "redirectUri",
-          "source_file": "Foo.java",     // optional; project-mode — basename файла source
-          "sink_file":   "Bar.java",     // optional; project-mode — basename файла sink
+          "source_file": "Foo.java",     // optional; точный относительный suffix source path
+          "sink_file":   "Bar.java",     // optional; точный относительный suffix sink path
           "source_line": 215,            // 1-indexed; 0 = unknown
           "sink_line": 303,
           "vuln_type": "xss",            // xss | sql_injection | command_injection | path_traversal | xxe | ssrf | deserialization | open_redirect | code_injection
           "description": "что именно за поток и почему это уязвимость",
-          "expected_realistic": true     // optional; false → не штрафуется как FN
+          "expected_realistic": true     // legacy metadata о сложности; метрики не меняет
         }
       ],
 
       "false_positive_patterns": [
         {
-          "source_var": "realm",         // matched fuzzy (substring, либо
-          "sink_var": "setClientNote",   //  source_pattern/sink_pattern regex)
+          "source_var": "realm",         // точное canonical identifier match
+          "sink_var": "setClientNote",   // regex задаётся только через *_pattern
           "reason": "internal session setter — не выводится наружу"
         }
       ]
@@ -181,7 +178,8 @@ Stage 2 строит граф приближённо (регекс-эврист�
 Поля `true_positives` и `false_positive_patterns` независимы:
 - цепочки, попавшие в TP → засчитываются как True Positive;
 - остальные, попавшие в FP-паттерн → False Positive;
-- всё прочее → **unclassified** (=кандидаты на 0-day, ручной просмотр).
+- всё прочее → **unclassified** (=кандидаты на ручной просмотр), но в
+  основной precision они также считаются ложными срабатываниями.
 
 ## Как добавить новый проект
 
@@ -196,13 +194,13 @@ $EDITOR tests/fixtures/real_world/<project>/ground_truth.json
 pytest tests/unit/test_real_world_fixtures.py -v
 
 # Прогон только этого проекта (отчёты пишутся в evaluation/<project>/):
-python scripts/evaluate.py --project <project>
+vtc evaluate --project <project>
 
 # Все проекты сразу + агрегированная таблица:
-python scripts/evaluate.py --all-projects
+vtc evaluate --all-projects
 
 # Сравнение baseline vs after:
-python scripts/evaluate.py --diff \
+vtc evaluate --diff \
     evaluation/<project>/baseline.json \
     evaluation/<project>/after.json
 ```
@@ -219,7 +217,7 @@ OUTPUT_RENDERING сток = живой кандидат.
 1. Положить файлы интереса в `tests/fixtures/real_world/<project>/`,
    разметить только заведомо известные FP в `false_positive_patterns`
    (без `true_positives` пока их не подтвердили).
-2. Прогнать `python scripts/evaluate.py --project <project> --baseline`.
+2. Прогнать `vtc evaluate --project <project> --baseline`.
 3. Каждую цепочку с conf ≥ 0.7 в `unclassified` проверить руками.
    Подтверждённые уязвимости — переехать в `true_positives` (с описанием),
    false-paths — в `false_positive_patterns`. Это превращает прогон в

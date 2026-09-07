@@ -1,6 +1,8 @@
 """A* pathfinding with semantic heuristics using CodeBERT embeddings."""
 
 import heapq
+import os
+from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -26,6 +28,9 @@ class SemanticHeuristic:
     of variable names and their contexts, then uses cosine distance as heuristic.
     """
 
+    _model_cache: Dict[str, object] = {}
+    _failed_models: Set[str] = set()
+
     def __init__(self, model_name: str = "microsoft/codebert-base") -> None:
         """Initialize semantic heuristic with CodeBERT model.
 
@@ -35,20 +40,37 @@ class SemanticHeuristic:
         Raises:
             RuntimeError: If sentence-transformers is not available.
         """
+        self.embedding_cache: Dict[str, np.ndarray] = {}
+
         if not SENTENCE_TRANSFORMERS_AVAILABLE:
             logger.warning("sentence-transformers not available, using fallback heuristic")
             self.model = None
             return
 
-        try:
-            self.model = SentenceTransformer(model_name)
-            logger.info(f"Loaded semantic heuristic model: {model_name}")
-        except Exception as e:
-            logger.warning(f"Failed to load semantic model: {str(e)}, using fallback")
+        if os.getenv("VTC_USE_CODEBERT", "false").lower() not in (
+            "true", "1", "yes", "on"
+        ):
             self.model = None
+            logger.debug(
+                "CodeBERT disabled; using deterministic lightweight heuristic"
+            )
+            return
 
-        # Embedding cache: variable_name -> embedding vector
-        self.embedding_cache: Dict[str, np.ndarray] = {}
+        if model_name in self._model_cache:
+            self.model = self._model_cache[model_name]
+        elif model_name in self._failed_models:
+            self.model = None
+        else:
+            try:
+                self.model = SentenceTransformer(model_name)
+                self._model_cache[model_name] = self.model
+                logger.info(f"Loaded semantic heuristic model: {model_name}")
+            except Exception as e:
+                self._failed_models.add(model_name)
+                logger.warning(
+                    f"Failed to load semantic model: {str(e)}, using fallback"
+                )
+                self.model = None
 
     def get_embedding(self, variable_name: str, context: Optional[str] = None) -> np.ndarray:
         """Get embedding for a variable, with caching.
@@ -109,6 +131,9 @@ class SemanticHeuristic:
         Returns:
             Distance value (0.0 to 2.0, where 0 is identical, 1.0 is orthogonal).
         """
+        if var1 == var2 and context1 == context2:
+            return 0.0
+
         emb1 = self.get_embedding(var1, context1)
         emb2 = self.get_embedding(var2, context2)
 
@@ -172,7 +197,11 @@ class AStarPathFinder:
         )
 
     def find_path(
-        self, source_node: str, sink_node: str, max_length: int = 15
+        self,
+        source_node: str,
+        sink_node: str,
+        max_length: int = 15,
+        function_name: Optional[str] = None,
     ) -> Optional[List[str]]:
         """Find optimal path from source to sink using A*.
 
@@ -209,7 +238,7 @@ class AStarPathFinder:
         )
         counter += 1
 
-        logger.debug(f"Starting A* search from {source_node} to {sink_node}")
+        logger.trace(f"Starting A* search from {source_node} to {sink_node}")
 
         while open_set:
             current_f, _, current_node, path = heapq.heappop(open_set)
@@ -234,6 +263,15 @@ class AStarPathFinder:
             for neighbor in self.graph.neighbors(current_node):
                 if neighbor in visited:
                     continue
+                edge_scope = self.graph[current_node][neighbor].get("function_name")
+                edge_scopes = self.graph[current_node][neighbor].get(
+                    "function_names", []
+                )
+                if function_name:
+                    if edge_scopes and function_name not in edge_scopes:
+                        continue
+                    if not edge_scopes and edge_scope and edge_scope != function_name:
+                        continue
 
                 # Calculate tentative g_score
                 # Cost of edge is 1 plus any edge weight if present
@@ -254,12 +292,51 @@ class AStarPathFinder:
                     )
                     counter += 1
 
-                    logger.debug(
+                    logger.trace(
                         f"Exploring {current_node} -> {neighbor}: "
                         f"g={tentative_g:.2f}, h={h:.2f}, f={f:.2f}"
                     )
 
-        logger.debug(f"No path found from {source_node} to {sink_node} using A*")
+        logger.trace(f"No path found from {source_node} to {sink_node} using A*")
+        return None
+
+    def _find_scoped_field_path(
+        self,
+        source_node: str,
+        sink_node: str,
+        allowed_functions: Set[str],
+        max_length: int,
+    ) -> Optional[List[str]]:
+        """Find a cross-method path constrained to its endpoint scopes."""
+        if source_node not in self.graph or sink_node not in self.graph:
+            return None
+
+        queue = deque([(source_node, [source_node], False)])
+        visited: Set[Tuple[str, bool]] = set()
+        while queue:
+            node, path, has_field_flow = queue.popleft()
+            state = (node, has_field_flow)
+            if state in visited or len(path) > max_length:
+                continue
+            visited.add(state)
+            if node == sink_node and has_field_flow:
+                return path
+
+            for neighbor in self.graph.neighbors(node):
+                edge = self.graph[node][neighbor]
+                next_has_field = has_field_flow
+                if not edge.get("bridge"):
+                    edge_functions = set(edge.get("function_names", []))
+                    if edge.get("function_name"):
+                        edge_functions.add(edge["function_name"])
+                    if not edge_functions or edge_functions.isdisjoint(
+                        allowed_functions
+                    ):
+                        continue
+                    field_functions = set(edge.get("field_flow_functions", []))
+                    if not field_functions.isdisjoint(allowed_functions):
+                        next_has_field = True
+                queue.append((neighbor, path + [neighbor], next_has_field))
         return None
 
     def find_all_chains(
@@ -305,10 +382,10 @@ class AStarPathFinder:
             if src_id not in self.graph:
                 continue
             reachable: Set[str] = set()
-            queue = [(src_id, 0)]
+            queue = deque([(src_id, 0)])
             visited: Set[str] = set()
             while queue:
-                node, depth = queue.pop(0)
+                node, depth = queue.popleft()
                 if node in visited or depth > max_length:
                     continue
                 visited.add(node)
@@ -328,26 +405,85 @@ class AStarPathFinder:
                 if sink_id not in reachable:
                     skipped += 1
                     continue
-                # Skip cross-method pairs: if both have function_name set
-                # and they differ, these variables are in different scopes.
-                # Only apply within the same file — cross-file pairs are allowed.
+                # Same-file, cross-method flows are accepted only when the
+                # discovered path crosses a declared class field. This keeps
+                # legitimate setter -> renderer flows while preventing local
+                # variables with identical names from collapsing scopes.
                 src_func = getattr(source.location, "function_name", None)
                 sink_func = getattr(sink.location, "function_name", None)
                 src_file = getattr(source.location, "file_path", "")
                 sink_file = getattr(sink.location, "file_path", "")
-                if (src_func and sink_func and src_func != sink_func
-                        and src_file and sink_file and src_file == sink_file):
-                    logger.debug(
-                        f"Skipping cross-method pair: {source.variable_name} "
-                        f"({src_func}) -> {sink.variable_name} ({sink_func})"
+                cross_method = bool(
+                    src_func and sink_func and src_func != sink_func
+                    and src_file and sink_file and src_file == sink_file
+                )
+
+                logger.trace(f"A* search: {src_id} -> {sink_id}")
+
+                pair_function = None
+                if src_func and sink_func and src_func == sink_func and src_file == sink_file:
+                    pair_function = src_func
+                if cross_method:
+                    path_nodes = self._find_scoped_field_path(
+                        src_id,
+                        sink_id,
+                        {src_func, sink_func},
+                        max_length,
                     )
-                    continue
-
-                logger.debug(f"A* search: {src_id} -> {sink_id}")
-
-                path_nodes = self.find_path(src_id, sink_id, max_length)
+                else:
+                    path_nodes = self.find_path(
+                        src_id,
+                        sink_id,
+                        max_length,
+                        function_name=pair_function,
+                    )
 
                 if path_nodes:
+                    cross_file = bool(
+                        src_file and sink_file and src_file != sink_file
+                    )
+                    if cross_file and src_func:
+                        bridge_functions = [
+                            self.graph[left][right].get("caller_function")
+                            for left, right in zip(path_nodes, path_nodes[1:])
+                            if self.graph[left][right].get("bridge")
+                        ]
+                        if (
+                            bridge_functions
+                            and src_func not in bridge_functions
+                        ):
+                            logger.debug(
+                                "Skipping cross-file path whose call bridge "
+                                f"belongs to another method: {src_id} -> {sink_id}"
+                            )
+                            continue
+                    if cross_method:
+                        allowed_functions = {src_func, sink_func}
+                        edges_in_scope = True
+                        has_field_flow = False
+                        for left, right in zip(path_nodes, path_nodes[1:]):
+                            edge = self.graph[left][right]
+                            if edge.get("bridge"):
+                                continue
+                            edge_functions = set(edge.get("function_names", []))
+                            if edge.get("function_name"):
+                                edge_functions.add(edge["function_name"])
+                            if not edge_functions or edge_functions.isdisjoint(
+                                allowed_functions
+                            ):
+                                edges_in_scope = False
+                                break
+                            field_functions = set(
+                                edge.get("field_flow_functions", [])
+                            )
+                            if not field_functions.isdisjoint(allowed_functions):
+                                has_field_flow = True
+                        if not has_field_flow or not edges_in_scope:
+                            logger.debug(
+                                "Skipping unscoped cross-method path: "
+                                f"{src_id} -> {sink_id}"
+                            )
+                            continue
                     # Filter self-loops: a single-node path means
                     # source and sink map to the same graph node
                     # — no actual data flow exists.
@@ -401,7 +537,7 @@ class AStarPathFinder:
                 estimated_path_length = min(10, max(1, len(self.graph) // 5))
                 h_value = semantic_distance * estimated_path_length
 
-                logger.debug(
+                logger.trace(
                     f"Semantic heuristic {current} -> {goal}: distance={semantic_distance:.3f}, h={h_value:.3f}"
                 )
 
@@ -489,26 +625,28 @@ class AStarPathFinder:
                 chain_vars.add(display)
 
             for san in sanitizers:
-                # Allow sanitizers slightly beyond the sink (e.g. setString
-                # after prepareStatement on the next line)
-                in_range = min_line <= san.location.line_number <= max_line + 5
-                # Also allow if sanitizer explicitly references source variable
-                refs_source = (
-                    san.effectiveness >= 0.9
-                    and source.variable_name
-                    and len(source.variable_name) > 1
-                    and source.variable_name in san.code_snippet
-                )
-                if not in_range and not refs_source:
+                san_file = san.location.file_path
+                src_file = source.location.file_path
+                sink_file = sink.location.file_path
+                if san_file not in {src_file, sink_file}:
                     continue
-                # Match by vulnerability type
-                if vuln_type in san.vulnerability_types:
-                    matching_sanitizers.append(san)
-                # Or match by variable name in sanitizer code (handles misclassification)
-                elif san.effectiveness >= 0.9 and any(
-                    v in san.code_snippet for v in chain_vars if len(v) > 1
-                ):
-                    matching_sanitizers.append(san)
+
+                if src_file == sink_file:
+                    ordered = min_line <= san.location.line_number <= max_line + 5
+                elif san_file == src_file:
+                    ordered = san.location.line_number >= src_line
+                else:
+                    ordered = san.location.line_number <= sink_line + 5
+                if not ordered:
+                    continue
+
+                # Static pattern matching is not a proof unless it is tied to
+                # an actual value carried by this chain.
+                if not san.variable_name or san.variable_name not in chain_vars:
+                    continue
+                if vuln_type not in san.vulnerability_types:
+                    continue
+                matching_sanitizers.append(san)
 
             if matching_sanitizers:
                 logger.debug(

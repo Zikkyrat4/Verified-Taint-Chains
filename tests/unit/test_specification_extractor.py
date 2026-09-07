@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.stage1_llm_inference.specification_extractor import SimpleSpecificationExtractor
 from src.stage1_llm_inference.llm_client import SimpleLLMClient
 from src.core.exceptions import ParsingError, LLMError
-from src.core.models import VulnerabilityType
+from src.core.models import CodeLocation, SinkCategory, Source, VulnerabilityType
 
 
 class TestSimpleSpecificationExtractorInit:
@@ -427,69 +427,22 @@ class TestContextExtraction:
         assert classes[0].get("name") == "MyHandler"
 
 
-class TestFalsePositiveFiltering:
-    """Tests for false-positive source variable filtering."""
+class TestLLMEndpointPreservation:
+    """The parser must not reject model-selected endpoints by variable name."""
 
-    def test_filter_resultset_variable(self) -> None:
-        """Test that ResultSet variable 'rs' is filtered out."""
+    def test_preserves_valid_identifiers(self) -> None:
         client = SimpleLLMClient(api_key="test-key")
         extractor = SimpleSpecificationExtractor(client)
 
         response = {
             "sources": [
-                {"line": 10, "variable": "rs", "type": "database", "confidence": 0.9},
-                {"line": 11, "variable": "username", "type": "user_input", "confidence": 0.9},
+                {"line": 10, "variable": "result", "type": "database", "confidence": 0.9},
+                {"line": 11, "variable": "context", "type": "external_data", "confidence": 0.9},
             ]
         }
 
         sources = extractor._parse_llm_sources(response, "test.java")
-        assert len(sources) == 1
-        assert sources[0].variable_name == "username"
-
-    def test_filter_connection_variable(self) -> None:
-        """Test that Connection variable 'conn' is filtered out."""
-        client = SimpleLLMClient(api_key="test-key")
-        extractor = SimpleSpecificationExtractor(client)
-
-        response = {
-            "sources": [
-                {"line": 10, "variable": "conn", "type": "database", "confidence": 0.9},
-            ]
-        }
-
-        sources = extractor._parse_llm_sources(response, "test.java")
-        assert len(sources) == 0
-
-    def test_filter_statement_variables(self) -> None:
-        """Test that Statement-related variables are filtered out."""
-        client = SimpleLLMClient(api_key="test-key")
-        extractor = SimpleSpecificationExtractor(client)
-
-        response = {
-            "sources": [
-                {"line": 10, "variable": "stmt", "type": "database", "confidence": 0.9},
-                {"line": 11, "variable": "ps", "type": "database", "confidence": 0.9},
-                {"line": 12, "variable": "pstmt", "type": "database", "confidence": 0.9},
-            ]
-        }
-
-        sources = extractor._parse_llm_sources(response, "test.java")
-        assert len(sources) == 0
-
-    def test_filter_is_case_insensitive(self) -> None:
-        """Test that filtering works case-insensitively."""
-        client = SimpleLLMClient(api_key="test-key")
-        extractor = SimpleSpecificationExtractor(client)
-
-        response = {
-            "sources": [
-                {"line": 10, "variable": "RS", "type": "database", "confidence": 0.9},
-                {"line": 11, "variable": "Conn", "type": "database", "confidence": 0.9},
-            ]
-        }
-
-        sources = extractor._parse_llm_sources(response, "test.java")
-        assert len(sources) == 0
+        assert [source.variable_name for source in sources] == ["result", "context"]
 
     def test_stores_function_name_in_source(self) -> None:
         """Test that function_name is stored in Source CodeLocation."""
@@ -636,6 +589,33 @@ class TestLineResolution:
         assert "farAway" in spec.sources[0].code_snippet
 
     @pytest.mark.asyncio
+    async def test_comment_mention_is_not_used_as_endpoint_line(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(
+            llm_client=client,
+            batch_max_chars=10_000,
+        )
+        code = """public class LinkTag {
+  /** title is rendered by this tag. */
+  private String stored;
+  public void setTitle(String title) {
+    this.stored = title;
+  }
+  public void render() { out.print(stored); }
+}
+"""
+        with patch.object(client, "chat_with_json_prompt", new_callable=AsyncMock) as m:
+            m.return_value = {
+                "sources": [{"line": 2, "variable": "title",
+                             "type": "tag_attribute", "confidence": 0.9}],
+                "sinks": [],
+            }
+            spec = await extractor.extract(code, "LinkTag.java")
+
+        assert spec.sources[0].location.line_number == 4
+        assert "setTitle" in spec.sources[0].code_snippet
+
+    @pytest.mark.asyncio
     async def test_resolved_snippet_classifies_correctly(self) -> None:
         """End-to-end: line-resolved snippet hits the USER_INPUT classifier."""
         from src.core.models import SourceCategory
@@ -663,74 +643,6 @@ class TestLineResolution:
         # `getParameter(` and assigns USER_INPUT — not the INTERNAL_API
         # fallback that would bypass the risk matrix.
         assert spec.sources[0].source_category == SourceCategory.USER_INPUT
-
-
-class TestJspTagSetterPrePass:
-    """Tests for the JSP-tag setter source pre-pass."""
-
-    def test_is_jsp_tag_class_via_class_suffix(self) -> None:
-        """Class name ending in `Tag` activates the pre-pass."""
-        assert SimpleSpecificationExtractor._is_jsp_tag_class(
-            imports=[], classes=[{"name": "LinkToTag"}]
-        )
-
-    def test_is_jsp_tag_class_via_import(self) -> None:
-        """`javax.servlet.jsp.tagext` import activates the pre-pass."""
-        assert SimpleSpecificationExtractor._is_jsp_tag_class(
-            imports=["javax.servlet.jsp.tagext.TagSupport"], classes=[]
-        )
-
-    def test_is_jsp_tag_class_negative(self) -> None:
-        """Plain Spring/POJO classes are not in scope."""
-        assert not SimpleSpecificationExtractor._is_jsp_tag_class(
-            imports=["org.springframework.stereotype.Component"],
-            classes=[{"name": "UserService"}],
-        )
-
-    def test_extract_setter_sources_emits_param(self) -> None:
-        """JSP-tag setter parameter is emitted as USER_INPUT source."""
-        client = SimpleLLMClient(api_key="test-key")
-        extractor = SimpleSpecificationExtractor(client)
-
-        code = (
-            "package org.apache.wiki.tags;\n"
-            "public class LinkToTag {\n"
-            "    public String m_title = \"\";\n"
-            "    public void setTitle( String title )\n"
-            "    {\n"
-            "        m_title = title;\n"
-            "    }\n"
-            "}\n"
-        )
-        sources = extractor._extract_jsp_setter_sources(
-            source_code=code,
-            file_path="LinkToTag.java",
-            imports=[],
-            classes=[{"name": "LinkToTag"}],
-        )
-        assert len(sources) == 1
-        assert sources[0].variable_name == "title"
-        assert sources[0].location.line_number == 4
-        assert sources[0].location.function_name == "setTitle"
-        assert sources[0].type == "user_input"
-
-    def test_extract_setter_sources_skipped_outside_jsp(self) -> None:
-        """POJO setters do not produce sources (avoids FP-explosion)."""
-        client = SimpleLLMClient(api_key="test-key")
-        extractor = SimpleSpecificationExtractor(client)
-
-        code = (
-            "public class UserDto {\n"
-            "    public void setName(String name) { this.name = name; }\n"
-            "}\n"
-        )
-        sources = extractor._extract_jsp_setter_sources(
-            source_code=code,
-            file_path="UserDto.java",
-            imports=[],
-            classes=[{"name": "UserDto"}],
-        )
-        assert sources == []
 
 
 class TestInferVulnerabilityType:
@@ -765,54 +677,6 @@ class TestInferVulnerabilityType:
         """`deserialize` is checked before XSS keywords like `output`."""
         result = SimpleSpecificationExtractor._infer_vulnerability_type(
             raw_type="deserialize_output_sink", sink_type="x"
-        )
-        assert result == VulnerabilityType.UNSAFE_DESERIALIZATION
-
-
-class TestCorrectVulnTypeFromSnippet:
-    """Tests for snippet-based vuln_type post-correction."""
-
-    def test_readvalue_snippet_corrects_to_deserialization(self) -> None:
-        snippet = "SerializedBrokeredIdentityContext ctx = JsonSerialization.readValue(asString, X.class);"
-        result = SimpleSpecificationExtractor._correct_vuln_type_from_snippet(snippet)
-        assert result == VulnerabilityType.UNSAFE_DESERIALIZATION
-
-    def test_readobject_snippet_corrects(self) -> None:
-        snippet = "Object o = ois.readObject();"
-        result = SimpleSpecificationExtractor._correct_vuln_type_from_snippet(snippet)
-        assert result == VulnerabilityType.UNSAFE_DESERIALIZATION
-
-    def test_classforname_corrects_to_code_injection(self) -> None:
-        snippet = "Class<?> clazz = Reflections.classForName(value.getClazz(), loader);"
-        result = SimpleSpecificationExtractor._correct_vuln_type_from_snippet(snippet)
-        assert result == VulnerabilityType.CODE_INJECTION
-
-    def test_class_forname_corrects(self) -> None:
-        snippet = "Class<?> c = Class.forName(name);"
-        result = SimpleSpecificationExtractor._correct_vuln_type_from_snippet(snippet)
-        assert result == VulnerabilityType.CODE_INJECTION
-
-    def test_neutral_snippet_returns_none(self) -> None:
-        """No override on snippets that don't match deserialization/code patterns."""
-        snippet = "db.executeQuery(sql);"
-        result = SimpleSpecificationExtractor._correct_vuln_type_from_snippet(snippet)
-        assert result is None
-
-    def test_empty_snippet_returns_none(self) -> None:
-        assert SimpleSpecificationExtractor._correct_vuln_type_from_snippet("") is None
-
-    def test_context_window_catches_neighboring_readvalue(self) -> None:
-        """Snippet snaps to follow-on `return`, but window finds readValue."""
-        snippet = "return serializedCtx;"
-        context = (
-            "try {\n"
-            "    SerializedCtx serializedCtx = "
-            "JsonSerialization.readValue(asString, SerializedCtx.class);\n"
-            "    return serializedCtx;\n"
-            "} catch (IOException e) {}\n"
-        )
-        result = SimpleSpecificationExtractor._correct_vuln_type_from_snippet(
-            snippet, context
         )
         assert result == VulnerabilityType.UNSAFE_DESERIALIZATION
 
@@ -935,6 +799,9 @@ class TestExtractCacheIntegration:
             llm_provider="openai",
             llm_model="gpt-4-turbo",
             min_confidence=0.5,
+            extractor_options=(
+                "analysis_backend=llm;analysis_mode=exhaustive;batch_max_chars=0"
+            ),
         )
 
         ext = self._make_extractor(spec_cache=cache)
@@ -985,3 +852,596 @@ class TestExtractCacheIntegration:
         )
         assert spec.sources == []
         ext.llm_client.chat_with_json_prompt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_incomplete_extraction_is_not_cached(self, tmp_path):
+        from src.stage1_llm_inference.spec_cache import SpecCache
+
+        cache = SpecCache(cache_dir=tmp_path)
+        ext = self._make_extractor(spec_cache=cache)
+        ext.llm_client.chat_with_json_prompt = AsyncMock(
+            side_effect=LLMError("temporary provider failure")
+        )
+        code = """
+public class Controller {
+    void run(String input) { Runtime.getRuntime().exec(input); }
+}
+"""
+
+        spec = await ext.extract(code, file_path="Controller.java")
+
+        assert spec.extraction_complete is False
+        assert spec.extraction_errors
+        assert cache.stats.writes == 0
+
+
+class TestLLMBatching:
+    """File batching reduces request fan-out without losing AST scope."""
+
+    @pytest.mark.asyncio
+    async def test_batches_methods_and_restores_function_scope(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(return_value={
+            "sources": [{
+                "line": 3,
+                "variable": "input",
+                "type": "user_input",
+                "confidence": 0.9,
+            }],
+            "sinks": [{
+                "line": 7,
+                "variable": "query",
+                "type": "sql_execution",
+                "vulnerability_type": "sql_injection",
+                "confidence": 0.9,
+            }],
+            "sanitizers": [{
+                "line": 3,
+                "variable": "input",
+                "type": "input_validation",
+                "vulnerability_types": ["sql_injection"],
+                "confidence": 0.8,
+                "effectiveness": 0.5,
+            }],
+        })
+        extractor = SimpleSpecificationExtractor(
+            client,
+            batch_max_chars=10_000,
+        )
+        code = """public class Batched {
+    public void first() {
+        String input = request.getParameter("q");
+        audit(input);
+    }
+    public void second(String query) {
+        db.execute(query);
+    }
+}
+"""
+
+        spec = await extractor.extract(code, "Batched.java")
+
+        client.chat_with_json_prompt.assert_awaited_once()
+        assert [source.variable_name for source in spec.sources].count("input") == 1
+        assert next(
+            source for source in spec.sources if source.variable_name == "input"
+        ).location.function_name == "first"
+        assert next(
+            sink for sink in spec.sinks if sink.variable_name == "query"
+        ).location.function_name == "second"
+        sanitizer = spec.sanitizers[0]
+        assert sanitizer.location.function_name == "first"
+        assert "request.getParameter" in sanitizer.code_snippet
+
+    def test_combined_prompt_formats_full_file_examples(self):
+        from src.stage1_llm_inference.prompt_templates import build_combined_prompt
+
+        prompt = build_combined_prompt(
+            code="class T { void run(String input) {} }",
+            function_info=None,
+            class_info=None,
+            imports=[],
+        )
+
+        assert "setValue(String value)" in prompt
+        assert "this.field = value" in prompt
+
+    @pytest.mark.asyncio
+    async def test_failed_full_file_batch_retries_as_smaller_method_batches(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(side_effect=[
+            ParsingError("truncated"),
+            ParsingError("truncated"),
+            {"sources": [], "sinks": []},
+            {"sources": [], "sinks": []},
+        ])
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=400)
+        code = """public class RetriedBatch {
+    public void first(String input) {
+        service.consumeFirst(input);
+    }
+
+    // Padding keeps the complete file above the retry batch limit while each
+    // individual method remains below it.
+    public void second(String value) {
+        service.consumeSecond(value);
+    }
+}
+"""
+
+        spec = await extractor.extract(code, "RetriedBatch.java")
+
+        assert spec.extraction_complete is True
+        assert spec.extraction_errors == []
+        assert client.chat_with_json_prompt.await_count == 4
+
+    @pytest.mark.asyncio
+    async def test_successful_large_batch_is_not_mistaken_for_failure(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(return_value={
+            "sources": [], "sinks": [], "sanitizers": [],
+        })
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=400)
+        code = """public class SuccessfulBatch {
+    public void first(String input) {
+        Runtime.getRuntime().exec(input);
+    }
+
+    // Padding makes a failed synthetic batch eligible for split retry.
+    public void second(String value) {
+        Runtime.getRuntime().exec(value);
+    }
+}
+"""
+
+        spec = await extractor.extract(code, "SuccessfulBatch.java")
+
+        assert spec.extraction_complete is True
+        # The empty batch is reviewed once per suspicious method, not treated
+        # as a failed batch and recursively split/retried.
+        assert client.chat_with_json_prompt.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_sink_without_sources_gets_one_llm_consistency_repair(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(side_effect=[
+            {
+                "sources": [],
+                "sinks": [{
+                    "line": 4,
+                    "variable": "target",
+                    "type": "file_write",
+                    "vulnerability_type": "path_traversal",
+                    "confidence": 0.95,
+                }],
+            },
+            {
+                "sources": [{
+                    "line": 3,
+                    "variable": "entry",
+                    "type": "archive_entry",
+                    "confidence": 0.95,
+                }]
+            },
+        ])
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=10_000)
+        code = """class ZipReader {
+    void unpack(ZipEntry entry) {
+        File target = new File(root, entry.getName());
+        Files.copy(input, target.toPath());
+    }
+}"""
+
+        spec = await extractor.extract(code, "ZipReader.java")
+
+        assert client.chat_with_json_prompt.await_count == 2
+        assert [source.variable_name for source in spec.sources] == ["entry"]
+
+    @pytest.mark.asyncio
+    async def test_suspicious_empty_result_gets_one_llm_review(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(side_effect=[
+            {"sources": [], "sinks": [], "sanitizers": []},
+            {
+                "sources": [{
+                    "line": 2, "variable": "target", "type": "user_input",
+                    "confidence": 0.9,
+                }],
+                "sinks": [{
+                    "line": 3, "variable": "target", "type": "redirect",
+                    "vulnerability_type": "open_redirect", "confidence": 0.9,
+                }],
+                "sanitizers": [],
+            },
+        ])
+        extractor = SimpleSpecificationExtractor(client)
+        code = """class Redirector {
+    public void redirect(HttpServletRequest request, HttpServletResponse response) {
+        String target = request.getParameter("next");
+        response.sendRedirect(target);
+    }
+}"""
+
+        spec = await extractor.extract(code, "Redirector.java")
+
+        assert client.chat_with_json_prompt.await_count == 2
+        assert [source.variable_name for source in spec.sources] == ["target"]
+        assert [sink.variable_name for sink in spec.sinks] == ["target"]
+
+    @pytest.mark.asyncio
+    async def test_batch_repairs_sink_method_without_its_own_source(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(side_effect=[
+            {
+                "sources": [{
+                    "line": 3, "variable": "target",
+                    "type": "user_input", "confidence": 0.9,
+                }],
+                "sinks": [
+                    {
+                        "line": 4, "variable": "target", "type": "redirect",
+                        "vulnerability_type": "open_redirect", "confidence": 0.9,
+                    },
+                    {
+                        "line": 8, "variable": "target", "type": "redirect",
+                        "vulnerability_type": "open_redirect", "confidence": 0.9,
+                    },
+                ],
+                "sanitizers": [],
+            },
+            {
+                "sources": [{
+                    "line": 7, "variable": "target",
+                    "type": "user_input", "confidence": 0.9,
+                }]
+            },
+        ])
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=10_000)
+        code = """class Redirector {
+    public void first(HttpServletRequest request, HttpServletResponse response) {
+        String target = request.getParameter("first");
+        response.sendRedirect(target);
+    }
+    public void second(HttpServletRequest request, HttpServletResponse response) {
+        String target = request.getHeader("Location");
+        response.sendRedirect(target);
+    }
+}"""
+
+        spec = await extractor.extract(code, "Redirector.java")
+
+        assert client.chat_with_json_prompt.await_count == 2
+        assert any(
+            source.variable_name == "target"
+            and source.location.function_name == "second"
+            and source.location.line_number == 7
+            for source in spec.sources
+        )
+
+
+class TestLLMAnalysisModes:
+    @pytest.mark.asyncio
+    async def test_targeted_skips_unrelated_nontrivial_method(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(
+            return_value={"sources": [], "sinks": []}
+        )
+        extractor = SimpleSpecificationExtractor(client, analysis_mode="targeted")
+
+        await extractor.extract(
+            "class T { void work(String value) { service.customConsume(value); } }",
+            "T.java",
+        )
+
+        client.chat_with_json_prompt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_llm_backend_does_not_mix_in_deterministic_endpoints(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(
+            return_value={"sources": [], "sinks": []}
+        )
+        extractor = SimpleSpecificationExtractor(client, analysis_backend="llm")
+
+        spec = await extractor.extract(
+            "class T { public static void run(String cmd) { "
+            "Runtime.getRuntime().exec(cmd); } }",
+            "T.java",
+        )
+
+        assert client.chat_with_json_prompt.await_count == 2
+        assert spec.sources == []
+        assert spec.sinks == []
+        assert spec.extraction_backend == "llm"
+
+    @pytest.mark.asyncio
+    async def test_static_backend_keeps_deterministic_endpoints_without_llm(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(
+            return_value={"sources": [], "sinks": []}
+        )
+        extractor = SimpleSpecificationExtractor(client, analysis_backend="static")
+
+        spec = await extractor.extract(
+            "class T { public static void run(String cmd) { "
+            "Runtime.getRuntime().exec(cmd); } }",
+            "T.java",
+        )
+
+        client.chat_with_json_prompt.assert_not_called()
+        assert any(sink.variable_name == "cmd" for sink in spec.sinks)
+        assert spec.extraction_backend == "static"
+        assert spec.llm_model == ""
+
+
+class TestParseLLMSanitizers:
+    def test_parse_sanitizer_success(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client)
+        response = {
+            "sanitizers": [{
+                "line": 7,
+                "variable": "path",
+                "type": "allowed_root_check",
+                "vulnerability_types": ["path_traversal"],
+                "confidence": 0.95,
+                "effectiveness": 0.9,
+            }]
+        }
+
+        sanitizers = extractor._parse_llm_sanitizers(
+            response, "Test.java", line_offset=10, function_name="load"
+        )
+
+        assert len(sanitizers) == 1
+        assert sanitizers[0].variable_name == "path"
+        assert sanitizers[0].location.line_number == 17
+        assert sanitizers[0].location.function_name == "load"
+        assert sanitizers[0].vulnerability_types == ["path_traversal"]
+        assert sanitizers[0].effectiveness == 0.9
+
+    def test_missing_sanitizers_key_means_none(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client)
+
+        assert extractor._parse_llm_sanitizers({}, "Test.java") == []
+
+
+class TestSinkAttributedSources:
+    def test_accepts_only_explicit_model_attribution(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client)
+        response = {
+            "sinks": [{
+                "variable": "f",
+                "taint_sources": [{
+                    "line": 8,
+                    "variable": "e",
+                    "type": "archive_entry",
+                    "confidence": 0.95,
+                }],
+            }]
+        }
+
+        sources = extractor._parse_llm_sink_attributed_sources(
+            response, "Zip.java", function_name="unpack"
+        )
+
+        assert [source.variable_name for source in sources] == ["e"]
+        assert sources[0].location.line_number == 8
+
+    def test_does_not_infer_source_from_sink_reasoning(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client)
+        response = {
+            "sinks": [{
+                "variable": "f",
+                "reasoning": "Zip entry e controls this path",
+            }]
+        }
+
+        assert extractor._parse_llm_sink_attributed_sources(
+            response, "Zip.java"
+        ) == []
+
+
+class TestStructuralSinkFilter:
+    def test_rejects_literal_field_declaration(self):
+        from src.core.models import CodeLocation, Sink
+
+        sink = Sink(
+            location=CodeLocation(file_path="Test.java", line_number=1),
+            variable_name="redirect",
+            type="other",
+            confidence=0.9,
+            code_snippet='private String redirect = "";',
+            vulnerability_type=VulnerabilityType.OTHER,
+        )
+
+        assert SimpleSpecificationExtractor._is_plausible_sink(sink) is False
+
+    def test_keeps_model_selected_unfamiliar_call_result(self):
+        from src.core.models import CodeLocation, Sink
+
+        sink = Sink(
+            location=CodeLocation(file_path="Test.java", line_number=1),
+            variable_name="result",
+            type="novel_security_boundary",
+            confidence=0.9,
+            code_snippet="Payload result = customEngine.consume(input);",
+            vulnerability_type=VulnerabilityType.OTHER,
+        )
+
+        assert SimpleSpecificationExtractor._is_plausible_sink(sink) is True
+
+    def test_keeps_security_operation_assignment(self):
+        from src.core.models import CodeLocation, Sink
+
+        sink = Sink(
+            location=CodeLocation(file_path="Test.java", line_number=1),
+            variable_name="clazz",
+            type="deserialization",
+            confidence=0.9,
+            code_snippet="Class<?> clazz = Reflections.classForName(value);",
+            vulnerability_type=VulnerabilityType.UNSAFE_DESERIALIZATION,
+        )
+        assert SimpleSpecificationExtractor._is_plausible_sink(sink) is True
+
+    def test_rejects_sink_whose_snippet_does_not_use_reported_variable(self):
+        from src.core.models import CodeLocation, Sink
+
+        sink = Sink(
+            location=CodeLocation(file_path="Test.java", line_number=1),
+            variable_name="catPicture",
+            type="file_path",
+            confidence=0.9,
+            code_snippet="var uploadedFile = new File(root, fullName);",
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+        )
+
+        assert SimpleSpecificationExtractor._is_plausible_sink(sink) is False
+
+    def test_keeps_model_selected_call_assignment(self):
+        from src.core.models import CodeLocation, Sink
+
+        sink = Sink(
+            location=CodeLocation(file_path="Test.java", line_number=1),
+            variable_name="url",
+            type="html_output",
+            confidence=0.9,
+            code_snippet="url = wikiContext.getURL(pageName);",
+            vulnerability_type=VulnerabilityType.XSS,
+        )
+
+        assert SimpleSpecificationExtractor._is_plausible_sink(sink) is True
+
+    @pytest.mark.parametrize(
+        ("snippet", "variable", "vuln_type", "sink_category"),
+        [
+            (
+                "byte[] listBytes = JsonSerialization.writeValueAsBytes(value);",
+                "listBytes",
+                VulnerabilityType.OTHER,
+                None,
+            ),
+            (
+                "url = wikiContext.getURL(VIEW, pageName);",
+                "url",
+                VulnerabilityType.SSRF,
+                None,
+            ),
+            (
+                "relayState = client.getAttribute(RELAY_STATE);",
+                "relayState",
+                VulnerabilityType.OTHER,
+                None,
+            ),
+            (
+                "relayState = client.getAttribute(RELAY_STATE);",
+                "relayState",
+                VulnerabilityType.OPEN_REDIRECT,
+                None,
+            ),
+            (
+                "code = OAuth2CodeParser.persistCode(session, codeData);",
+                "code",
+                VulnerabilityType.OPEN_REDIRECT,
+                None,
+            ),
+            (
+                "Worker worker = new Worker(doc, clientArtifactBindingURI);",
+                "clientArtifactBindingURI",
+                VulnerabilityType.SSRF,
+                SinkCategory.FRAMEWORK_API,
+            ),
+            (
+                "this.credentialId = credentialId;",
+                "credentialId",
+                VulnerabilityType.OTHER,
+                None,
+            ),
+            (
+                "code = OAuth2CodeParser.persistCode(session, codeData);",
+                "code",
+                VulnerabilityType.SSRF,
+                None,
+            ),
+            (
+                "ArtifactResolutionRunnable task = new ArtifactResolutionRunnable(uri);",
+                "task",
+                VulnerabilityType.SSRF,
+                SinkCategory.FRAMEWORK_API,
+            ),
+            (
+                "cache.put(NAME_ID, nameIdFormat);",
+                "nameIdFormat",
+                VulnerabilityType.OTHER,
+                SinkCategory.DATA_STORAGE,
+            ),
+        ],
+    )
+    def test_rejects_non_terminal_model_sinks(
+        self, snippet, variable, vuln_type, sink_category
+    ):
+        from src.core.models import CodeLocation, Sink
+
+        sink = Sink(
+            location=CodeLocation(file_path="Test.java", line_number=1),
+            variable_name=variable,
+            type="model_selected",
+            confidence=0.9,
+            code_snippet=snippet,
+            vulnerability_type=vuln_type,
+            sink_category=sink_category,
+        )
+
+        assert SimpleSpecificationExtractor._is_plausible_sink(sink) is False
+
+    def test_keeps_concrete_outbound_ssrf_operation(self):
+        from src.core.models import CodeLocation, Sink
+
+        sink = Sink(
+            location=CodeLocation(file_path="Test.java", line_number=1),
+            variable_name="target",
+            type="outbound_request",
+            confidence=0.9,
+            code_snippet="client.postText(target.toString(), token);",
+            vulnerability_type=VulnerabilityType.SSRF,
+        )
+
+        assert SimpleSpecificationExtractor._is_plausible_sink(sink) is True
+
+
+
+class TestIdentifierMatching:
+    def test_does_not_match_longer_identifier(self):
+        assert not SimpleSpecificationExtractor._mentions_identifier(
+            "protected boolean redirectToAuthentication;", "redirect"
+        )
+        assert not SimpleSpecificationExtractor._mentions_identifier(
+            "File catPicturesDirectory;", "catPicture"
+        )
+
+    def test_matches_exact_java_identifier(self):
+        assert SimpleSpecificationExtractor._mentions_identifier(
+            "return render(redirect);", "redirect"
+        )
+
+    def test_endpoint_variable_must_be_java_identifier(self):
+        assert SimpleSpecificationExtractor._is_java_identifier("payload")
+        assert SimpleSpecificationExtractor._is_java_identifier("$value_2")
+        assert not SimpleSpecificationExtractor._is_java_identifier("getPayload()")
+        assert not SimpleSpecificationExtractor._is_java_identifier("obj.value")
+
+    def test_model_source_accessor_normalizes_to_receiver(self):
+        normalize = SimpleSpecificationExtractor._normalize_llm_source_identifier
+
+        assert normalize("e.getName()") == "e"
+        assert normalize("file.getOriginalFilename()") == "file"
+        assert normalize("this.contextData") == "contextData"
+
+    def test_unqualified_call_is_not_invented_as_identifier(self):
+        normalize = SimpleSpecificationExtractor._normalize_llm_source_identifier
+
+        assert normalize("getId()") is None
+        assert normalize("left + right") is None

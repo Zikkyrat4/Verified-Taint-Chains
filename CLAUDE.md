@@ -53,10 +53,9 @@ Key directories:
   cron-utils, spring-framework). Schema and CWE-coverage matrix:
   `tests/fixtures/real_world/README.md`. Adding a new project = new
   directory; no core changes needed.
-- `scripts/evaluate.py` - Project-agnostic evaluation harness. Common modes:
-  `--project <name>` (one project, output → `evaluation/<name>/`),
-  `--all-projects` (walks all + aggregate table), `--fixtures-dir <path>`
-  (back-compat / explicit). `--diff a.json b.json` for delta tables.
+- `src/evaluation/` - Project-agnostic evaluation harness exposed through
+  `vtc evaluate`. Common modes: `--project <name>`, `--all-projects`,
+  `--fixtures-dir <path>`, and `--diff a.json b.json`.
 - `evaluation/<project>/` - Snapshot reports per project
   (`baseline.{json,md}`, `after.{json,md}`).
 - `examples/` - Example code and usage demonstrations

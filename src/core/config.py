@@ -1,7 +1,7 @@
 """Pipeline configuration management."""
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -37,6 +37,14 @@ class PipelineConfig:
     llm_model: str = ""  # Will be set based on provider in __post_init__
     openai_base_url: Optional[str] = None  # override for OpenAI-compatible endpoints
     openai_user_agent: Optional[str] = None  # override User-Agent (proxies that block the SDK UA)
+    openai_timeout: float = 60.0
+    openai_json_mode: bool = True
+    openai_thinking: Optional[str] = None
+    llm_max_retries: int = 2
+    llm_max_tokens: int = 4000
+    llm_batch_max_chars: int = 8000
+    analysis_backend: str = "llm"
+    llm_analysis_mode: str = "targeted"
     ollama_base_url: str = "http://localhost:11434"
     max_path_length: int = 15
     min_confidence: float = 0.6
@@ -49,13 +57,16 @@ class PipelineConfig:
     use_astar: bool = True
     pathfinding_algorithm: str = "astar"  # "astar" or "bfs" (default: astar)
     max_concurrent_files: int = 4  # max concurrent Stage 1 extractions
+    max_concurrent_functions: int = 2  # max concurrent functions within one file
     max_files: int = 0  # max files for project mode (0 = unlimited)
     use_llm_graph_builder: bool = True  # use LLM-driven graph builder (AST + LLM enrichment)
+    llm_graph_enrichment_enabled: bool = False
     llm_graph_enrichment_confidence: float = 0.7  # min confidence for LLM-inferred edges
     # Persistent Stage 1 cache — turns weeks-long restarts into seconds. See
     # src/stage1_llm_inference/spec_cache.py. Defaults: enabled, dir resolved
     # at pipeline-init time to ``<source_path>/.vtc-cache``.
     cache_enabled: bool = True
+    cache_read_enabled: bool = True
     cache_dir: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -67,8 +78,17 @@ class PipelineConfig:
         if self.llm_provider not in ("openai", "ollama"):
             raise ValueError("llm_provider must be 'openai' or 'ollama'")
 
-        # API key required only for OpenAI
-        if self.llm_provider == "openai" and not self.llm_api_key:
+        if self.analysis_backend not in ("llm", "static", "hybrid"):
+            raise ValueError(
+                "analysis_backend must be 'llm', 'static', or 'hybrid'"
+            )
+
+        # A static baseline must be runnable without configuring an LLM.
+        if (
+            self.analysis_backend != "static"
+            and self.llm_provider == "openai"
+            and not self.llm_api_key
+        ):
             raise ValueError(
                 "llm_api_key is required when using OpenAI provider. "
                 "Set OPENAI_API_KEY environment variable."
@@ -98,6 +118,34 @@ class PipelineConfig:
         if self.max_concurrent_files < 1:
             raise ValueError("max_concurrent_files must be at least 1")
 
+        if self.max_concurrent_functions < 1:
+            raise ValueError("max_concurrent_functions must be at least 1")
+
+        if self.openai_timeout <= 0:
+            raise ValueError("openai_timeout must be positive")
+
+        if self.openai_thinking not in (None, "enabled", "disabled"):
+            raise ValueError("openai_thinking must be 'enabled', 'disabled', or None")
+
+        if self.llm_max_retries < 1:
+            raise ValueError("llm_max_retries must be at least 1")
+
+        if self.llm_max_tokens < 1:
+            raise ValueError("llm_max_tokens must be at least 1")
+
+        if self.llm_batch_max_chars < 0:
+            raise ValueError("llm_batch_max_chars must be non-negative")
+
+        if self.llm_analysis_mode not in ("targeted", "exhaustive"):
+            raise ValueError(
+                "llm_analysis_mode must be 'targeted' or 'exhaustive'"
+            )
+
+        if self.analysis_backend == "static" and self.llm_graph_enrichment_enabled:
+            raise ValueError(
+                "llm_graph_enrichment_enabled is incompatible with analysis_backend='static'"
+            )
+
         if self.max_files < 0:
             raise ValueError("max_files must be non-negative (0 = unlimited)")
 
@@ -120,7 +168,11 @@ class PipelineConfig:
         )
 
 
-def load_config_from_env() -> PipelineConfig:
+def load_config_from_env(
+    *,
+    analysis_backend_override: Optional[str] = None,
+    llm_analysis_mode_override: Optional[str] = None,
+) -> PipelineConfig:
     """Load pipeline configuration from environment variables.
 
     Uses python-dotenv to load from .env file. Environment variables take
@@ -173,6 +225,44 @@ def load_config_from_env() -> PipelineConfig:
     # neutral. Empty string = unset.
     openai_user_agent = os.getenv("OPENAI_USER_AGENT") or None
 
+    openai_json_mode = os.getenv("OPENAI_JSON_MODE", "true").lower() in (
+        "true", "1", "yes", "on"
+    )
+    openai_thinking = os.getenv("OPENAI_THINKING") or None
+    if openai_thinking:
+        openai_thinking = openai_thinking.lower()
+
+    try:
+        openai_timeout = float(os.getenv("OPENAI_TIMEOUT", "60"))
+    except ValueError:
+        logger.warning("Invalid OPENAI_TIMEOUT, using default 60")
+        openai_timeout = 60.0
+
+    try:
+        llm_max_retries = int(os.getenv("LLM_MAX_RETRIES", "2"))
+    except ValueError:
+        logger.warning("Invalid LLM_MAX_RETRIES, using default 2")
+        llm_max_retries = 2
+
+    try:
+        llm_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "4000"))
+    except ValueError:
+        logger.warning("Invalid LLM_MAX_TOKENS, using default 4000")
+        llm_max_tokens = 4000
+
+    try:
+        llm_batch_max_chars = int(os.getenv("LLM_BATCH_MAX_CHARS", "8000"))
+    except ValueError:
+        logger.warning("Invalid LLM_BATCH_MAX_CHARS, using default 8000")
+        llm_batch_max_chars = 8000
+
+    analysis_backend = (
+        analysis_backend_override or os.getenv("ANALYSIS_BACKEND", "llm")
+    ).lower()
+    llm_analysis_mode = (
+        llm_analysis_mode_override or os.getenv("LLM_ANALYSIS_MODE", "targeted")
+    ).lower()
+
     # Extract model (check both LLM_MODEL and legacy OPENAI_MODEL)
     # Default depends on provider, will be set in __post_init__ if not specified
     model = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL", "")
@@ -224,12 +314,21 @@ def load_config_from_env() -> PipelineConfig:
         max_concurrent_files = 4
 
     try:
+        max_concurrent_functions = int(os.getenv("MAX_CONCURRENT_FUNCTIONS", "2"))
+    except ValueError:
+        logger.warning("Invalid MAX_CONCURRENT_FUNCTIONS, using default 2")
+        max_concurrent_functions = 2
+
+    try:
         max_files = int(os.getenv("MAX_FILES", "0"))
     except ValueError:
         logger.warning("Invalid MAX_FILES, using default 0 (unlimited)")
         max_files = 0
 
     use_llm_graph_builder = os.getenv("USE_LLM_GRAPH_BUILDER", "true").lower() == "true"
+    llm_graph_enrichment_enabled = os.getenv(
+        "LLM_GRAPH_ENRICHMENT_ENABLED", "false"
+    ).lower() in ("true", "1", "yes", "on")
 
     try:
         llm_graph_enrichment_confidence = float(
@@ -262,6 +361,14 @@ def load_config_from_env() -> PipelineConfig:
         llm_model=model,
         openai_base_url=openai_base_url,
         openai_user_agent=openai_user_agent,
+        openai_timeout=openai_timeout,
+        openai_json_mode=openai_json_mode,
+        openai_thinking=openai_thinking,
+        llm_max_retries=llm_max_retries,
+        llm_max_tokens=llm_max_tokens,
+        llm_batch_max_chars=llm_batch_max_chars,
+        analysis_backend=analysis_backend,
+        llm_analysis_mode=llm_analysis_mode,
         ollama_base_url=ollama_base_url,
         max_path_length=max_path_length,
         min_confidence=min_confidence,
@@ -274,8 +381,10 @@ def load_config_from_env() -> PipelineConfig:
         use_astar=use_astar,
         pathfinding_algorithm=pathfinding_algorithm,
         max_concurrent_files=max_concurrent_files,
+        max_concurrent_functions=max_concurrent_functions,
         max_files=max_files,
         use_llm_graph_builder=use_llm_graph_builder,
+        llm_graph_enrichment_enabled=llm_graph_enrichment_enabled,
         llm_graph_enrichment_confidence=llm_graph_enrichment_confidence,
         cache_enabled=cache_enabled,
         cache_dir=cache_dir,

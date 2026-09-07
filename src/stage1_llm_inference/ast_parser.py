@@ -96,9 +96,6 @@ class JavaASTParser:
         try:
             tree = self.parser.parse(source_code.encode("utf-8"))
 
-            # Query for method declarations
-            method_query = '(method_declaration (modifiers)? (type_identifier) @return_type (method_name) @method_name (formal_parameters) @params (block) @body)'
-
             # Traverse tree to find method declarations
             self._traverse_and_extract_methods(
                 tree.root_node, source_code, functions
@@ -143,6 +140,103 @@ class JavaASTParser:
 
         return classes
 
+    def extract_field_names(self, source_code: str) -> List[str]:
+        """Return class/interface field names declared outside method bodies."""
+        if self.parser is None:
+            return []
+        try:
+            tree = self.parser.parse(source_code.encode("utf-8"))
+            fields: List[str] = []
+            stack = [tree.root_node]
+            while stack:
+                node = stack.pop()
+                if node.type == "field_declaration":
+                    for child in node.named_children:
+                        if child.type != "variable_declarator":
+                            continue
+                        name_node = child.child_by_field_name("name")
+                        if name_node is not None:
+                            fields.append(self._get_node_text(name_node, source_code))
+                stack.extend(node.children)
+            return fields
+        except Exception as e:
+            logger.debug(f"Field extraction failed: {e}")
+            return []
+
+    def extract_local_names_by_function(
+        self, source_code: str
+    ) -> Dict[str, set[str]]:
+        """Return formal/local variable names grouped by containing method."""
+        if self.parser is None:
+            return {}
+        try:
+            tree = self.parser.parse(source_code.encode("utf-8"))
+            result: Dict[str, set[str]] = {}
+            stack = [(tree.root_node, None)]
+            while stack:
+                node, function_name = stack.pop()
+                if node.type in ("method_declaration", "constructor_declaration"):
+                    name_node = node.child_by_field_name("name")
+                    if name_node is not None:
+                        function_name = self._get_node_text(name_node, source_code)
+                        result.setdefault(function_name, set())
+                if function_name and node.type in (
+                    "formal_parameter",
+                    "spread_parameter",
+                    "catch_formal_parameter",
+                    "variable_declarator",
+                ):
+                    name_node = node.child_by_field_name("name")
+                    if name_node is not None:
+                        result[function_name].add(
+                            self._get_node_text(name_node, source_code)
+                        )
+                stack.extend((child, function_name) for child in node.children)
+            return result
+        except Exception as e:
+            logger.debug(f"Local-name extraction failed: {e}")
+            return {}
+
+    def extract_method_calls(self, source_code: str) -> List[Dict[str, Any]]:
+        """Return method calls with receiver and positional argument text."""
+        if self.parser is None:
+            return []
+        try:
+            tree = self.parser.parse(source_code.encode("utf-8"))
+            calls: List[Dict[str, Any]] = []
+            stack = [(tree.root_node, None)]
+            while stack:
+                node, function_name = stack.pop()
+                if node.type in ("method_declaration", "constructor_declaration"):
+                    function_node = node.child_by_field_name("name")
+                    if function_node is not None:
+                        function_name = self._get_node_text(function_node, source_code)
+                if node.type == "method_invocation":
+                    name_node = node.child_by_field_name("name")
+                    object_node = node.child_by_field_name("object")
+                    args_node = node.child_by_field_name("arguments")
+                    if name_node is not None and args_node is not None:
+                        calls.append({
+                            "name": self._get_node_text(name_node, source_code),
+                            "receiver": (
+                                self._get_node_text(object_node, source_code)
+                                if object_node is not None else ""
+                            ),
+                            "arguments": [
+                                self._get_node_text(child, source_code)
+                                for child in args_node.named_children
+                            ],
+                            "line": node.start_point[0] + 1,
+                            "function_name": function_name,
+                        })
+                stack.extend(
+                    (child, function_name) for child in reversed(node.children)
+                )
+            return calls
+        except Exception as e:
+            logger.debug(f"Method-call extraction failed: {e}")
+            return []
+
     def extract_data_flows(self, source_code: str) -> List[Dict[str, Any]]:
         """Extract data flow edges from Java code using AST.
 
@@ -175,7 +269,11 @@ class JavaASTParser:
             return self._extract_data_flows_regex(source_code)
 
     def _traverse_data_flows(
-        self, node: Any, source_code: str, flows: List[Dict[str, Any]]
+        self,
+        node: Any,
+        source_code: str,
+        flows: List[Dict[str, Any]],
+        function_name: Optional[str] = None,
     ) -> None:
         """Recursively traverse AST nodes and extract data flow edges.
 
@@ -187,12 +285,17 @@ class JavaASTParser:
         try:
             node_type = node.type
 
+            if node_type in ("method_declaration", "constructor_declaration"):
+                name_node = node.child_by_field_name("name")
+                if name_node is not None:
+                    function_name = self._get_node_text(name_node, source_code)
+
+            first_new_flow = len(flows)
+
             if node_type == "local_variable_declaration":
                 self._extract_local_var_flows(node, source_code, flows)
             elif node_type == "assignment_expression":
                 self._extract_assignment_flows(node, source_code, flows)
-            elif node_type == "method_invocation":
-                self._extract_method_invocation_flows(node, source_code, flows)
             elif node_type == "return_statement":
                 self._extract_return_flows(node, source_code, flows)
             elif node_type == "throw_statement":
@@ -200,8 +303,13 @@ class JavaASTParser:
             elif node_type == "field_access":
                 self._extract_field_access_flows(node, source_code, flows)
 
+            for flow in flows[first_new_flow:]:
+                flow["function_name"] = function_name
+
             for child in node.children:
-                self._traverse_data_flows(child, source_code, flows)
+                self._traverse_data_flows(
+                    child, source_code, flows, function_name=function_name
+                )
         except Exception as e:
             logger.debug(f"Error traversing data flow node: {str(e)}")
 
@@ -264,6 +372,10 @@ class JavaASTParser:
             lhs = children[0]
             rhs = children[2]
             lhs_name = self._get_node_text(lhs, source_code)
+            if lhs.type == "field_access":
+                lhs_vars = self._extract_identifiers(lhs, source_code)
+                if lhs_vars:
+                    lhs_name = lhs_vars[-1]
             rhs_vars = self._extract_identifiers(rhs, source_code)
             line = node.start_point[0] + 1
             for rv in rhs_vars:
@@ -544,7 +656,7 @@ class JavaASTParser:
             methods: List to accumulate method definitions.
         """
         try:
-            if node.type == "method_declaration":
+            if node.type in ("method_declaration", "constructor_declaration"):
                 method_info = self._extract_method_info(node, source_code)
                 if method_info:
                     methods.append(method_info)
@@ -572,21 +684,34 @@ class JavaASTParser:
             start_line = node.start_point[0] + 1
             end_line = node.end_point[0] + 1
 
-            # Extract method name (simplified)
-            name_match = re.search(r"\b(\w+)\s*\(", method_text)
-            method_name = name_match.group(1) if name_match else "unknown"
+            # Tree-sitter fields are authoritative. Regexes incorrectly select
+            # the first annotation call (for example @PostMapping) as the method.
+            name_node = node.child_by_field_name("name")
+            params_node = node.child_by_field_name("parameters")
+            type_node = node.child_by_field_name("type")
 
-            # Extract parameters (simplified)
-            params_match = re.search(r"\((.*?)\)", method_text)
-            parameters = params_match.group(1).split(",") if params_match else []
-            parameters = [p.strip() for p in parameters if p.strip()]
-
-            # Extract return type (simplified) — skip access/static/final modifiers
-            return_type_match = re.search(
-                r"(?:public|private|protected)\s+(?:static\s+)?(?:final\s+)?(\w+)\s+\w+",
-                method_text,
+            method_name = (
+                self._get_node_text(name_node, source_code) if name_node else "unknown"
             )
-            return_type = return_type_match.group(1) if return_type_match else "void"
+            parameters = []
+            if params_node is not None:
+                for child in params_node.named_children:
+                    if child.type in ("formal_parameter", "spread_parameter"):
+                        parameters.append(self._get_node_text(child, source_code).strip())
+
+            return_type = (
+                self._get_node_text(type_node, source_code) if type_node else "void"
+            )
+
+            class_name = None
+            parent = getattr(node, "parent", None)
+            while parent is not None:
+                if parent.type in ("class_declaration", "interface_declaration"):
+                    class_node = parent.child_by_field_name("name")
+                    if class_node is not None:
+                        class_name = self._get_node_text(class_node, source_code)
+                    break
+                parent = getattr(parent, "parent", None)
 
             return {
                 "name": method_name,
@@ -595,7 +720,7 @@ class JavaASTParser:
                 "parameters": parameters,
                 "body": method_text,
                 "return_type": return_type,
-                "class_name": None,  # Would need parent class tracking
+                "class_name": class_name,
             }
 
         except Exception as e:
@@ -647,12 +772,18 @@ class JavaASTParser:
             # Extract class name (simplified)
             name_match = re.search(r"class\s+(\w+)", class_text)
             class_name = name_match.group(1) if name_match else "unknown"
+            superclass_match = re.search(
+                r"\bclass\s+[A-Za-z_$][\w$]*[^\{]*?\bextends\s+"
+                r"([A-Za-z_$][\w$]*)",
+                class_text,
+            )
 
             return {
                 "name": class_name,
                 "start_line": start_line,
                 "end_line": end_line,
                 "body": class_text,
+                "superclass": superclass_match.group(1) if superclass_match else None,
             }
 
         except Exception as e:

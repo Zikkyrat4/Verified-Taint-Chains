@@ -13,8 +13,8 @@ import pytest
 
 REAL_WORLD = Path(__file__).resolve().parent.parent / "fixtures" / "real_world"
 
-# Allowed `vuln_type` values (must align with VulnerabilityType enum + extensions
-# the matching logic in scripts/evaluate.py understands via fuzzy `in` match).
+# Allowed `vuln_type` values must align with the exact labels accepted by the
+# evaluator and the VulnerabilityType enum extensions.
 _ALLOWED_VULN_TYPES = {
     "xss",
     "sql_injection",

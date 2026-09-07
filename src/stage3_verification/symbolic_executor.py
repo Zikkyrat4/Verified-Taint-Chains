@@ -6,9 +6,10 @@ Supports multiple backends:
 3. Fallback to UNVERIFIABLE if neither available
 """
 
+import importlib.util
 import re
-from typing import Dict, List, Optional, Set, Tuple, Any
 from enum import Enum
+from typing import Any, Dict, List, Optional
 
 from src.core.models import TaintChain, VerificationStatus
 from src.utils.logger import get_logger
@@ -28,8 +29,9 @@ except ImportError:
 
 # Check JPype availability (for Java PathFinder)
 try:
-    import jpype
-    JPYPE_AVAILABLE = True
+    JPYPE_AVAILABLE = importlib.util.find_spec("jpype") is not None
+    if not JPYPE_AVAILABLE:
+        raise ImportError
     logger.info("JPype available for Java PathFinder integration")
 except ImportError:
     JPYPE_AVAILABLE = False
@@ -87,6 +89,8 @@ class PathConstraints:
         """Initialize path constraints."""
         self.constraints: List[Any] = []
         self.variables: Dict[str, SymbolicVariable] = {}
+        self.modeled_edges = 0
+        self.expected_edges = 0
 
     def add_variable(self, name: str, var_type: str = "String") -> SymbolicVariable:
         """Add a symbolic variable.
@@ -182,7 +186,7 @@ class SymbolicExecutor:
             return self._execute_with_jpf(chain, source_code)
         else:
             logger.warning(
-                f"No backend available for symbolic execution, returning UNVERIFIABLE"
+                "No backend available for symbolic execution, returning UNVERIFIABLE"
             )
             return VerificationStatus.UNVERIFIABLE
 
@@ -209,6 +213,17 @@ class SymbolicExecutor:
         try:
             # Build path constraints
             constraints = self._build_path_constraints(chain, source_code)
+
+            if (
+                not constraints.constraints
+                or constraints.modeled_edges < constraints.expected_edges
+            ):
+                logger.info(
+                    "Symbolic execution inconclusive: "
+                    f"modeled {constraints.modeled_edges}/"
+                    f"{constraints.expected_edges} path edges"
+                )
+                return VerificationStatus.UNVERIFIABLE
 
             # Create Z3 solver
             solver = z3.Solver()
@@ -264,13 +279,13 @@ class SymbolicExecutor:
         constraints = PathConstraints()
 
         # Add source variable as symbolic
-        source_var = constraints.add_variable(
+        constraints.add_variable(
             chain.source.variable_name,
             "String"  # Most taint sources are strings
         )
 
         # Add sink variable as symbolic
-        sink_var = constraints.add_variable(
+        constraints.add_variable(
             chain.sink.variable_name,
             "String"
         )
@@ -280,6 +295,7 @@ class SymbolicExecutor:
 
         # Extract path from chain
         path = chain.path if hasattr(chain, 'path') else []
+        constraints.expected_edges = max(0, len(path) - 1)
 
         # Build constraints from path
         for i in range(len(path) - 1):
@@ -300,14 +316,7 @@ class SymbolicExecutor:
                 )
                 if constraint is not None:
                     constraints.add_constraint(constraint)
-
-        # Add taint propagation constraint: sink depends on source
-        if Z3_AVAILABLE and source_var.z3_var is not None and sink_var.z3_var is not None:
-            # For string variables, check if sink contains source
-            if isinstance(source_var.z3_var, z3.SeqRef) and isinstance(sink_var.z3_var, z3.SeqRef):
-                # Add constraint that source is substring of sink (taint propagation)
-                taint_constraint = z3.Contains(sink_var.z3_var, source_var.z3_var)
-                constraints.add_constraint(taint_constraint)
+                    constraints.modeled_edges += 1
 
         logger.debug(f"Built path constraints: {constraints}")
         return constraints
@@ -382,10 +391,6 @@ class SymbolicExecutor:
             if match:
                 condition = match.group(1)
                 return self._parse_condition(condition, constraints)
-
-        # Default: assume data flow exists
-        if isinstance(src.z3_var, z3.SeqRef):
-            return z3.Contains(dst.z3_var, src.z3_var)
 
         return None
 

@@ -13,7 +13,7 @@ from enum import Enum
 from src.core.models import TaintChain, Explanation, VulnerabilityType, VerificationStatus
 from src.core.exceptions import ParsingError, LLMError
 from src.stage1_llm_inference.llm_client import SimpleLLMClient
-from src.stage4_explanation.templates import get_template, TEMPLATE_REGISTRY
+from src.stage4_explanation.templates import get_template
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -68,7 +68,7 @@ class ExplanationGenerator:
     - Multiple output formats
     """
 
-    def __init__(self, llm_client: SimpleLLMClient) -> None:
+    def __init__(self, llm_client: Optional[SimpleLLMClient]) -> None:
         """Initialize the explanation generator.
 
         Args:
@@ -346,7 +346,7 @@ Sink Confidence: {chain.sink.confidence:.2f}{verification_context}{sanitizer_con
 
 """
 
-        prompt += f"""**Common Pitfalls:**
+        prompt += """**Common Pitfalls:**
 """
         for i, pitfall in enumerate(template.common_pitfalls, 1):
             prompt += f"{i}. {pitfall}\n"
@@ -379,7 +379,7 @@ Analyze the specific data flow in this code and provide a JSON response with:
    {strategy['description']}
 """
 
-        prompt += f"""
+        prompt += """
 **Secure Coding Patterns:**
 """
         for i, pattern in enumerate(template.secure_patterns, 1):

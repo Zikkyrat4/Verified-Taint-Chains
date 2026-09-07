@@ -173,6 +173,45 @@ class TestAStarPathFinder:
         chains = finder.find_all_chains([sample_source], [sample_sink])
         assert len(chains) == 0
 
+    def test_cross_file_bridge_must_belong_to_source_function(self):
+        graph = nx.DiGraph()
+        graph.add_edge(
+            "A.java:username",
+            "B.java:path",
+            bridge=True,
+            caller_function="processUpload",
+        )
+        source = Source(
+            location=CodeLocation(
+                file_path="A.java", line_number=10, function_name="otherEndpoint"
+            ),
+            variable_name="username",
+            type="user_input",
+            confidence=0.9,
+            code_snippet="String username",
+        )
+        sink = Sink(
+            location=CodeLocation(
+                file_path="B.java", line_number=20, function_name="writeFile"
+            ),
+            variable_name="path",
+            type="file_path",
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+            confidence=0.9,
+            code_snippet="new File(path)",
+        )
+
+        chains = AStarPathFinder(graph, use_semantic=False).find_all_chains(
+            [source],
+            [sink],
+            node_id_map={
+                id(source): "A.java:username",
+                id(sink): "B.java:path",
+            },
+        )
+
+        assert chains == []
+
     def test_find_all_chains_multiple(self, simple_graph):
         source1 = Source(
             location=CodeLocation(file_path="t.java", line_number=1),
@@ -247,6 +286,67 @@ class TestAStarPathFinder:
         finder = AStarPathFinder(simple_graph, use_semantic=False)
         chains = finder.find_all_chains([source], [sink])
         assert len(chains) == 0
+
+    def test_allow_cross_method_chain_through_declared_field(self):
+        graph = nx.DiGraph()
+        graph.add_node("title")
+        graph.add_node("m_title", is_field=True)
+        graph.add_edge(
+            "title",
+            "m_title",
+            function_name="setTitle",
+            field_flow_functions=["setTitle"],
+        )
+        source = Source(
+            location=CodeLocation(
+                file_path="Tag.java", line_number=5, function_name="setTitle"
+            ),
+            variable_name="title", type="user_input", confidence=0.9,
+            code_snippet="m_title = title;",
+        )
+        sink = Sink(
+            location=CodeLocation(
+                file_path="Tag.java", line_number=20, function_name="render"
+            ),
+            variable_name="m_title", type="html_output", confidence=0.9,
+            code_snippet="out.print(m_title);",
+            vulnerability_type=VulnerabilityType.XSS,
+        )
+
+        chains = AStarPathFinder(graph, use_semantic=False).find_all_chains(
+            [source], [sink]
+        )
+
+        assert len(chains) == 1
+
+    def test_reject_cross_method_chain_borrowing_unrelated_method_edge(self):
+        graph = nx.DiGraph()
+        graph.add_node("input")
+        graph.add_node("shared", is_field=True)
+        graph.add_node("output")
+        graph.add_edge("input", "shared", function_name="sourceMethod")
+        graph.add_edge("shared", "output", function_name="unrelatedMethod")
+        source = Source(
+            location=CodeLocation(
+                file_path="T.java", line_number=5, function_name="sourceMethod"
+            ),
+            variable_name="input", type="user_input", confidence=0.9,
+            code_snippet="shared = input;",
+        )
+        sink = Sink(
+            location=CodeLocation(
+                file_path="T.java", line_number=30, function_name="sinkMethod"
+            ),
+            variable_name="output", type="html_output", confidence=0.9,
+            code_snippet="out.print(output);",
+            vulnerability_type=VulnerabilityType.XSS,
+        )
+
+        chains = AStarPathFinder(graph, use_semantic=False).find_all_chains(
+            [source], [sink]
+        )
+
+        assert chains == []
 
     def test_allow_same_method_chains(self, simple_graph):
         """Test that A* allows same-method source-sink pairs."""

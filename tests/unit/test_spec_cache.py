@@ -101,6 +101,18 @@ def test_different_min_confidence_misses(tmp_path):
     assert cache.get("code", **_kwargs(min_confidence=0.7)) is None
 
 
+def test_different_extractor_options_miss(tmp_path):
+    cache = SpecCache(cache_dir=tmp_path)
+    cache.put(
+        "code", _make_spec(),
+        **_kwargs(extractor_options="analysis_mode=targeted"),
+    )
+
+    assert cache.get(
+        "code", **_kwargs(extractor_options="analysis_mode=exhaustive")
+    ) is None
+
+
 def test_corrupt_json_treated_as_miss(tmp_path):
     cache = SpecCache(cache_dir=tmp_path)
     key = SpecCache.compute_key("code", **_kwargs())
@@ -176,6 +188,11 @@ def test_default_cache_dir_for_file(tmp_path):
     f = tmp_path / "A.java"
     f.write_text("class A {}")
     # Single-file: cache sits next to it, not inside.
+    assert default_cache_dir(str(f)) == tmp_path / ".vtc-cache"
+
+
+def test_default_cache_dir_for_missing_file(tmp_path):
+    f = tmp_path / "Missing.java"
     assert default_cache_dir(str(f)) == tmp_path / ".vtc-cache"
 
 

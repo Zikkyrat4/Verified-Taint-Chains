@@ -39,13 +39,13 @@ logger = get_logger()
 CACHE_SCHEMA_VERSION = "1"
 
 # Bump when the extractor pipeline changes in a way that would alter outputs
-# (e.g. classification rules, JSP setter pass, snippet resolution). Independent
+# (e.g. classification rules or snippet resolution). Independent
 # from CACHE_SCHEMA_VERSION because old caches stay readable — they just don't
 # match the new extractor's expected output.
-EXTRACTOR_VERSION = "1"
+EXTRACTOR_VERSION = "24"
 
 # Bump when prompt templates change. Same rationale as EXTRACTOR_VERSION.
-PROMPT_TEMPLATE_VERSION = "1"
+PROMPT_TEMPLATE_VERSION = "12"
 
 
 @dataclass
@@ -130,6 +130,7 @@ class SpecCache:
         llm_provider: str,
         llm_model: str,
         min_confidence: float,
+        extractor_options: str = "",
     ) -> str:
         """SHA-256 hex digest covering content + every extractor-affecting input.
 
@@ -152,6 +153,8 @@ class SpecCache:
         h.update(llm_model.encode("utf-8"))
         h.update(b"\0")
         h.update(f"{min_confidence:.6f}".encode("ascii"))
+        h.update(b"\0")
+        h.update(extractor_options.encode("utf-8"))
         return h.hexdigest()
 
     def _path_for_key(self, key: str) -> Path:
@@ -169,6 +172,7 @@ class SpecCache:
         llm_provider: str,
         llm_model: str,
         min_confidence: float,
+        extractor_options: str = "",
     ) -> Optional[Specification]:
         """Return a cached ``Specification`` or ``None`` on miss/error.
 
@@ -182,6 +186,7 @@ class SpecCache:
             llm_provider=llm_provider,
             llm_model=llm_model,
             min_confidence=min_confidence,
+            extractor_options=extractor_options,
         )
         path = self._path_for_key(key)
         if not path.exists():
@@ -213,6 +218,7 @@ class SpecCache:
         llm_provider: str,
         llm_model: str,
         min_confidence: float,
+        extractor_options: str = "",
     ) -> None:
         """Persist a ``Specification`` for future ``get`` calls.
 
@@ -228,6 +234,7 @@ class SpecCache:
             llm_provider=llm_provider,
             llm_model=llm_model,
             min_confidence=min_confidence,
+            extractor_options=extractor_options,
         )
         path = self._path_for_key(key)
         try:
@@ -257,5 +264,8 @@ class SpecCache:
 def default_cache_dir(source_path: str) -> Path:
     """Default location: ``<source_path>/.vtc-cache`` (single file → its parent)."""
     p = Path(source_path)
-    base = p.parent if p.is_file() else p
+    # A not-yet-existing file is not ``is_file()``, so testing that predicate
+    # would create ``Missing.java/.vtc-cache`` and turn the requested file path
+    # into a directory. Only an existing directory is a directory target.
+    base = p if p.is_dir() else p.parent
     return base / ".vtc-cache"

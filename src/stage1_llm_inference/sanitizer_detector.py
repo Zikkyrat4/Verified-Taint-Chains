@@ -83,12 +83,12 @@ _SANITIZER_PATTERNS: List[Tuple[re.Pattern, str, List[str], float]] = [
         ["xss"],
         0.9,
     ),
-    # Path traversal: Path.normalize() + startsWith() check
+    # Normalization alone does not enforce an allowed-root boundary.
     (
         re.compile(r"\.normalize\s*\(\s*\)"),
         "path_normalization",
         ["path_traversal"],
-        0.95,
+        0.5,
     ),
     # Path traversal: startsWith check (often paired with normalize).
     # Weak signal alone — `.startsWith("/")` checks absolute path, not "..".
@@ -108,12 +108,18 @@ _SANITIZER_PATTERNS: List[Tuple[re.Pattern, str, List[str], float]] = [
         ["path_traversal"],
         0.9,
     ),
-    # Path traversal: getCanonicalPath/File (resolves symlinks and ..)
+    (
+        re.compile(r'\.replace\s*\(\s*"\.\./"\s*,\s*""\s*\)'),
+        "path_segment_removal",
+        ["path_traversal"],
+        0.9,
+    ),
+    # Canonicalization alone still permits paths outside the allowed root.
     (
         re.compile(r"\.getCanonical(Path|File)\s*\("),
         "canonical_path",
         ["path_traversal"],
-        0.9,
+        0.5,
     ),
     # Command injection: ProcessBuilder with multiple args (varargs or list)
     (
@@ -142,16 +148,6 @@ _SANITIZER_PATTERNS: List[Tuple[re.Pattern, str, List[str], float]] = [
         "string_array_command",
         ["command_injection"],
         0.9,
-    ),
-    # Path traversal: read-only File API (listFiles, list, exists, isDirectory).
-    # These methods only inspect the filesystem, they don't read/write file content.
-    # `getName` removed — it's dual-use (Class.getName, BeanInfo.getName, etc.)
-    # and produced massive FPs on non-file code.
-    (
-        re.compile(r"\.\s*(listFiles|list|exists|isDirectory|isFile|canRead)\s*\("),
-        "safe_file_api",
-        ["path_traversal"],
-        0.95,
     ),
     # Input validation: regex matches check
     (
@@ -188,20 +184,6 @@ _SANITIZER_PATTERNS: List[Tuple[re.Pattern, str, List[str], float]] = [
         ["sql_injection", "command_injection", "path_traversal"],
         0.9,
     ),
-    # Open redirect: redirect-allowlist verifier methods (generic Java/Spring)
-    (
-        re.compile(r"verifyRedirectUri\s*\(|isAllowedRedirectUri\s*\("),
-        "redirect_allowlist",
-        ["xss", "ssrf"],
-        0.85,
-    ),
-    # Output: explicit URI builder (parameter binding) — Spring UriComponentsBuilder
-    (
-        re.compile(r"UriComponentsBuilder\s*\.\s*fromUri(String)?\s*\("),
-        "uri_builder",
-        ["xss", "ssrf"],
-        0.7,
-    ),
 ]
 
 
@@ -231,6 +213,7 @@ class StaticSanitizerDetector:
             for pattern, san_type, vuln_types, effectiveness in _SANITIZER_PATTERNS:
                 match = pattern.search(line)
                 if match:
+                    variable_name = self._infer_variable(line, match)
                     sanitizer = Sanitizer(
                         location=CodeLocation(
                             file_path=file_path,
@@ -239,6 +222,7 @@ class StaticSanitizerDetector:
                         type=san_type,
                         confidence=effectiveness,
                         code_snippet=line.strip(),
+                        variable_name=variable_name,
                         vulnerability_types=list(vuln_types),
                         effectiveness=effectiveness,
                     )
@@ -250,3 +234,23 @@ class StaticSanitizerDetector:
 
         logger.info(f"Static sanitizer detection: found {len(sanitizers)} sanitizers")
         return sanitizers
+
+    @staticmethod
+    def _infer_variable(line: str, match: re.Match) -> str | None:
+        """Infer the value being validated or transformed on this line."""
+        prefix = line[:match.start()]
+
+        # Assignment target for helpers returning a sanitized value.
+        assigned = re.search(r"\b([A-Za-z_]\w*)\s*=\s*[^=]*$", prefix)
+        if assigned:
+            return assigned.group(1)
+
+        # Receiver of ``value.normalize()`` / ``value.replace(...)``.
+        receiver = re.search(r"\b([A-Za-z_]\w*)\s*$", prefix)
+        if match.group(0).lstrip().startswith(".") and receiver:
+            return receiver.group(1)
+
+        # First identifier argument to a static sanitizer call.
+        suffix = line[match.end():]
+        argument = re.search(r"\(\s*([A-Za-z_]\w*)", suffix)
+        return argument.group(1) if argument else None

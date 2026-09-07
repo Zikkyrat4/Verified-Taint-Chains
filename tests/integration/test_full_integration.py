@@ -342,7 +342,8 @@ public class SecurityTest {
 """)
             test_file = f.name
 
-        os.environ["OPENAI_API_KEY"] = "test-key-workflow"
+        original_backend = os.environ.get("ANALYSIS_BACKEND")
+        os.environ["ANALYSIS_BACKEND"] = "static"
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -364,7 +365,10 @@ public class SecurityTest {
 
         finally:
             Path(test_file).unlink()
-            os.environ.pop("OPENAI_API_KEY", None)
+            if original_backend is not None:
+                os.environ["ANALYSIS_BACKEND"] = original_backend
+            else:
+                os.environ.pop("ANALYSIS_BACKEND", None)
 
     def test_pipeline_with_vulnerable_example_exists(self) -> None:
         """Test that vulnerable example file exists and is readable."""

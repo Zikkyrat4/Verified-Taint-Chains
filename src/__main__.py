@@ -3,7 +3,6 @@
 import asyncio
 import sys
 from pathlib import Path
-from typing import Optional
 
 import click
 
@@ -11,7 +10,7 @@ from src import __version__
 from src.core.config import load_config_from_env
 from src.core.exceptions import TaintAnalysisError
 from src.pipeline.orchestrator import SimplePipeline
-from src.utils.logger import setup_logger, get_logger
+from src.utils.logger import configure_logging, get_logger
 
 
 @click.group()
@@ -58,12 +57,16 @@ def analyze(file: str, output: str, verbose: bool) -> None:
     Example usage:
       python -m src analyze --file app.java --output results.json --verbose
     """
-    try:
-        # Setup logging
-        log_level = "DEBUG" if verbose else "INFO"
-        setup_logger(level=log_level)
-        logger = get_logger()
+    log_level = "DEBUG" if verbose else "INFO"
+    configure_logging(level=log_level)
+    logger = get_logger()
+    with logger.contextualize(command="analyze", target=file):
+        _run_analysis(file, output, verbose, logger)
 
+
+def _run_analysis(file: str, output: str, verbose: bool, logger) -> None:
+    """Run the legacy module CLI with logging context configured."""
+    try:
         logger.info(f"Verified Taint Chains v{__version__}")
         logger.info(f"Starting analysis of {file}...")
 
@@ -112,7 +115,7 @@ def analyze(file: str, output: str, verbose: bool) -> None:
             logger.info("Pipeline execution completed successfully")
 
         except FileNotFoundError as e:
-            click.echo(f"❌ Analysis failed: File not found", err=True)
+            click.echo("❌ Analysis failed: File not found", err=True)
             logger.error(f"File not found: {str(e)}")
             sys.exit(1)
 

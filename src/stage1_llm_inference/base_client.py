@@ -1,9 +1,10 @@
 """Base abstract class for LLM clients with common retry and parsing logic."""
 
 import asyncio
+import inspect
 import json
 from abc import ABC, abstractmethod
-from typing import Any, List
+from typing import List, Optional
 
 from src.core.exceptions import LLMError, ParsingError
 from src.utils.logger import get_logger
@@ -25,7 +26,12 @@ class BaseLLMClient(ABC):
         model: Name of the model to use for API calls.
     """
 
-    def __init__(self, model: str) -> None:
+    def __init__(
+        self,
+        model: str,
+        default_max_tokens: int = 4000,
+        default_max_retries: int = 3,
+    ) -> None:
         """Initialize the base LLM client.
 
         Args:
@@ -38,6 +44,8 @@ class BaseLLMClient(ABC):
             raise ValueError("model cannot be empty")
 
         self.model = model
+        self.default_max_tokens = default_max_tokens
+        self.default_max_retries = default_max_retries
         logger.info(f"Initialized {self.__class__.__name__} with model: {model}")
 
     @abstractmethod
@@ -81,12 +89,21 @@ class BaseLLMClient(ABC):
         """
         pass
 
+    async def aclose(self) -> None:
+        """Close a provider's persistent async transport when it exposes one."""
+        close = getattr(getattr(self, "client", None), "close", None)
+        if close is None:
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+
     async def chat_completion(
         self,
         messages: List[dict],
         temperature: float = 0.0,
-        max_tokens: int = 4000,
-        max_retries: int = 3,
+        max_tokens: Optional[int] = None,
+        max_retries: Optional[int] = None,
     ) -> str:
         """Make a chat completion API call with exponential backoff retry logic.
 
@@ -108,6 +125,9 @@ class BaseLLMClient(ABC):
         """
         if not messages:
             raise ValueError("messages list cannot be empty")
+
+        max_tokens = max_tokens or self.default_max_tokens
+        max_retries = max_retries or self.default_max_retries
 
         last_error = None
 
@@ -156,7 +176,9 @@ class BaseLLMClient(ABC):
             f"Failed to complete API call after {max_retries} retries"
         ) from last_error
 
-    async def chat_with_json_prompt(self, prompt: str, max_tokens: int = 4000) -> dict:
+    async def chat_with_json_prompt(
+        self, prompt: str, max_tokens: Optional[int] = None
+    ) -> dict:
         """Send a ready-made prompt and parse JSON response.
 
         Unlike analyze_code(), this does not wrap the prompt with additional
@@ -213,8 +235,8 @@ class BaseLLMClient(ABC):
                         logger.info("Parsed JSON after stripping pattern fields")
                     except json.JSONDecodeError as strip_err:
                         logger.debug(
-                            f"Strip pattern fields still failed: {strip_err}. "
-                            f"Stripped text:\n{stripped[:2000]}"
+                            f"Strip pattern fields still failed: {strip_err} "
+                            f"({len(stripped)} characters)"
                         )
                         # Last resort: truncate and salvage partial data
                         parsed = self._try_truncated_parse(stripped)
@@ -224,7 +246,9 @@ class BaseLLMClient(ABC):
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response: {str(e)}")
-            logger.debug(f"Raw response that failed parsing:\n{response_text[:2000]}")
+            logger.debug(
+                f"Discarding malformed LLM response ({len(response_text)} characters)"
+            )
             raise ParsingError(f"Invalid JSON in LLM response: {str(e)}") from e
         except Exception as e:
             logger.error(f"LLM analysis failed: {str(e)}")

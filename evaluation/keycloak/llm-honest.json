@@ -1,0 +1,937 @@
+{
+  "analysis": {
+    "backend": "llm",
+    "llm_analysis_mode": "targeted",
+    "llm_provider": "openai",
+    "llm_model": "glm-5.3-flash",
+    "min_confidence": 0.6,
+    "max_path_length": 15,
+    "pathfinding_algorithm": "astar",
+    "verification_enabled": true,
+    "verification_level": "both",
+    "symbolic_execution_enabled": true,
+    "use_joern": true,
+    "use_semantic_heuristic": true,
+    "use_astar": true,
+    "use_llm_graph_builder": true,
+    "llm_graph_enrichment_enabled": false,
+    "llm_graph_enrichment_confidence": 0.7,
+    "llm_batch_max_chars": 8000,
+    "max_concurrent_files": 4,
+    "max_concurrent_functions": 2,
+    "max_files": 0,
+    "cache_enabled": true,
+    "cache_read_enabled": true,
+    "openai_timeout": 60.0,
+    "llm_max_retries": 2,
+    "llm_max_tokens": 4000,
+    "openai_json_mode": true,
+    "openai_thinking": "disabled",
+    "evaluation_policy": {
+      "all_labelled_true_positives": true,
+      "exact_endpoint_identifiers": true,
+      "exact_vulnerability_type": true,
+      "line_tolerance": 5,
+      "unmatched_findings_count_as_fp": true,
+      "one_to_one_matching": true
+    }
+  },
+  "aggregate": {
+    "total_tp": 0,
+    "total_fp": 0,
+    "total_fn": 9,
+    "total_unclassified": 26,
+    "expected_tp": 9,
+    "precision": 0.0,
+    "precision_known": 0.0,
+    "precision_lower_bound": 0.0,
+    "precision_strict": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "f1_lower_bound": 0.0,
+    "files_analyzed": 4,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "OIDCLoginProtocol.java",
+      "cve": "CVE-2024-2419",
+      "expected_tp": 3,
+      "found_tp": 0,
+      "fp": 0,
+      "fn": 3,
+      "unclassified": 3,
+      "tp_matched": [],
+      "fp_chains": [],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "redirect",
+          "sink_var": "redirectUri",
+          "source_line": 215,
+          "sink_line": 303,
+          "vuln_type": "open_redirect",
+          "description": "authSession.getRedirectUri() -> redirectUri.build() in authenticated()"
+        },
+        {
+          "id": "TP-2",
+          "source_var": "redirect",
+          "sink_var": "redirectUri",
+          "source_line": 321,
+          "sink_line": 345,
+          "vuln_type": "open_redirect",
+          "description": "authSession.getRedirectUri() -> redirectUri.build() in sendError()"
+        },
+        {
+          "id": "TP-3",
+          "source_var": "redirectUri",
+          "sink_var": "finalRedirectUri",
+          "source_line": 392,
+          "sink_line": 400,
+          "vuln_type": "open_redirect",
+          "description": "logoutSession.getAuthNote(LOGOUT_REDIRECT_URI) -> renderLogoutPage()"
+        }
+      ],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "redirect_to_redirectUri_139722368357056",
+            "type": "open_redirect",
+            "cwe": "CWE-601",
+            "vulnerability_label": "open_redirect",
+            "source": {
+              "variable": "redirect",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/OIDCLoginProtocol.java",
+              "line": 215,
+              "code_snippet": "String redirect = authSession.getRedirectUri();"
+            },
+            "sink": {
+              "variable": "redirectUri",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/OIDCLoginProtocol.java",
+              "line": 216,
+              "code_snippet": "OIDCRedirectUriBuilder redirectUri = OIDCRedirectUriBuilder.fromUri(redirect, responseMode, session, clientSession);"
+            },
+            "path": [
+              "redirect",
+              "redirectUri"
+            ],
+            "confidence": 0.8500000000000001
+          }
+        },
+        {
+          "chain": {
+            "id": "authSession_to_redirectUri_139722367980288",
+            "type": "open_redirect",
+            "cwe": "CWE-601",
+            "vulnerability_label": "open_redirect",
+            "source": {
+              "variable": "authSession",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/OIDCLoginProtocol.java",
+              "line": 244,
+              "code_snippet": "authSession.getClientNote(OAuth2Constants.SCOPE),"
+            },
+            "sink": {
+              "variable": "redirectUri",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/OIDCLoginProtocol.java",
+              "line": 216,
+              "code_snippet": "OIDCRedirectUriBuilder redirectUri = OIDCRedirectUriBuilder.fromUri(redirect, responseMode, session, clientSession);"
+            },
+            "path": [
+              "authSession",
+              "redirect",
+              "redirectUri"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "managementUrl_to_target_139722368358208",
+            "type": "ssrf",
+            "cwe": "CWE-918",
+            "vulnerability_label": "ssrf",
+            "source": {
+              "variable": "managementUrl",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/OIDCLoginProtocol.java",
+              "line": 452,
+              "code_snippet": "public boolean sendPushRevocationPolicyRequest(RealmModel realm, ClientModel resource, int notBefore, String managementUrl) {"
+            },
+            "sink": {
+              "variable": "target",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/OIDCLoginProtocol.java",
+              "line": 456,
+              "code_snippet": "URI target = UriBuilder.fromUri(managementUrl).path(AdapterConstants.K_PUSH_NOT_BEFORE).build();"
+            },
+            "path": [
+              "managementUrl",
+              "target"
+            ],
+            "confidence": 0.8
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 8,
+        "sinks_found": 2,
+        "sanitizers_found": 0,
+        "chains_found": 3,
+        "chains_verified": 3,
+        "verification_rate": 1.0,
+        "explanations_generated": 3,
+        "graph_nodes": 486,
+        "graph_edges": 203,
+        "extraction_complete": true,
+        "extraction_errors": [],
+        "analysis_backend": "llm",
+        "llm_analysis_mode": "targeted"
+      },
+      "error": null
+    },
+    {
+      "file": "SerializedBrokeredIdentityContext.java",
+      "cve": "internal (Unsafe Deserialization patterns)",
+      "expected_tp": 4,
+      "found_tp": 0,
+      "fp": 0,
+      "fn": 4,
+      "unclassified": 3,
+      "tp_matched": [],
+      "fp_chains": [],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "value",
+          "sink_var": "clazz",
+          "source_line": 292,
+          "sink_line": 292,
+          "vuln_type": "deserialization",
+          "description": "value.getClazz() -> Reflections.classForName()"
+        },
+        {
+          "id": "TP-2",
+          "source_var": "value",
+          "sink_var": "deserialized",
+          "source_line": 294,
+          "sink_line": 294,
+          "vuln_type": "deserialization",
+          "description": "value.getData() -> serializer.deserialize() assigned to `deserialized` (line 294). Sink variable is the deserialization result `deserialized` \u2014 `ctxData` is not a variable in this code."
+        },
+        {
+          "id": "TP-3",
+          "source_var": "asString",
+          "sink_var": "ctx",
+          "source_line": 344,
+          "sink_line": 349,
+          "vuln_type": "deserialization",
+          "description": "authSession.getAuthNote() -> JsonSerialization.readValue()"
+        },
+        {
+          "id": "TP-4",
+          "source_var": "ctxEntry",
+          "sink_var": "asBytes",
+          "source_line": 244,
+          "sink_line": 246,
+          "vuln_type": "deserialization",
+          "description": "ctxEntry.getData() -> JsonSerialization.readValue()"
+        }
+      ],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "contextData_to_asBytes_139722368396608",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "insecure_deserialization",
+            "source": {
+              "variable": "contextData",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/SerializedBrokeredIdentityContext.java",
+              "line": 200,
+              "code_snippet": "for (Map.Entry<String, ContextDataEntry> entry : this.contextData.entrySet()) {"
+            },
+            "sink": {
+              "variable": "asBytes",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/SerializedBrokeredIdentityContext.java",
+              "line": 245,
+              "code_snippet": "byte[] asBytes = Base64Url.decode(asString);"
+            },
+            "path": [
+              "contextData",
+              "ctxEntry",
+              "asString",
+              "asBytes"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "asString_to_asBytes_139722368338496",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "insecure_deserialization",
+            "source": {
+              "variable": "asString",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/SerializedBrokeredIdentityContext.java",
+              "line": 244,
+              "code_snippet": "String asString = ctxEntry.getData();"
+            },
+            "sink": {
+              "variable": "asBytes",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/SerializedBrokeredIdentityContext.java",
+              "line": 245,
+              "code_snippet": "byte[] asBytes = Base64Url.decode(asString);"
+            },
+            "path": [
+              "asString",
+              "asBytes"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "authSession_to_deserialized_139722368681088",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "insecure_deserialization",
+            "source": {
+              "variable": "authSession",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/SerializedBrokeredIdentityContext.java",
+              "line": 266,
+              "code_snippet": "public BrokeredIdentityContext deserialize(KeycloakSession session, AuthenticationSessionModel authSession) {"
+            },
+            "sink": {
+              "variable": "deserialized",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/SerializedBrokeredIdentityContext.java",
+              "line": 294,
+              "code_snippet": "Object deserialized = serializer.deserialize(value.getData(), clazz);"
+            },
+            "path": [
+              "authSession",
+              "realm",
+              "idp",
+              "serializer",
+              "deserialized"
+            ],
+            "confidence": 0.825
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 13,
+        "sinks_found": 4,
+        "sanitizers_found": 0,
+        "chains_found": 3,
+        "chains_verified": 3,
+        "verification_rate": 1.0,
+        "explanations_generated": 3,
+        "graph_nodes": 264,
+        "graph_edges": 101,
+        "extraction_complete": true,
+        "extraction_errors": [],
+        "analysis_backend": "llm",
+        "llm_analysis_mode": "targeted"
+      },
+      "error": null
+    },
+    {
+      "file": "CVE-2022-3782/RedirectUtils.java",
+      "cve": "CVE-2022-3782",
+      "expected_tp": 1,
+      "found_tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "unclassified": 0,
+      "tp_matched": [],
+      "fp_chains": [],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "redirectUri",
+          "sink_var": "redirectUri",
+          "source_line": 90,
+          "sink_line": 144,
+          "vuln_type": "path_traversal",
+          "description": "redirectUri parameter -> URI.create -> normalize -> return (path traversal via double encoding)",
+          "expected_realistic": false,
+          "comment": "Utility function \u2014 source comes from caller; tool may not flag parameter as USER_INPUT"
+        }
+      ],
+      "unclassified_chains": [],
+      "pipeline_metrics": {
+        "sources_found": 0,
+        "sinks_found": 0,
+        "sanitizers_found": 0,
+        "chains_found": 0,
+        "chains_verified": 0,
+        "verification_rate": 0.0,
+        "explanations_generated": 0,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+        "extraction_complete": true,
+        "extraction_errors": [],
+        "analysis_backend": "llm",
+        "llm_analysis_mode": "targeted"
+      },
+      "error": null
+    },
+    {
+      "file": "CVE-2022-4361/SamlService.java",
+      "cve": "CVE-2022-4361",
+      "expected_tp": 1,
+      "found_tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "unclassified": 20,
+      "tp_matched": [],
+      "fp_chains": [],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "redirectUri",
+          "sink_var": "redirect",
+          "source_line": 424,
+          "sink_line": 461,
+          "vuln_type": "xss",
+          "description": "getAssertionConsumerServiceURL (deserialized SAML XML) -> authSession.setRedirectUri"
+        }
+      ],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "artifact_to_artifactResponseString_139722357879232",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "insecure_deserialization",
+            "source": {
+              "variable": "artifact",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1146,
+              "code_snippet": "String artifact = artifactResolveMessage.getArtifact(); // Artifact from resolve request"
+            },
+            "sink": {
+              "variable": "artifactResponseString",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1214,
+              "code_snippet": "logger.errorf(e,\"Failed to obtain document from ArtifactResponseString: %s.\", artifactResponseString);"
+            },
+            "path": [
+              "artifact",
+              "artifactResponseString"
+            ],
+            "confidence": 0.85
+          }
+        },
+        {
+          "chain": {
+            "id": "relayState_to_requestAbstractType_139722357934272",
+            "type": "other",
+            "cwe": "CWE-20",
+            "vulnerability_label": "untrusted_plugin_invocation",
+            "source": {
+              "variable": "relayState",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 413,
+              "code_snippet": "protected Response loginRequest(String relayState, AuthnRequestType requestAbstractType, ClientModel client) {"
+            },
+            "sink": {
+              "variable": "requestAbstractType",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 500,
+              "code_snippet": "requestAbstractType = it.next().beforeProcessingLoginRequest(requestAbstractType, authSession);"
+            },
+            "path": [
+              "relayState",
+              "authSession",
+              "requestAbstractType"
+            ],
+            "confidence": 0.75
+          }
+        },
+        {
+          "chain": {
+            "id": "inputStream_to_soapBodyContents_139722357923200",
+            "type": "xxe",
+            "cwe": "CWE-611",
+            "vulnerability_label": "xml_external_entity_injection",
+            "source": {
+              "variable": "inputStream",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1047,
+              "code_snippet": "public Response artifactResolutionService(InputStream inputStream) {"
+            },
+            "sink": {
+              "variable": "soapBodyContents",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1059,
+              "code_snippet": "\"ArtifactResolve message: %s\", DocumentUtil.asString(soapBodyContents));"
+            },
+            "path": [
+              "inputStream",
+              "soapBodyContents"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "inputStream_to_samlDocumentHolder_139722357922624",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "unsafe_deserialization_of_saml_document",
+            "source": {
+              "variable": "inputStream",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1047,
+              "code_snippet": "public Response artifactResolutionService(InputStream inputStream) {"
+            },
+            "sink": {
+              "variable": "samlDocumentHolder",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1070,
+              "code_snippet": "return artifactResolve(artifactResolveType, samlDocumentHolder);"
+            },
+            "path": [
+              "inputStream",
+              "soapBodyContents",
+              "samlDocumentHolder"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "artifactResolveMessage_to_artifact_139722357922624",
+            "type": "other",
+            "cwe": "CWE-284",
+            "vulnerability_label": "cache_key_manipulation",
+            "source": {
+              "variable": "artifactResolveMessage",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1143,
+              "code_snippet": "logger.debug(\"Received artifactResolve message for artifact \" + artifactResolveMessage.getArtifact() + \"\\n\" +"
+            },
+            "sink": {
+              "variable": "artifact",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1163,
+              "code_snippet": "logger.errorf(\"No data stored for artifact %s\", artifact);"
+            },
+            "path": [
+              "artifactResolveMessage",
+              "artifact"
+            ],
+            "confidence": 0.8999999999999999
+          }
+        },
+        {
+          "chain": {
+            "id": "artifactResolveMessage_to_artifactResponseString_139722357880256",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "insecure_deserialization",
+            "source": {
+              "variable": "artifactResolveMessage",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1143,
+              "code_snippet": "logger.debug(\"Received artifactResolve message for artifact \" + artifactResolveMessage.getArtifact() + \"\\n\" +"
+            },
+            "sink": {
+              "variable": "artifactResponseString",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1214,
+              "code_snippet": "logger.errorf(e,\"Failed to obtain document from ArtifactResponseString: %s.\", artifactResponseString);"
+            },
+            "path": [
+              "artifactResolveMessage",
+              "artifact",
+              "artifactResponseString"
+            ],
+            "confidence": 0.8999999999999999
+          }
+        },
+        {
+          "chain": {
+            "id": "artifactResolveMessage_to_artifactResponseType_139722357922624",
+            "type": "xxe",
+            "cwe": "CWE-611",
+            "vulnerability_label": "xxe",
+            "source": {
+              "variable": "artifactResolveMessage",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1143,
+              "code_snippet": "logger.debug(\"Received artifactResolve message for artifact \" + artifactResolveMessage.getArtifact() + \"\\n\" +"
+            },
+            "sink": {
+              "variable": "artifactResponseType",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1212,
+              "code_snippet": "artifactResponseDocument = SamlProtocolUtils.convert(artifactResponseType);"
+            },
+            "path": [
+              "artifactResolveMessage",
+              "artifact",
+              "artifactResponseString",
+              "artifactResponseType"
+            ],
+            "confidence": 0.875
+          }
+        },
+        {
+          "chain": {
+            "id": "artifactResolveMessage_to_artifactResponseDocument_139722387699328",
+            "type": "other",
+            "cwe": "CWE-345",
+            "vulnerability_label": "response_manipulation",
+            "source": {
+              "variable": "artifactResolveMessage",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1143,
+              "code_snippet": "logger.debug(\"Received artifactResolve message for artifact \" + artifactResolveMessage.getArtifact() + \"\\n\" +"
+            },
+            "sink": {
+              "variable": "artifactResponseDocument",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1233,
+              "code_snippet": "return artifactResponseMessage(artifactResolveMessage, artifactResponseDocument, clientModel);"
+            },
+            "path": [
+              "artifactResolveMessage",
+              "artifact",
+              "artifactResponseString",
+              "artifactResponseType",
+              "artifactResponseDocument"
+            ],
+            "confidence": 0.8999999999999999
+          }
+        },
+        {
+          "chain": {
+            "id": "artifact_to_artifactResponseType_139722357948288",
+            "type": "xxe",
+            "cwe": "CWE-611",
+            "vulnerability_label": "xxe",
+            "source": {
+              "variable": "artifact",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1146,
+              "code_snippet": "String artifact = artifactResolveMessage.getArtifact(); // Artifact from resolve request"
+            },
+            "sink": {
+              "variable": "artifactResponseType",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1212,
+              "code_snippet": "artifactResponseDocument = SamlProtocolUtils.convert(artifactResponseType);"
+            },
+            "path": [
+              "artifact",
+              "artifactResponseString",
+              "artifactResponseType"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "artifact_to_artifactResponseDocument_139722357879232",
+            "type": "other",
+            "cwe": "CWE-345",
+            "vulnerability_label": "response_manipulation",
+            "source": {
+              "variable": "artifact",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1146,
+              "code_snippet": "String artifact = artifactResolveMessage.getArtifact(); // Artifact from resolve request"
+            },
+            "sink": {
+              "variable": "artifactResponseDocument",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1233,
+              "code_snippet": "return artifactResponseMessage(artifactResolveMessage, artifactResponseDocument, clientModel);"
+            },
+            "path": [
+              "artifact",
+              "artifactResponseString",
+              "artifactResponseType",
+              "artifactResponseDocument"
+            ],
+            "confidence": 0.85
+          }
+        },
+        {
+          "chain": {
+            "id": "artifactResponseString_to_artifactResponseType_139722357946368",
+            "type": "xxe",
+            "cwe": "CWE-611",
+            "vulnerability_label": "xxe",
+            "source": {
+              "variable": "artifactResponseString",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1196,
+              "code_snippet": "artifactResponseString = artifactResolver.resolveArtifact(clientSessionModel, artifact);"
+            },
+            "sink": {
+              "variable": "artifactResponseType",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1212,
+              "code_snippet": "artifactResponseDocument = SamlProtocolUtils.convert(artifactResponseType);"
+            },
+            "path": [
+              "artifactResponseString",
+              "artifactResponseType"
+            ],
+            "confidence": 0.75
+          }
+        },
+        {
+          "chain": {
+            "id": "artifactResponseString_to_artifactResponseDocument_139722387271104",
+            "type": "other",
+            "cwe": "CWE-345",
+            "vulnerability_label": "response_manipulation",
+            "source": {
+              "variable": "artifactResponseString",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1196,
+              "code_snippet": "artifactResponseString = artifactResolver.resolveArtifact(clientSessionModel, artifact);"
+            },
+            "sink": {
+              "variable": "artifactResponseDocument",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1233,
+              "code_snippet": "return artifactResponseMessage(artifactResolveMessage, artifactResponseDocument, clientModel);"
+            },
+            "path": [
+              "artifactResponseString",
+              "artifactResponseType",
+              "artifactResponseDocument"
+            ],
+            "confidence": 0.7749999999999999
+          }
+        },
+        {
+          "chain": {
+            "id": "artifactResponseDocument_to_artifactResponseElement_139722357946368",
+            "type": "xxe",
+            "cwe": "CWE-91",
+            "vulnerability_label": "xml_injection",
+            "source": {
+              "variable": "artifactResponseDocument",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1258,
+              "code_snippet": "Element artifactResponseElement = artifactResponseDocument.getDocumentElement();"
+            },
+            "sink": {
+              "variable": "artifactResponseElement",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1259,
+              "code_snippet": "artifactResponseElement.setAttribute(\"InResponseTo\", artifactResolveMessage.getID());"
+            },
+            "path": [
+              "artifactResponseDocument",
+              "artifactResponseElement"
+            ],
+            "confidence": 0.725
+          }
+        },
+        {
+          "chain": {
+            "id": "doc_to_httpPost_139722357946368",
+            "type": "ssrf",
+            "cwe": "CWE-918",
+            "vulnerability_label": "ssrf",
+            "source": {
+              "variable": "doc",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1386,
+              "code_snippet": "HttpPost httpPost = Soap.createMessage().addToBody(doc).buildHttpPost(clientArtifactBindingURI);"
+            },
+            "sink": {
+              "variable": "httpPost",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1386,
+              "code_snippet": "HttpPost httpPost = Soap.createMessage().addToBody(doc).buildHttpPost(clientArtifactBindingURI);"
+            },
+            "path": [
+              "doc",
+              "httpPost"
+            ],
+            "confidence": 0.75
+          }
+        },
+        {
+          "chain": {
+            "id": "clientArtifactBindingURI_to_httpPost_139722415540608",
+            "type": "ssrf",
+            "cwe": "CWE-918",
+            "vulnerability_label": "ssrf",
+            "source": {
+              "variable": "clientArtifactBindingURI",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1386,
+              "code_snippet": "HttpPost httpPost = Soap.createMessage().addToBody(doc).buildHttpPost(clientArtifactBindingURI);"
+            },
+            "sink": {
+              "variable": "httpPost",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1386,
+              "code_snippet": "HttpPost httpPost = Soap.createMessage().addToBody(doc).buildHttpPost(clientArtifactBindingURI);"
+            },
+            "path": [
+              "clientArtifactBindingURI",
+              "httpPost"
+            ],
+            "confidence": 0.7
+          }
+        },
+        {
+          "chain": {
+            "id": "soapBodyContents_to_samlDocumentHolder_139722357963712",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "unsafe_deserialization_of_saml_document",
+            "source": {
+              "variable": "soapBodyContents",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1048,
+              "code_snippet": "Document soapBodyContents = Soap.extractSoapMessage(inputStream);"
+            },
+            "sink": {
+              "variable": "samlDocumentHolder",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1070,
+              "code_snippet": "return artifactResolve(artifactResolveType, samlDocumentHolder);"
+            },
+            "path": [
+              "soapBodyContents",
+              "samlDocumentHolder"
+            ],
+            "confidence": 0.8
+          }
+        },
+        {
+          "chain": {
+            "id": "sessionMapping_to_artifactResponseString_139722357946368",
+            "type": "deserialization",
+            "cwe": "CWE-502",
+            "vulnerability_label": "insecure_deserialization",
+            "source": {
+              "variable": "sessionMapping",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1162,
+              "code_snippet": "if (sessionMapping == null) {"
+            },
+            "sink": {
+              "variable": "artifactResponseString",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1214,
+              "code_snippet": "logger.errorf(e,\"Failed to obtain document from ArtifactResponseString: %s.\", artifactResponseString);"
+            },
+            "path": [
+              "sessionMapping",
+              "clientSessionModel",
+              "artifactResponseString"
+            ],
+            "confidence": 0.85
+          }
+        },
+        {
+          "chain": {
+            "id": "sessionMapping_to_artifactResponseType_139722357963712",
+            "type": "xxe",
+            "cwe": "CWE-611",
+            "vulnerability_label": "xxe",
+            "source": {
+              "variable": "sessionMapping",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1162,
+              "code_snippet": "if (sessionMapping == null) {"
+            },
+            "sink": {
+              "variable": "artifactResponseType",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1212,
+              "code_snippet": "artifactResponseDocument = SamlProtocolUtils.convert(artifactResponseType);"
+            },
+            "path": [
+              "sessionMapping",
+              "clientSessionModel",
+              "artifactResponseString",
+              "artifactResponseType"
+            ],
+            "confidence": 0.825
+          }
+        },
+        {
+          "chain": {
+            "id": "sessionMapping_to_artifactResponseDocument_139722357988864",
+            "type": "other",
+            "cwe": "CWE-345",
+            "vulnerability_label": "response_manipulation",
+            "source": {
+              "variable": "sessionMapping",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1162,
+              "code_snippet": "if (sessionMapping == null) {"
+            },
+            "sink": {
+              "variable": "artifactResponseDocument",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1233,
+              "code_snippet": "return artifactResponseMessage(artifactResolveMessage, artifactResponseDocument, clientModel);"
+            },
+            "path": [
+              "sessionMapping",
+              "clientSessionModel",
+              "artifactResponseString",
+              "artifactResponseType",
+              "artifactResponseDocument"
+            ],
+            "confidence": 0.85
+          }
+        },
+        {
+          "chain": {
+            "id": "artifactResponseType_to_artifactResponseDocument_139722357986496",
+            "type": "other",
+            "cwe": "CWE-345",
+            "vulnerability_label": "response_manipulation",
+            "source": {
+              "variable": "artifactResponseType",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1212,
+              "code_snippet": "artifactResponseDocument = SamlProtocolUtils.convert(artifactResponseType);"
+            },
+            "sink": {
+              "variable": "artifactResponseDocument",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/keycloak/CVE-2022-4361/SamlService.java",
+              "line": 1233,
+              "code_snippet": "return artifactResponseMessage(artifactResolveMessage, artifactResponseDocument, clientModel);"
+            },
+            "path": [
+              "artifactResponseType",
+              "artifactResponseDocument"
+            ],
+            "confidence": 0.875
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 45,
+        "sinks_found": 16,
+        "sanitizers_found": 9,
+        "chains_found": 20,
+        "chains_verified": 20,
+        "verification_rate": 1.0,
+        "explanations_generated": 20,
+        "graph_nodes": 1039,
+        "graph_edges": 557,
+        "extraction_complete": true,
+        "extraction_errors": [],
+        "analysis_backend": "llm",
+        "llm_analysis_mode": "targeted"
+      },
+      "error": null
+    }
+  ]
+}

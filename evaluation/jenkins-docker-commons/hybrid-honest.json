@@ -1,0 +1,123 @@
+{
+  "analysis": {
+    "backend": "hybrid",
+    "llm_analysis_mode": "targeted",
+    "llm_provider": "openai",
+    "llm_model": "glm-5.3-flash",
+    "min_confidence": 0.6,
+    "max_path_length": 15,
+    "pathfinding_algorithm": "astar",
+    "verification_enabled": true,
+    "verification_level": "both",
+    "symbolic_execution_enabled": true,
+    "use_joern": true,
+    "use_semantic_heuristic": true,
+    "use_astar": true,
+    "use_llm_graph_builder": true,
+    "llm_graph_enrichment_enabled": false,
+    "llm_graph_enrichment_confidence": 0.7,
+    "llm_batch_max_chars": 8000,
+    "max_concurrent_files": 4,
+    "max_concurrent_functions": 2,
+    "max_files": 0,
+    "cache_enabled": true,
+    "cache_read_enabled": true,
+    "openai_timeout": 60.0,
+    "llm_max_retries": 2,
+    "llm_max_tokens": 4000,
+    "openai_json_mode": true,
+    "openai_thinking": "disabled",
+    "evaluation_policy": {
+      "all_labelled_true_positives": true,
+      "exact_endpoint_identifiers": true,
+      "exact_vulnerability_type": true,
+      "line_tolerance": 5,
+      "unmatched_findings_count_as_fp": true,
+      "one_to_one_matching": true
+    }
+  },
+  "aggregate": {
+    "total_tp": 0,
+    "total_fp": 0,
+    "total_fn": 1,
+    "total_unclassified": 1,
+    "expected_tp": 1,
+    "precision": 0.0,
+    "precision_known": 0.0,
+    "precision_lower_bound": 0.0,
+    "precision_strict": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "f1_lower_bound": 0.0,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2022-20617/DockerRegistryEndpoint.java",
+      "cve": "CVE-2022-20617",
+      "expected_tp": 1,
+      "found_tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "unclassified": 1,
+      "tp_matched": [],
+      "fp_chains": [],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "s",
+          "sink_var": "url",
+          "source_line": 120,
+          "sink_line": 128,
+          "vuln_type": "command_injection",
+          "description": "fromImageName(String s, ...) parameter -> regex matcher.group(2) -> new URL(...) used in subsequent shell context"
+        }
+      ],
+      "unclassified_chains": [
+        {
+          "chain": {
+            "id": "s_to_url_124110320639616",
+            "type": "ssrf",
+            "cwe": "CWE-918",
+            "vulnerability_label": "ssrf",
+            "source": {
+              "variable": "s",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
+              "line": 120,
+              "code_snippet": "public static DockerRegistryEndpoint fromImageName(String s, @CheckForNull String credentialsId) {"
+            },
+            "sink": {
+              "variable": "url",
+              "file": "/opt/Verified-Taint-Chains/tests/fixtures/real_world/jenkins-docker-commons/CVE-2022-20617/DockerRegistryEndpoint.java",
+              "line": 128,
+              "code_snippet": "url = matcher.group(2) == null ? null : new URL(\"https://\" + matcher.group(2)).toString();"
+            },
+            "path": [
+              "s",
+              "matcher",
+              "url"
+            ],
+            "confidence": 0.75
+          }
+        }
+      ],
+      "pipeline_metrics": {
+        "sources_found": 7,
+        "sinks_found": 1,
+        "sanitizers_found": 3,
+        "chains_found": 1,
+        "chains_verified": 1,
+        "verification_rate": 1.0,
+        "explanations_generated": 1,
+        "graph_nodes": 430,
+        "graph_edges": 42,
+        "extraction_complete": true,
+        "extraction_errors": [],
+        "analysis_backend": "hybrid",
+        "llm_analysis_mode": "targeted"
+      },
+      "error": null
+    }
+  ]
+}

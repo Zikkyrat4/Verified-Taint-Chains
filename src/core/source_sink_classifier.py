@@ -7,7 +7,13 @@ Categories drive confidence adjustment to reduce false positives on framework co
 import re
 from typing import List, Tuple
 
-from src.core.models import Source, Sink, SourceCategory, SinkCategory
+from src.core.models import (
+    Sink,
+    SinkCategory,
+    Source,
+    SourceCategory,
+    VulnerabilityType,
+)
 
 
 # ============================================================================
@@ -38,7 +44,7 @@ _SOURCE_PATTERNS: List[Tuple[re.Pattern, SourceCategory]] = [
     (re.compile(
         r"getSession\(|getAttribute\(|getNote\("
         r"|getClaim\(|getAuthenticatedUser\(|getPrincipal\("
-        r"|getCredentials\(|session\.get|getRedirectUri\("
+        r"|getCredentials\(|session\.get"
     ), SourceCategory.SESSION_DATA),
 
     # DATABASE — query results, entity properties
@@ -71,19 +77,19 @@ _SINK_PATTERNS: List[Tuple[re.Pattern, SinkCategory]] = [
     # EVENT_LOGGING — audit, structured logging, MDC. Generic Java/Spring/SLF4J/JUL.
     # MUST come before DATA_STORAGE (some loggers use put()) and FRAMEWORK_API.
     (re.compile(
-        r"\bevent\.(detail|error|success|client|user)\(|\bauditEvent\."
-        r"|\b(LOG|LOGGER|log|logger)\s*\.\s*(info|warn|debug|error|trace|fatal)\("
+        r"\b(LOG|LOGGER|log|logger)\s*\.\s*(info|warn|debug|error|trace|fatal)\("
+        r"|\b(?:listener\.)?getLogger\(\)\s*\.\s*(?:print|println|printf)\("
+        r"|\blistener\s*\.\s*fatalError\("
         r"|\b(slf4j|Slf4j|SLF4J)\b"
         r"|\bMDC\.(put|get)\("
         r"|\bAudit(Event|Log|Logger)\b"
-        r"|ServicesLogger\.|adminEvent\."
     ), SinkCategory.EVENT_LOGGING),
 
     # OUTPUT_RENDERING — response write, print, redirect, HTML output
     (re.compile(
         r"\.write\(|println\(|print\(|sendRedirect\("
         r"|getWriter\(|addAttribute\(|forward\(|include\(|sendError\("
-        r"|renderResponse\(|renderTemplate\(|renderLogoutPage\("
+        r"|renderResponse\(|renderTemplate\("
         r"|Response\.ok\(|ResponseEntity\.ok\("
     ), SinkCategory.OUTPUT_RENDERING),
 
@@ -106,14 +112,9 @@ _SINK_PATTERNS: List[Tuple[re.Pattern, SinkCategory]] = [
         r"|\.toString\(\)\s*$"
     ), SinkCategory.BENIGN),
 
-    # DATA_STORAGE — session set, DB write, cache. Internal flag-style setters
-    # (setProtocol, setClientNote, setRedirectUri) belong here; we still keep
-    # them out of FRAMEWORK_API but score them lower than DB writes via the
-    # risk matrix.
+    # DATA_STORAGE — generic session, database, and cache writes.
     (re.compile(
-        r"setAttribute\(|setNote\(|setAuthNote\("
-        r"|persist\(|save\(|merge\(|insert\(|update\(|put\("
-        r"|setClientNote\(|setProtocol\(|setRedirectUri\("
+        r"setAttribute\(|persist\(|save\(|merge\(|insert\(|update\(|put\("
     ), SinkCategory.DATA_STORAGE),
 
     # FRAMEWORK_API — constructors, generic setters, framework methods (fallback)
@@ -127,12 +128,18 @@ _SINK_PATTERNS: List[Tuple[re.Pattern, SinkCategory]] = [
 # ============================================================================
 
 _SOURCE_TYPE_KEYWORDS: List[Tuple[str, SourceCategory]] = [
+    ("user_controlled", SourceCategory.USER_INPUT),
+    ("attacker_controlled", SourceCategory.USER_INPUT),
+    ("tag_attribute", SourceCategory.USER_INPUT),
+    ("file_upload", SourceCategory.USER_INPUT),
     ("user_input", SourceCategory.USER_INPUT),
     ("http", SourceCategory.USER_INPUT),
     ("request", SourceCategory.USER_INPUT),
     ("file", SourceCategory.EXTERNAL_DATA),
+    ("external_data", SourceCategory.EXTERNAL_DATA),
     ("network", SourceCategory.EXTERNAL_DATA),
     ("deserialization", SourceCategory.EXTERNAL_DATA),
+    ("parsed_xml", SourceCategory.EXTERNAL_DATA),
     ("session", SourceCategory.SESSION_DATA),
     ("auth", SourceCategory.SESSION_DATA),
     ("database", SourceCategory.DATABASE),
@@ -187,6 +194,23 @@ def classify_sink(sink: Sink) -> SinkCategory:
     for pattern, category in _SINK_PATTERNS:
         if pattern.search(text):
             return category
+
+    vuln = sink.vulnerability_type
+    if vuln in (
+        VulnerabilityType.SQL_INJECTION,
+        VulnerabilityType.COMMAND_INJECTION,
+        VulnerabilityType.CODE_INJECTION,
+        VulnerabilityType.UNSAFE_DESERIALIZATION,
+    ):
+        return SinkCategory.DIRECT_EXECUTION
+    if vuln in (VulnerabilityType.XSS, VulnerabilityType.OPEN_REDIRECT):
+        return SinkCategory.OUTPUT_RENDERING
+    if vuln in (
+        VulnerabilityType.PATH_TRAVERSAL,
+        VulnerabilityType.SSRF,
+        VulnerabilityType.XXE,
+    ):
+        return SinkCategory.RESOURCE_ACCESS
 
     # Default fallback
     return SinkCategory.UNKNOWN

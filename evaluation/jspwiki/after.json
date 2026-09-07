@@ -1,14 +1,14 @@
 {
   "aggregate": {
-    "total_tp": 2,
+    "total_tp": 0,
     "total_fp": 0,
-    "total_fn": 0,
+    "total_fn": 2,
     "total_unclassified": 0,
     "expected_tp": 2,
-    "precision": 1.0,
-    "precision_strict": 1.0,
-    "recall": 1.0,
-    "f1": 1.0,
+    "precision": 0.0,
+    "precision_strict": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
     "files_analyzed": 1,
     "files_failed": 0
   },
@@ -17,95 +17,45 @@
       "file": "CVE-2019-10076/LinkToTag.java",
       "cve": "CVE-2019-10076",
       "expected_tp": 2,
-      "found_tp": 2,
+      "found_tp": 0,
       "fp": 0,
-      "fn": 0,
+      "fn": 2,
       "unclassified": 0,
-      "tp_matched": [
+      "tp_matched": [],
+      "fp_chains": [],
+      "fn_chains": [
         {
-          "chain": {
-            "id": "title_to_m_title_4833266176",
-            "type": "xss",
-            "cwe": "CWE-79",
-            "vulnerability_label": "cross_site_scripting",
-            "source": {
-              "variable": "title",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
-              "line": 69,
-              "code_snippet": "public void setTitle( String title )"
-            },
-            "sink": {
-              "variable": "m_title",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
-              "line": 127,
-              "code_snippet": "+ m_accesskey + \"\\\" title=\\\"\" + m_title + \"\\\">\");"
-            },
-            "path": [
-              "title",
-              "m_title"
-            ],
-            "confidence": 0.825
-          },
-          "tp": {
-            "id": "TP-1",
-            "source_var": "title",
-            "sink_var": "m_title",
-            "source_line": 69,
-            "sink_line": 127,
-            "vuln_type": "xss",
-            "description": "setTitle(String title) \u2014 attacker-controlled title attribute -> m_title field -> out.print(...m_title...)",
-            "_cwe": "CWE-079"
-          }
+          "id": "TP-1",
+          "source_var": "title",
+          "sink_var": "m_title",
+          "source_line": 69,
+          "sink_line": 127,
+          "vuln_type": "xss",
+          "description": "setTitle(String title) \u2014 attacker-controlled title attribute -> m_title field -> out.print(...m_title...)",
+          "_cwe": "CWE-079"
         },
         {
-          "chain": {
-            "id": "access_to_m_accesskey_4806590976",
-            "type": "xss",
-            "cwe": "CWE-79",
-            "vulnerability_label": "cross_site_scripting",
-            "source": {
-              "variable": "access",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
-              "line": 74,
-              "code_snippet": "public void setAccesskey( String access )"
-            },
-            "sink": {
-              "variable": "m_accesskey",
-              "file": "/Users/zikkyrat/Projects/Diplom/tests/fixtures/real_world/jspwiki/CVE-2019-10076/LinkToTag.java",
-              "line": 127,
-              "code_snippet": "+ m_accesskey + \"\\\" title=\\\"\" + m_title + \"\\\">\");"
-            },
-            "path": [
-              "access",
-              "m_accesskey"
-            ],
-            "confidence": 0.825
-          },
-          "tp": {
-            "id": "TP-2",
-            "source_var": "access",
-            "sink_var": "m_accesskey",
-            "source_line": 74,
-            "sink_line": 126,
-            "vuln_type": "xss",
-            "description": "setAccesskey(String access) -> m_accesskey field -> out.print(...m_accesskey...)",
-            "_cwe": "CWE-079"
-          }
+          "id": "TP-2",
+          "source_var": "access",
+          "sink_var": "m_accesskey",
+          "source_line": 74,
+          "sink_line": 126,
+          "vuln_type": "xss",
+          "description": "setAccesskey(String access) -> m_accesskey field -> out.print(...m_accesskey...)",
+          "_cwe": "CWE-079"
         }
       ],
-      "fp_chains": [],
-      "fn_chains": [],
       "unclassified_chains": [],
       "pipeline_metrics": {
-        "sources_found": 8,
-        "sinks_found": 4,
+        "sources_found": 3,
+        "sinks_found": 0,
         "sanitizers_found": 0,
-        "chains_found": 2,
-        "chains_verified": 2,
-        "verification_rate": 1.0,
-        "explanations_generated": 2,
+        "chains_found": 0,
+        "chains_verified": 0,
+        "verification_rate": 0.0,
+        "explanations_generated": 0,
         "graph_nodes": 177,
-        "graph_edges": 35
+        "graph_edges": 34
       },
       "error": null
     }

@@ -1,0 +1,105 @@
+{
+  "analysis": {
+    "backend": "static",
+    "llm_analysis_mode": "n/a",
+    "llm_provider": "n/a",
+    "llm_model": "n/a",
+    "min_confidence": 0.6,
+    "max_path_length": 15,
+    "pathfinding_algorithm": "astar",
+    "verification_enabled": true,
+    "verification_level": "both",
+    "symbolic_execution_enabled": true,
+    "use_joern": true,
+    "use_semantic_heuristic": true,
+    "use_astar": true,
+    "use_llm_graph_builder": true,
+    "llm_graph_enrichment_enabled": false,
+    "llm_graph_enrichment_confidence": 0.7,
+    "llm_batch_max_chars": 8000,
+    "max_concurrent_files": 4,
+    "max_concurrent_functions": 2,
+    "max_files": 0,
+    "cache_enabled": true,
+    "cache_read_enabled": true,
+    "openai_timeout": "n/a",
+    "llm_max_retries": "n/a",
+    "llm_max_tokens": "n/a",
+    "openai_json_mode": "n/a",
+    "openai_thinking": "n/a",
+    "evaluation_policy": {
+      "all_labelled_true_positives": true,
+      "exact_endpoint_identifiers": true,
+      "exact_vulnerability_type": true,
+      "line_tolerance": 5,
+      "unmatched_findings_count_as_fp": true,
+      "one_to_one_matching": true
+    }
+  },
+  "aggregate": {
+    "total_tp": 0,
+    "total_fp": 0,
+    "total_fn": 2,
+    "total_unclassified": 0,
+    "expected_tp": 2,
+    "precision": 0.0,
+    "precision_known": 0.0,
+    "precision_lower_bound": 0.0,
+    "precision_strict": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "f1_lower_bound": 0.0,
+    "files_analyzed": 1,
+    "files_failed": 0
+  },
+  "files": [
+    {
+      "file": "CVE-2019-10076/LinkToTag.java",
+      "cve": "CVE-2019-10076",
+      "expected_tp": 2,
+      "found_tp": 0,
+      "fp": 0,
+      "fn": 2,
+      "unclassified": 0,
+      "tp_matched": [],
+      "fp_chains": [],
+      "fn_chains": [
+        {
+          "id": "TP-1",
+          "source_var": "title",
+          "sink_var": "m_title",
+          "source_line": 69,
+          "sink_line": 127,
+          "vuln_type": "xss",
+          "description": "setTitle(String title) \u2014 attacker-controlled title attribute -> m_title field -> out.print(...m_title...)"
+        },
+        {
+          "id": "TP-2",
+          "source_var": "access",
+          "sink_var": "m_accesskey",
+          "source_line": 74,
+          "sink_line": 126,
+          "vuln_type": "xss",
+          "description": "setAccesskey(String access) -> m_accesskey field -> out.print(...m_accesskey...)"
+        }
+      ],
+      "unclassified_chains": [],
+      "pipeline_metrics": {
+        "sources_found": 0,
+        "sinks_found": 4,
+        "sanitizers_found": 0,
+        "chains_found": 0,
+        "chains_verified": 0,
+        "verification_rate": 0.0,
+        "explanations_generated": 0,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+        "extraction_complete": true,
+        "extraction_errors": [],
+        "analysis_backend": "static",
+        "llm_analysis_mode": "targeted"
+      },
+      "error": null
+    }
+  ]
+}
