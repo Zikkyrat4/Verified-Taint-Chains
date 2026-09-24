@@ -151,7 +151,7 @@ class LLMGraphBuilder:
                     condition=condition,
                 )
 
-        logger.info(
+        logger.debug(
             f"LLMGraphBuilder base graph: {graph.number_of_nodes()} nodes, "
             f"{ast_edge_count} AST edges, {graph.number_of_edges()} total edges"
         )

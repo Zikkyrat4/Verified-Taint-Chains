@@ -63,13 +63,16 @@ class TestBuildScopedGraph:
             file_code_map, file_sources, file_sinks,
         )
 
-        # Both files should have their own "query" node, prefixed
-        assert "A.java:query" in graph.nodes
-        assert "B.java:query" in graph.nodes
+        # Full paths prevent both basename and parent-directory collisions.
+        assert "/project/A.java:query" in graph.nodes
+        assert "/project/B.java:query" in graph.nodes
 
-        # scope_map should resolve the objects correctly
-        assert scope_map[id(src_a)] == "A.java:query"
-        assert scope_map[id(snk_b)] == "B.java:query"
+        # Boundary objects get dedicated nodes so equal source/sink variable
+        # names cannot collapse to a zero-length candidate chain.
+        assert scope_map[id(src_a)] == "/project/A.java:__vtc_source_0"
+        assert scope_map[id(snk_b)] == "/project/B.java:__vtc_sink_0"
+        assert graph.has_edge(scope_map[id(src_a)], "/project/A.java:query")
+        assert graph.has_edge("/project/B.java:query", scope_map[id(snk_b)])
 
     @pytest.mark.asyncio
     async def test_same_name_without_call_does_not_create_bridge(self, test_config):
@@ -103,7 +106,7 @@ class TestBuildScopedGraph:
             file_code_map, file_sources, file_sinks,
         )
 
-        assert not graph.has_edge("A.java:data", "B.java:data")
+        assert not graph.has_edge("/project/A.java:data", "/project/B.java:data")
 
     @pytest.mark.asyncio
     async def test_no_bridge_within_same_file(self, test_config):
@@ -170,11 +173,10 @@ class TestBuildScopedGraph:
             file_code_map, file_sources, file_sinks,
         )
 
-        # Disambiguated names should include parent directory
-        assert scope_map[id(src1)] == "mod1/Util.java:data"
-        assert scope_map[id(src2)] == "mod2/Util.java:data"
-        assert "mod1/Util.java:data" in graph.nodes
-        assert "mod2/Util.java:data" in graph.nodes
+        assert scope_map[id(src1)] == "/project/mod1/Util.java:__vtc_source_0"
+        assert scope_map[id(src2)] == "/project/mod2/Util.java:__vtc_source_0"
+        assert "/project/mod1/Util.java:data" in graph.nodes
+        assert "/project/mod2/Util.java:data" in graph.nodes
 
     @pytest.mark.asyncio
     async def test_parameter_passthrough_bridge(self, test_config):
@@ -211,15 +213,17 @@ class TestBuildScopedGraph:
         file_sources = {"/project/Sub.java": [src_a], "/project/Base.java": []}
         file_sinks = {"/project/Sub.java": [], "/project/Base.java": [snk_b]}
 
-        graph, _ = await pipeline._build_scoped_graph(
+        graph, scope_map = await pipeline._build_scoped_graph(
             file_code_map, file_sources, file_sinks,
         )
 
         import networkx as nx
         # The bridge connects the subclass source to the base's same-named param,
-        assert graph.has_edge("Sub.java:fullName", "Base.java:fullName")
+        assert graph.has_edge(
+            "/project/Sub.java:fullName", "/project/Base.java:fullName"
+        )
         # and the full cross-file flow reaches the base sink.
-        assert nx.has_path(graph, "Sub.java:fullName", "Base.java:uploadedFile")
+        assert nx.has_path(graph, scope_map[id(src_a)], scope_map[id(snk_b)])
 
     @pytest.mark.asyncio
     async def test_bridge_does_not_borrow_source_from_another_method(self, test_config):

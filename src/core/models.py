@@ -230,6 +230,8 @@ class TaintChain(BaseModel):
         vulnerability_type: Type of vulnerability represented.
         sanitizers_on_path: List of sanitizers found along the path.
         verification_status: Result of verification (if verified).
+        verification_method: Independent verification method used.
+        verification_details: Human-readable verification or rejection reason.
     """
 
     id: str
@@ -241,6 +243,11 @@ class TaintChain(BaseModel):
     vulnerability_type: VulnerabilityType
     sanitizers_on_path: List[Sanitizer] = Field(default_factory=list)
     verification_status: Optional[VerificationStatus] = None
+    verification_method: Optional[str] = None
+    verification_details: Optional[str] = None
+    cfg_verification_status: Optional[VerificationStatus] = None
+    symbolic_verification_status: Optional[VerificationStatus] = None
+    verification_confidence: Optional[float] = None
 
     @field_validator("confidence")
     @classmethod

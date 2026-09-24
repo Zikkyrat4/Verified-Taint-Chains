@@ -10,11 +10,13 @@ Strategy:
    - If disabled -> return UNVERIFIABLE
 """
 
-from typing import Dict, List, Optional
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-from src.core.models import TaintChain, VerificationStatus
 from src.core.config import PipelineConfig
+from src.core.models import TaintChain, VerificationStatus
 from src.stage3_verification.cfg_verifier import CFGVerifier
 from src.stage3_verification.symbolic_executor import SymbolicExecutor
 from src.utils.logger import get_logger
@@ -100,12 +102,15 @@ class VerificationEngine:
                 backend=None,  # Auto-detect
                 timeout=symbolic_timeout
             )
-            logger.info("Symbolic execution enabled")
+            logger.debug("Symbolic execution enabled")
         else:
             self.symbolic_executor = None
-            logger.info("Symbolic execution disabled (set symbolic_execution_enabled=True to enable)")
+            logger.debug(
+                "Symbolic execution disabled "
+                "(set symbolic_execution_enabled=True to enable)"
+            )
 
-        logger.info(
+        logger.debug(
             f"Initialized VerificationEngine: "
             f"cfg_enabled=True, "
             f"symbolic_enabled={config.symbolic_execution_enabled}"
@@ -134,18 +139,21 @@ class VerificationEngine:
         if chain.sanitizers_on_path:
             max_eff = max(s.effectiveness for s in chain.sanitizers_on_path)
             if max_eff >= 0.9:
-                logger.info(
+                logger.debug(
                     f"✗ Sanitizer reject: {chain.source.variable_name} -> "
                     f"{chain.sink.variable_name} (effectiveness={max_eff:.0%})"
                 )
-                chain.verification_status = VerificationStatus.FALSE
-                return VerificationResult(
+                result = VerificationResult(
                     status=VerificationStatus.FALSE,
                     cfg_status=VerificationStatus.FALSE,
                     confidence=max_eff,
                     method_used="sanitizer",
-                    details=f"Effective sanitizer detected (effectiveness={max_eff:.0%})",
+                    details=(
+                        "Effective sanitizer detected "
+                        f"(effectiveness={max_eff:.0%})"
+                    ),
                 )
+                return self._attach_result(chain, result)
 
         # ========== LEVEL 1: CFG Check (Fast) ==========
         cfg_status = self.cfg_verifier.verify_chain(chain, source_code)
@@ -153,7 +161,14 @@ class VerificationEngine:
         # The lightweight CFG parser is conservative and incomplete. Failure
         # to find a route is not proof that the route is impossible.
         if cfg_status == VerificationStatus.FALSE:
-            logger.info(
+            if self.cfg_verifier.limit_exceeded:
+                details = (
+                    "Lightweight CFG skipped due to complexity limit: "
+                    f"{self.cfg_verifier.limit_reason}"
+                )
+            else:
+                details = "Lightweight CFG could not establish reachability"
+            logger.debug(
                 f"? CFG could not establish reachability: "
                 f"{chain.source.variable_name} -> {chain.sink.variable_name}"
             )
@@ -163,10 +178,20 @@ class VerificationEngine:
                 symbolic_status=None,
                 confidence=0.4,
                 method_used="cfg",
-                details="Lightweight CFG could not establish reachability"
+                details=details,
             )
-            chain.verification_status = result.status
-            return result
+            return self._attach_result(chain, result)
+
+        if self.config.verification_level == "cfg":
+            result = VerificationResult(
+                status=VerificationStatus.VERIFIED,
+                cfg_status=cfg_status,
+                symbolic_status=None,
+                confidence=0.8,
+                method_used="cfg",
+                details="Independent source CFG establishes control-flow reachability",
+            )
+            return self._attach_result(chain, result)
 
         # ========== LEVEL 2: Symbolic Execution (Slow, Optional) ==========
         if self.config.symbolic_execution_enabled and self.symbolic_executor:
@@ -203,8 +228,7 @@ class VerificationEngine:
             )
 
         else:
-            # Symbolic execution not enabled
-            logger.debug("Symbolic execution disabled, returning based on CFG only")
+            logger.debug("Symbolic execution required but disabled")
 
             result = VerificationResult(
                 status=VerificationStatus.UNVERIFIABLE,
@@ -212,18 +236,30 @@ class VerificationEngine:
                 symbolic_status=None,
                 confidence=0.6,  # Medium confidence with CFG only
                 method_used="cfg",
-                details="CFG reachable, but symbolic execution disabled (enable for higher confidence)"
+                details="CFG reachable, but required symbolic execution is disabled"
             )
 
-        # Update chain with verification status
-        chain.verification_status = result.status
+        self._attach_result(chain, result)
 
-        logger.info(
+        logger.debug(
             f"Verification complete: {chain.source.variable_name} -> "
             f"{chain.sink.variable_name} = {result.status.value} "
             f"(confidence: {result.confidence:.2f}, method: {result.method_used})"
         )
 
+        return result
+
+    @staticmethod
+    def _attach_result(
+        chain: TaintChain, result: VerificationResult
+    ) -> VerificationResult:
+        """Persist verification evidence on the chain for downstream reports."""
+        chain.verification_status = result.status
+        chain.verification_method = result.method_used
+        chain.verification_details = result.details
+        chain.cfg_verification_status = result.cfg_status
+        chain.symbolic_verification_status = result.symbolic_status
+        chain.verification_confidence = result.confidence
         return result
 
     def verify_all_chains(
@@ -240,7 +276,7 @@ class VerificationEngine:
         Returns:
             Dictionary with verification results and statistics.
         """
-        logger.info(f"Verifying {len(chains)} chains with VerificationEngine...")
+        logger.debug(f"Verifying {len(chains)} chains with VerificationEngine...")
 
         verified: List[TaintChain] = []
         false: List[TaintChain] = []
@@ -272,7 +308,7 @@ class VerificationEngine:
             "cfg+symbolic": sum(1 for r in results if r.method_used == "cfg+symbolic"),
         }
 
-        logger.info(
+        logger.debug(
             f"✓ Verification complete: "
             f"{len(verified)} verified, "
             f"{len(false)} false, "
@@ -288,6 +324,84 @@ class VerificationEngine:
             "avg_confidence": avg_confidence,
             "method_counts": method_counts,
             "results": results,
+        }
+
+    def verify_all_chains_scoped(
+        self,
+        chains: list[TaintChain],
+        file_code_map: Mapping[str, str],
+    ) -> dict:
+        """Verify project chains against only the files they actually touch.
+
+        Building the lightweight CFG from an entire project is both
+        semantically ambiguous and unbounded for large batches. Chains that
+        share the same file set are grouped so each relevant CFG is still
+        built only once.
+        """
+        normalized_files = {
+            path.replace("\\", "/"): path for path in file_code_map
+        }
+
+        def resolve_path(reported: str) -> str | None:
+            normalized = reported.replace("\\", "/")
+            if normalized in normalized_files:
+                return normalized_files[normalized]
+            matches = [
+                original
+                for candidate, original in normalized_files.items()
+                if candidate.endswith("/" + normalized)
+                or normalized.endswith("/" + candidate)
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+        groups: dict[tuple[str, ...], list[TaintChain]] = defaultdict(list)
+        for chain in chains:
+            nodes = [chain.source, *chain.path, chain.sink]
+            paths = {
+                resolved
+                for node in nodes
+                if (resolved := resolve_path(node.location.file_path)) is not None
+            }
+            groups[tuple(sorted(paths))].append(chain)
+
+        logger.info(
+            f"Scoped verification: {len(chains)} chains in {len(groups)} file group(s)"
+        )
+
+        combined = {
+            "verified": [],
+            "false": [],
+            "unverifiable": [],
+            "results": [],
+        }
+        for paths, grouped_chains in groups.items():
+            source_code = "\n".join(file_code_map[path] for path in paths)
+            group_result = self.verify_all_chains(grouped_chains, source_code)
+            for key in combined:
+                combined[key].extend(group_result[key])
+
+        results = combined["results"]
+        total = len(chains)
+        method_counts = {
+            "sanitizer": sum(result.method_used == "sanitizer" for result in results),
+            "cfg": sum(result.method_used == "cfg" for result in results),
+            "cfg+symbolic": sum(
+                result.method_used == "cfg+symbolic" for result in results
+            ),
+        }
+        logger.info(
+            f"Scoped verification complete: {len(combined['verified'])} confirmed, "
+            f"{len(combined['unverifiable'])} unverifiable, "
+            f"{len(combined['false'])} rejected"
+        )
+        return {
+            **combined,
+            "total": total,
+            "verification_rate": len(combined["verified"]) / total if total else 0.0,
+            "avg_confidence": (
+                sum(result.confidence for result in results) / total if total else 0.0
+            ),
+            "method_counts": method_counts,
         }
 
     def get_statistics(self) -> Dict:

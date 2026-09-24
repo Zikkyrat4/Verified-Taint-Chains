@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,73 +11,19 @@ import click
 
 from src.core.config import load_config_from_env
 from src.core.models import SinkCategory
+from src.evaluation.benchmarks.cli import benchmark
 from src.evaluation.engine import run_evaluation_command
 from src.pipeline.orchestrator import SimplePipeline
+from src.pipeline.source_discovery import count_all_java, find_java_files
 from src.stage1_llm_inference.spec_cache import default_cache_dir
 from src.utils.logger import configure_logging, get_logger
 
 logger = get_logger()
 
 
-# Directory names that are never application source: build output (which often
-# duplicates all of src/main), generated code, vendored deps, IDE/SCM metadata.
-# Matched as path components — analyzing them just wastes an LLM call per file.
-_EXCLUDED_DIRS = frozenset({
-    "target", "build", "out", "bin", "dist",
-    "node_modules", "generated-sources", "generated", "generated-test-sources",
-    ".git", ".idea", ".gradle", ".mvn", ".settings", ".svn",
-})
-
-# Conventional test file names (JUnit/Maven Surefire/Failsafe).
-_TEST_FILE_RE = re.compile(r"(?:Test|Tests|IT|TestCase)\.java$")
-
-
-def _is_test_path(rel_parts: tuple, name: str) -> bool:
-    """True if a file is test code (Maven/Gradle layout or conventional name)."""
-    # Maven/Gradle test source roots: src/test/**, src/integration-test/**, ...
-    for i in range(len(rel_parts) - 1):
-        if rel_parts[i] == "src" and rel_parts[i + 1] in (
-            "test", "integration-test", "testFixtures", "androidTest"
-        ):
-            return True
-    return bool(_TEST_FILE_RE.search(name))
-
-
-def _find_java_files(path: str, include_tests: bool = False) -> List[str]:
-    """Find .java files recursively, skipping non-application code.
-
-    Always skips build output / generated / vendored / IDE-SCM directories
-    (see ``_EXCLUDED_DIRS``). Test code (``src/test/**``, ``*Test.java``, ...)
-    is also skipped unless ``include_tests=True``.
-
-    Excluding these is standard scoping of the application under analysis — it
-    never hides a source/sink in production code — and it avoids wasting an LLM
-    call per file on duplicated build output and generated/vendored code.
-
-    A single file path is returned as-is (explicit targeting wins).
-    """
-    p = Path(path)
-    if p.is_file():
-        return [str(p)]
-
-    result: List[str] = []
-    for f in p.rglob("*.java"):
-        rel_parts = f.relative_to(p).parts
-        # Skip if any *directory* component (exclude the filename) is excluded.
-        if any(part in _EXCLUDED_DIRS for part in rel_parts[:-1]):
-            continue
-        if not include_tests and _is_test_path(rel_parts, f.name):
-            continue
-        result.append(str(f))
-    return sorted(result)
-
-
-def _count_all_java(path: str) -> int:
-    """Total .java files under a directory, before any exclusion (for display)."""
-    p = Path(path)
-    if p.is_file():
-        return 1
-    return sum(1 for _ in p.rglob("*.java"))
+# Compatibility aliases retained for existing imports and tests.
+_find_java_files = find_java_files
+_count_all_java = count_all_java
 
 
 def _apply_cache_settings(
@@ -152,6 +97,9 @@ def cli():
       vtc analyze code.java --llm-provider ollama
     """
     pass
+
+
+cli.add_command(benchmark)
 
 
 @cli.command()
@@ -417,7 +365,7 @@ async def _analyze(
             config.max_files = max_files
 
         if max_concurrent > 0:
-            config.max_concurrent_files = max_concurrent
+            config.max_concurrent_llm_requests = max_concurrent
 
         # Resolve cache settings. CLI flags override env. cache_dir default
         # depends on the target source path, so it can only be picked here.
@@ -625,7 +573,7 @@ async def _sinks(
         if max_files > 0:
             config.max_files = max_files
         if max_concurrent > 0:
-            config.max_concurrent_files = max_concurrent
+            config.max_concurrent_llm_requests = max_concurrent
 
         _apply_cache_settings(config, source_path, no_cache, cache_dir)
 
@@ -748,13 +696,21 @@ def _display_results(result: dict, verbose: bool):
     click.echo(f"Sinks found: {metrics['sinks_found']}")
     click.echo(f"Chains discovered: {metrics['chains_found']}")
     click.echo(f"Chains verified: {metrics['chains_verified']}")
+    if "chains_unverifiable" in metrics:
+        click.echo(f"Chains unverifiable: {metrics['chains_unverifiable']}")
+    if "chains_rejected" in metrics:
+        click.echo(f"Chains rejected: {metrics['chains_rejected']}")
     click.echo(f"Verification rate: {metrics['verification_rate']:.1%}")
     click.echo(f"Explanations generated: {metrics['explanations_generated']}")
 
     verified_chains = result["verified_chains"]
 
     if not verified_chains:
-        click.echo("\n✓ No vulnerabilities found")
+        click.echo("\nNo confirmed vulnerabilities found")
+        if metrics.get("chains_unverifiable"):
+            click.echo(
+                f"Unconfirmed candidates: {metrics['chains_unverifiable']}"
+            )
         return
 
     click.echo(f"\n{'='*70}")
@@ -1033,6 +989,8 @@ def _save_results_stage1_snapshot(
         "sanitizers_found": len(sanitizers),
         "chains_found": 0,
         "chains_verified": 0,
+        "chains_unverifiable": 0,
+        "chains_rejected": 0,
         "verification_rate": 0.0,
         "explanations_generated": 0,
         "graph_nodes": 0,

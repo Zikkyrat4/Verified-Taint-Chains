@@ -1,5 +1,6 @@
 """Simple path discovery using BFS on a data flow graph."""
 
+import hashlib
 import re
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -10,6 +11,116 @@ from src.core.types import Variables
 from src.utils.logger import get_logger
 
 logger = get_logger()
+
+
+def stable_chain_id(
+    source: Source,
+    sink: Sink,
+    path_nodes: List[str],
+) -> str:
+    """Build a deterministic ID from endpoint locations and the graph path."""
+    source_location = source.location
+    sink_location = sink.location
+    identity = "\0".join([
+        source_location.file_path or "",
+        str(source_location.line_number or 0),
+        source_location.function_name or "",
+        source.variable_name or "",
+        sink_location.file_path or "",
+        str(sink_location.line_number or 0),
+        sink_location.function_name or "",
+        sink.variable_name or "",
+        sink.vulnerability_type.value,
+        *path_nodes,
+    ])
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+    return f"{source.variable_name}_to_{sink.variable_name}_{digest}"
+
+
+def candidate_pair_priority(source: Source, sink: Sink) -> Tuple[object, ...]:
+    """Rank endpoint pairs without relying on benchmark-specific knowledge."""
+    source_location = source.location
+    sink_location = sink.location
+    stable_identity = "\0".join([
+        source_location.file_path or "",
+        str(source_location.line_number or 0),
+        source_location.function_name or "",
+        source.variable_name or "",
+        sink_location.file_path or "",
+        str(sink_location.line_number or 0),
+        sink_location.function_name or "",
+        sink.variable_name or "",
+        sink.vulnerability_type.value,
+    ])
+    return (
+        (source.confidence + sink.confidence) / 2.0,
+        source.confidence,
+        sink.confidence,
+        stable_identity,
+    )
+
+
+def _display_node_name(graph: nx.DiGraph, node_name: str) -> str:
+    """Return the source identifier stored on a possibly scoped graph node."""
+    if node_name in graph:
+        variable_name = graph.nodes[node_name].get("variable_name")
+        if variable_name:
+            return str(variable_name)
+    return node_name.rsplit(":", 1)[-1]
+
+
+def _intermediate_path_node(
+    graph: nx.DiGraph,
+    node_name: str,
+    previous: Optional[str],
+    following: Optional[str],
+    fallback: CodeLocation,
+) -> PathNode:
+    """Build an intermediate node from graph evidence, never fabricated lines."""
+    data = graph.nodes[node_name] if node_name in graph else {}
+    edge_candidates = []
+    if previous in graph and node_name in graph and graph.has_edge(previous, node_name):
+        edge_candidates.append(graph[previous][node_name])
+    if following in graph and node_name in graph and graph.has_edge(node_name, following):
+        edge_candidates.append(graph[node_name][following])
+
+    def first_value(*keys: str) -> object:
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, "", 0):
+                return value
+        for edge in edge_candidates:
+            for key in keys:
+                value = edge.get(key)
+                if value not in (None, "", 0):
+                    return value
+        return None
+
+    raw_line = first_value("line", "line_number", "call_line")
+    try:
+        line_number = max(1, int(raw_line or fallback.line_number))
+    except (TypeError, ValueError):
+        line_number = fallback.line_number
+    location = CodeLocation(
+        file_path=str(first_value("file_path", "caller_file") or fallback.file_path),
+        line_number=line_number,
+        function_name=(
+            str(first_value("function_name", "caller_function"))
+            if first_value("function_name", "caller_function")
+            else fallback.function_name
+        ),
+        class_name=(
+            str(first_value("class_name"))
+            if first_value("class_name")
+            else fallback.class_name
+        ),
+    )
+    return PathNode(
+        location=location,
+        variable_name=_display_node_name(graph, node_name),
+        node_type="intermediate",
+        code_snippet=str(data.get("code_snippet", "") or ""),
+    )
 
 
 class SimpleGraphBuilder:
@@ -66,7 +177,10 @@ class SimpleGraphBuilder:
             if source_var in graph and target_var in graph:
                 graph.add_edge(source_var, target_var)
 
-        logger.info(f"Built graph with {graph.number_of_nodes()} nodes and {graph.number_of_edges()} edges")
+        logger.debug(
+            f"Built graph with {graph.number_of_nodes()} nodes and "
+            f"{graph.number_of_edges()} edges"
+        )
 
         return graph
 
@@ -273,6 +387,10 @@ class SimpleBFSPathFinder:
             graph: NetworkX DiGraph representing data flow.
         """
         self.graph = graph
+        self.limit_exceeded = False
+        self.reachable_pairs_seen = 0
+        self.candidate_pairs_ranked = 0
+        self.ranked_out_count = 0
         logger.debug(f"Initialized SimpleBFSPathFinder with graph of {graph.number_of_nodes()} nodes")
 
     def find_path(
@@ -317,6 +435,7 @@ class SimpleBFSPathFinder:
         max_length: int = 15,
         sanitizers: Optional[List[Sanitizer]] = None,
         node_id_map: Optional[Dict[int, str]] = None,
+        max_chains: int = 0,
     ) -> List[TaintChain]:
         """Find all taint chains between sources and sinks.
 
@@ -332,11 +451,17 @@ class SimpleBFSPathFinder:
                 graph node ID (e.g. ``"File.java:varName"``).  When *None*
                 (default) the plain ``variable_name`` is used — fully
                 backward-compatible with the old single-file behaviour.
+            max_chains: Maximum retained candidates. The finder records
+                ``limit_exceeded`` when additional reachable pairs exist.
 
         Returns:
             List of TaintChain objects representing found vulnerabilities.
         """
         chains: List[TaintChain] = []
+        self.limit_exceeded = False
+        self.reachable_pairs_seen = 0
+        self.candidate_pairs_ranked = 0
+        self.ranked_out_count = 0
 
         def _node_id(obj: object) -> str:
             if node_id_map is not None:
@@ -368,6 +493,7 @@ class SimpleBFSPathFinder:
             source_reachable[src_id] = reachable
 
         skipped = 0
+        candidate_pairs: List[Tuple[Tuple[object, ...], Source, Sink]] = []
         for source in sources:
             src_id = _node_id(source)
             reachable = source_reachable.get(src_id, set())
@@ -391,26 +517,48 @@ class SimpleBFSPathFinder:
                     )
                     continue
 
-                logger.debug(f"Checking path: {src_id} -> {sink_id}")
+                candidate_pairs.append(
+                    (candidate_pair_priority(source, sink), source, sink)
+                )
 
-                path_nodes = self.find_path(src_id, sink_id, max_length)
+        candidate_pairs.sort(key=lambda item: item[0], reverse=True)
+        self.candidate_pairs_ranked = len(candidate_pairs)
+        self.reachable_pairs_seen = len(candidate_pairs)
 
-                if path_nodes:
-                    # Filter self-loops: a single-node path means
-                    # source and sink map to the same graph node
-                    # — no actual data flow exists.
-                    if len(path_nodes) <= 1:
-                        logger.debug(
-                            f"Skipping self-loop chain: {src_id} (path length {len(path_nodes)})"
-                        )
-                        continue
+        for pair_index, (_, source, sink) in enumerate(candidate_pairs):
+            src_id = _node_id(source)
+            sink_id = _node_id(sink)
+            logger.debug(f"Checking path: {src_id} -> {sink_id}")
 
-                    # Create TaintChain from path
-                    chain = self._create_chain_from_path(
-                        source, sink, path_nodes, sanitizers or []
+            path_nodes = self.find_path(src_id, sink_id, max_length)
+
+            if path_nodes:
+                # Filter self-loops: a single-node path means
+                # source and sink map to the same graph node
+                # — no actual data flow exists.
+                if len(path_nodes) <= 1:
+                    logger.debug(
+                        f"Skipping self-loop chain: {src_id} "
+                        f"(path length {len(path_nodes)})"
                     )
-                    chains.append(chain)
-                    logger.info(f"Found chain: {src_id} -> {sink_id}")
+                    continue
+
+                # Create TaintChain from path
+                chain = self._create_chain_from_path(
+                    source, sink, path_nodes, sanitizers or [], self.graph
+                )
+                chains.append(chain)
+                logger.debug(f"Found chain: {src_id} -> {sink_id}")
+                if max_chains and len(chains) >= max_chains:
+                    self.ranked_out_count = len(candidate_pairs) - pair_index - 1
+                    self.limit_exceeded = self.ranked_out_count > 0
+                    if self.limit_exceeded:
+                        logger.warning(
+                            "Global top-k candidate selection retained "
+                            f"{max_chains} of {len(candidate_pairs)} ranked "
+                            "graph-reachable endpoint pairs"
+                        )
+                    break
 
         if skipped:
             logger.debug(f"Skipped {skipped} unreachable source-sink pairs via pre-filter")
@@ -423,6 +571,7 @@ class SimpleBFSPathFinder:
         sink: Sink,
         path_nodes: List[str],
         sanitizers: Optional[List[Sanitizer]] = None,
+        graph: Optional[nx.DiGraph] = None,
     ) -> TaintChain:
         """Create a TaintChain object from a path.
 
@@ -439,27 +588,50 @@ class SimpleBFSPathFinder:
         path_objs: List[PathNode] = []
 
         for i, node_name in enumerate(path_nodes):
-            # Strip scope prefix (e.g. "File.java:varName" -> "varName")
-            display_name = node_name.split(":", 1)[-1] if ":" in node_name else node_name
-
             if i == 0:
                 # First node is the source
                 node_type = "source"
                 location = source.location
                 code_snippet = source.code_snippet
+                display_name = source.variable_name
             elif i == len(path_nodes) - 1:
                 # Last node is the sink
                 node_type = "sink"
                 location = sink.location
                 code_snippet = sink.code_snippet
+                display_name = sink.variable_name
             else:
-                # Intermediate nodes
+                if graph is not None:
+                    display_name = _display_node_name(graph, node_name)
+                    from_endpoint = graph.has_edge(path_nodes[i - 1], node_name) and (
+                        graph[path_nodes[i - 1]][node_name].get("edge_type")
+                        == "endpoint_binding"
+                    )
+                    to_endpoint = graph.has_edge(node_name, path_nodes[i + 1]) and (
+                        graph[node_name][path_nodes[i + 1]].get("edge_type")
+                        == "endpoint_binding"
+                    )
+                    if (
+                        from_endpoint and display_name == source.variable_name
+                    ) or (to_endpoint and display_name == sink.variable_name):
+                        continue
+                    path_objs.append(
+                        _intermediate_path_node(
+                            graph,
+                            node_name,
+                            path_nodes[i - 1],
+                            path_nodes[i + 1],
+                            source.location,
+                        )
+                    )
+                    continue
+                # Single-file compatibility for callers that create chains
+                # without retaining the graph. Keep known source scope, but do
+                # not invent a line number.
                 node_type = "intermediate"
-                location = CodeLocation(
-                    file_path=source.location.file_path,
-                    line_number=source.location.line_number + i,
-                )
+                location = source.location.model_copy()
                 code_snippet = ""
+                display_name = node_name.rsplit(":", 1)[-1]
 
             path_obj = PathNode(
                 location=location,
@@ -470,7 +642,7 @@ class SimpleBFSPathFinder:
             path_objs.append(path_obj)
 
         # Create TaintChain
-        chain_id = f"{source.variable_name}_to_{sink.variable_name}_{id(path_nodes)}"
+        chain_id = stable_chain_id(source, sink, path_nodes)
 
         # Calculate confidence as average of source and sink confidence
         confidence = (source.confidence + sink.confidence) / 2.0
@@ -487,7 +659,11 @@ class SimpleBFSPathFinder:
             # Collect chain variable names for variable-aware matching
             chain_vars = {source.variable_name, sink.variable_name}
             for node_name in path_nodes:
-                display = node_name.split(":", 1)[-1] if ":" in node_name else node_name
+                display = (
+                    _display_node_name(graph, node_name)
+                    if graph is not None
+                    else node_name.rsplit(":", 1)[-1]
+                )
                 chain_vars.add(display)
 
             for san in sanitizers:

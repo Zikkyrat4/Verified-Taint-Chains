@@ -64,6 +64,7 @@ def create_llm_client(config: "PipelineConfig") -> BaseLLMClient:
             max_retries=config.llm_max_retries,
             max_tokens=config.llm_max_tokens,
         )
+        client.set_max_concurrent_requests(config.max_concurrent_llm_requests)
         if config.openai_base_url:
             logger.info(
                 f"Created OpenAI client with model: {config.llm_model} "
@@ -79,6 +80,7 @@ def create_llm_client(config: "PipelineConfig") -> BaseLLMClient:
             model=config.llm_model,
             base_url=config.ollama_base_url,
         )
+        client.set_max_concurrent_requests(config.max_concurrent_llm_requests)
         logger.info(
             f"Created Ollama client with model: {config.llm_model} "
             f"at {config.ollama_base_url}"

@@ -158,6 +158,38 @@ def test_context_is_written_to_file(tmp_path: Path) -> None:
     assert "function=handle" in contents
 
 
+def test_file_log_has_one_physical_line_per_plain_record(tmp_path: Path) -> None:
+    log_file = tmp_path / "compact.log"
+    configure_logging(log_file=log_file, stderr=False)
+
+    _emit("info", "FIRST")
+    _emit("info", "SECOND")
+
+    lines = log_file.read_text().splitlines()
+    assert len(lines) == 2
+    assert "FIRST" in lines[0]
+    assert "SECOND" in lines[1]
+
+
+def test_exception_traceback_is_written_without_diagnose_values(tmp_path: Path) -> None:
+    log_file = tmp_path / "exception.log"
+    configure_logging(log_file=log_file, stderr=False)
+
+    patched = get_logger().patch(
+        lambda record: record.update(name="src.test_logger")
+    )
+    try:
+        raise ValueError("BROKEN_VALUE")
+    except ValueError:
+        patched.exception("OPERATION_FAILED")
+    get_logger().complete()
+
+    contents = log_file.read_text()
+    assert "OPERATION_FAILED" in contents
+    assert "Traceback (most recent call last)" in contents
+    assert "ValueError: BROKEN_VALUE" in contents
+
+
 def test_unwritable_log_path_does_not_break_configuration(tmp_path: Path) -> None:
     regular_file = tmp_path / "not-a-directory"
     regular_file.write_text("blocker")

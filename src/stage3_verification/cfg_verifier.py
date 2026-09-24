@@ -1,13 +1,18 @@
 """Control Flow Graph-based verification with proper CFG building."""
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
+
 import networkx as nx
 
 from src.core.models import TaintChain, VerificationStatus
 from src.utils.logger import get_logger
 
 logger = get_logger()
+
+
+class CFGComplexityLimit(RuntimeError):
+    """Raised when the lightweight CFG builder exceeds a safety bound."""
 
 
 class BasicBlock:
@@ -74,18 +79,55 @@ class CFGVerifier:
     considering control flow structures (if/else, loops).
     """
 
-    def __init__(self, max_loop_iterations: int = 10) -> None:
+    def __init__(
+        self,
+        max_loop_iterations: int = 10,
+        max_source_chars: int = 100_000,
+        max_blocks: int = 10_000,
+        max_nesting_depth: int = 200,
+    ) -> None:
         """Initialize CFG verifier.
 
         Args:
             max_loop_iterations: Maximum loop iterations to explore (prevents infinite loops).
+            max_source_chars: Maximum source size accepted by the lightweight parser.
+            max_blocks: Maximum number of CFG blocks to build.
+            max_nesting_depth: Maximum recursive control-flow nesting depth.
         """
         self.max_loop_iterations = max_loop_iterations
+        self.max_source_chars = max_source_chars
+        self.max_blocks = max_blocks
+        self.max_nesting_depth = max_nesting_depth
         self.cfg: Optional[nx.DiGraph] = None
         self.blocks: Dict[int, BasicBlock] = {}
         self.next_block_id = 0
+        self.limit_exceeded = False
+        self.limit_reason = ""
 
-        logger.info(f"Initialized CFGVerifier with max_loop_iterations={max_loop_iterations}")
+        logger.debug(
+            "Initialized CFGVerifier with "
+            f"max_loop_iterations={max_loop_iterations}, "
+            f"max_source_chars={max_source_chars}, max_blocks={max_blocks}"
+        )
+
+    def _reset_cfg(self) -> nx.DiGraph:
+        """Reset all state associated with the previous source unit."""
+        self.cfg = nx.DiGraph()
+        self.blocks = {}
+        self.next_block_id = 0
+        self.limit_exceeded = False
+        self.limit_reason = ""
+        return self.cfg
+
+    def _skip_cfg(self, reason: str) -> nx.DiGraph:
+        """Record a conservative skip instead of risking unbounded memory use."""
+        self.cfg = nx.DiGraph()
+        self.blocks = {}
+        self.next_block_id = 0
+        self.limit_exceeded = True
+        self.limit_reason = reason
+        logger.debug(f"Skipping lightweight CFG verification: {reason}")
+        return self.cfg
 
     def build_cfg(self, source_code: str) -> nx.DiGraph:
         """Build Control Flow Graph from source code.
@@ -104,21 +146,29 @@ class CFGVerifier:
         """
         logger.debug("Building CFG from source code")
 
-        self.cfg = nx.DiGraph()
-        self.blocks = {}
-        self.next_block_id = 0
+        self._reset_cfg()
+
+        source_size = len(source_code)
+        if source_size > self.max_source_chars:
+            return self._skip_cfg(
+                f"source has {source_size} characters; limit is "
+                f"{self.max_source_chars}"
+            )
 
         # Split into lines and clean
         lines = [line.strip() for line in source_code.split('\n') if line.strip()]
 
         if not lines:
-            logger.warning("Empty source code, returning empty CFG")
+            logger.debug("Empty source code, returning empty CFG")
             return self.cfg
 
         # Build CFG by parsing control structures
-        entry_block = self._parse_statements(lines, 0, len(lines))
+        try:
+            self._parse_statements(lines, 0, len(lines))
+        except CFGComplexityLimit as error:
+            return self._skip_cfg(str(error))
 
-        logger.info(
+        logger.debug(
             f"Built CFG: {self.cfg.number_of_nodes()} blocks, "
             f"{self.cfg.number_of_edges()} edges"
         )
@@ -130,7 +180,8 @@ class CFGVerifier:
         lines: List[str],
         start: int,
         end: int,
-        parent_block: Optional[int] = None
+        parent_block: Optional[int] = None,
+        depth: int = 0,
     ) -> int:
         """Parse statements and build CFG blocks.
 
@@ -143,6 +194,11 @@ class CFGVerifier:
         Returns:
             ID of the last block created.
         """
+        if depth > self.max_nesting_depth:
+            raise CFGComplexityLimit(
+                f"control-flow nesting exceeds {self.max_nesting_depth}"
+            )
+
         current_statements: List[str] = []
         i = start
         current_block = parent_block
@@ -161,7 +217,9 @@ class CFGVerifier:
                     current_statements = []
 
                 # Parse if statement
-                current_block = self._parse_if_statement(lines, i, end, current_block)
+                current_block = self._parse_if_statement(
+                    lines, i, end, current_block, depth
+                )
 
                 # Find matching else/closing brace
                 i = self._find_closing_brace(lines, i) + 1
@@ -176,7 +234,9 @@ class CFGVerifier:
                     current_statements = []
 
                 # Parse loop
-                current_block = self._parse_loop(lines, i, end, current_block)
+                current_block = self._parse_loop(
+                    lines, i, end, current_block, depth
+                )
 
                 # Find matching closing brace
                 i = self._find_closing_brace(lines, i) + 1
@@ -200,7 +260,8 @@ class CFGVerifier:
         lines: List[str],
         if_idx: int,
         end: int,
-        parent_block: Optional[int]
+        parent_block: Optional[int],
+        depth: int,
     ) -> int:
         """Parse if/else statement and create CFG branches.
 
@@ -225,14 +286,18 @@ class CFGVerifier:
         if_end = self._find_matching_brace(lines, if_idx)
 
         # Parse if branch
-        if_exit = self._parse_statements(lines, if_start, if_end, condition_block)
+        if_exit = self._parse_statements(
+            lines, if_start, if_end, condition_block, depth + 1
+        )
 
         # Look for else
         else_exit = condition_block
         if if_end < len(lines) and lines[if_end].strip().startswith('else'):
             else_start = if_end + 1
             else_end = self._find_matching_brace(lines, if_end)
-            else_exit = self._parse_statements(lines, else_start, else_end, condition_block)
+            else_exit = self._parse_statements(
+                lines, else_start, else_end, condition_block, depth + 1
+            )
 
         # Create join block
         join_block = self._create_block([])
@@ -253,7 +318,8 @@ class CFGVerifier:
         lines: List[str],
         loop_idx: int,
         end: int,
-        parent_block: Optional[int]
+        parent_block: Optional[int],
+        depth: int,
     ) -> int:
         """Parse while/for loop and create CFG with back edge.
 
@@ -277,7 +343,9 @@ class CFGVerifier:
         loop_end = self._find_matching_brace(lines, loop_idx)
 
         # Parse loop body
-        loop_body_exit = self._parse_statements(lines, loop_start, loop_end, loop_header)
+        loop_body_exit = self._parse_statements(
+            lines, loop_start, loop_end, loop_header, depth + 1
+        )
 
         # Add back edge from loop body to header
         if loop_body_exit is not None:
@@ -298,6 +366,11 @@ class CFGVerifier:
         Returns:
             Block ID.
         """
+        if self.next_block_id >= self.max_blocks:
+            raise CFGComplexityLimit(
+                f"CFG block count exceeds {self.max_blocks}"
+            )
+
         block_id = self.next_block_id
         self.next_block_id += 1
 
@@ -505,15 +578,15 @@ class CFGVerifier:
         )
 
         if is_reachable:
-            logger.info(
-                f"✓ CFG verification: {chain.source.variable_name} -> "
-                f"{chain.sink.variable_name} VERIFIED"
+            logger.debug(
+                f"CFG reachability established: {chain.source.variable_name} -> "
+                f"{chain.sink.variable_name}"
             )
             return VerificationStatus.VERIFIED
         else:
-            logger.info(
-                f"✗ CFG verification: {chain.source.variable_name} -> "
-                f"{chain.sink.variable_name} FALSE"
+            logger.debug(
+                f"CFG reachability not established: {chain.source.variable_name} -> "
+                f"{chain.sink.variable_name}"
             )
             return VerificationStatus.FALSE
 
@@ -528,6 +601,8 @@ class CFGVerifier:
                 "built": False,
                 "blocks": 0,
                 "edges": 0,
+                "limit_exceeded": self.limit_exceeded,
+                "limit_reason": self.limit_reason,
             }
 
         # Count edge types
@@ -542,4 +617,6 @@ class CFGVerifier:
             "edges": self.cfg.number_of_edges(),
             "edge_types": edge_types,
             "variables": sum(len(block.variables) for block in self.blocks.values()),
+            "limit_exceeded": self.limit_exceeded,
+            "limit_reason": self.limit_reason,
         }

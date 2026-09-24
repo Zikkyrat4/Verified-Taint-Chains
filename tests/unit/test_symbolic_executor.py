@@ -1,13 +1,23 @@
 """Tests for SymbolicExecutor."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
 
 from src.core.models import (
-    TaintChain, Source, Sink, PathNode, CodeLocation, VulnerabilityType, VerificationStatus,
+    CodeLocation,
+    PathNode,
+    Sink,
+    Source,
+    TaintChain,
+    VerificationStatus,
+    VulnerabilityType,
 )
 from src.stage3_verification.symbolic_executor import (
-    SymbolicExecutor, SymbolicBackend, SymbolicVariable, PathConstraints,
+    PathConstraints,
+    SymbolicBackend,
+    SymbolicExecutor,
+    SymbolicVariable,
 )
 
 
@@ -224,6 +234,98 @@ class TestSymbolicExecutor:
             'result = "prefix" + input;', "input", "result", pc
         )
         assert constraint is not None
+
+    def test_extract_constraint_models_syntactic_method_transformation(self):
+        try:
+            import z3  # noqa: F401
+        except ImportError:
+            pytest.skip("Z3 not available")
+
+        executor = SymbolicExecutor()
+        constraints = PathConstraints()
+        constraints.add_variable("input", "String")
+        constraints.add_variable("normalized", "String")
+
+        constraint = executor._extract_constraint_from_statement(
+            "String normalized = normalize(input);",
+            "input",
+            "normalized",
+            constraints,
+        )
+
+        assert constraint is not None
+
+    def test_constant_ternary_rejects_unreachable_tainted_branch(self):
+        try:
+            import z3  # noqa: F401
+        except ImportError:
+            pytest.skip("Z3 not available")
+
+        source = Source(
+            location=CodeLocation(file_path="Safe.java", line_number=1),
+            variable_name="param",
+            type="user_input",
+            confidence=0.9,
+            code_snippet='String param = request.getParameter("x");',
+        )
+        sink = Sink(
+            location=CodeLocation(file_path="Safe.java", line_number=3),
+            variable_name="bar",
+            type="file_read",
+            confidence=0.9,
+            code_snippet="read(bar);",
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+        )
+        chain = TaintChain(
+            id="constant-ternary",
+            source=source,
+            sink=sink,
+            path=[
+                PathNode(
+                    variable_name="param",
+                    location=source.location,
+                    node_type="source",
+                    code_snippet=source.code_snippet,
+                ),
+                PathNode(
+                    variable_name="bar",
+                    location=sink.location,
+                    node_type="sink",
+                    code_snippet="String bar;",
+                ),
+            ],
+            length=2,
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+            confidence=0.9,
+        )
+        code = """int num = 106;
+bar = (7 * 18) + num > 200 ? "safe" : param;
+read(bar);"""
+
+        executor = SymbolicExecutor()
+        assert executor.execute_path(chain, code) == VerificationStatus.FALSE
+
+    def test_unknown_ternary_keeps_possible_tainted_branch(self):
+        try:
+            import z3  # noqa: F401
+        except ImportError:
+            pytest.skip("Z3 not available")
+
+        executor = SymbolicExecutor()
+        constraints = PathConstraints()
+        result = executor._extract_constraint_from_statement(
+            'bar = flag ? "safe" : param;',
+            "param",
+            "bar",
+            constraints,
+        )
+
+        assert result is not None
+
+    def test_ternary_parser_rejects_colon_before_question_mark(self):
+        expression = 'String.format("%s:%s", key, value) ? fallback'
+
+        assert SymbolicExecutor._split_ternary(expression) is None
 
     def test_parse_condition_greater_than(self):
         try:

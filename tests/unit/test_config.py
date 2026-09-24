@@ -23,7 +23,11 @@ class TestPipelineConfig:
         assert config.symbolic_execution_enabled is False
         assert config.verification_level == "cfg"
         assert config.symbolic_timeout == 60
+        assert config.openai_timeout == 300.0
         assert config.llm_batch_max_chars == 8000
+        assert config.llm_truncation_max_tokens == 16000
+        assert config.max_concurrent_llm_requests == 5
+        assert config.max_candidate_chains == 10000
         assert config.analysis_backend == "llm"
         assert config.llm_analysis_mode == "targeted"
         assert config.cache_read_enabled is True
@@ -66,6 +70,22 @@ class TestPipelineConfig:
     def test_config_validation_invalid_llm_batch_size(self) -> None:
         with pytest.raises(ValueError, match="llm_batch_max_chars"):
             PipelineConfig(llm_api_key="test", llm_batch_max_chars=-1)
+
+    def test_config_validation_truncation_budget_covers_default(self) -> None:
+        with pytest.raises(ValueError, match="llm_truncation_max_tokens"):
+            PipelineConfig(
+                llm_api_key="test",
+                llm_max_tokens=4000,
+                llm_truncation_max_tokens=2000,
+            )
+
+    def test_config_validation_global_llm_limit_is_positive(self) -> None:
+        with pytest.raises(ValueError, match="max_concurrent_llm_requests"):
+            PipelineConfig(llm_api_key="test", max_concurrent_llm_requests=0)
+
+    def test_config_validation_candidate_limit_is_positive(self) -> None:
+        with pytest.raises(ValueError, match="max_candidate_chains"):
+            PipelineConfig(llm_api_key="test", max_candidate_chains=0)
 
     def test_config_validation_invalid_llm_analysis_mode(self) -> None:
         with pytest.raises(ValueError, match="llm_analysis_mode"):

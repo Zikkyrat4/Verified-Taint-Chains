@@ -1,6 +1,6 @@
 # VTC — Verified Taint Chains
 
-LLM-first инструмент анализа безопасности Java-кода. LLM обнаруживает границы taint-потока, после чего детерминированные этапы строят и верифицируют цепочки распространения данных (taint chains).
+LLM инструмент анализа безопасности Java-кода. LLM обнаруживает границы taint-потока, после чего детерминированные этапы строят и верифицируют цепочки распространения данных (taint chains).
 
 ## Как это работает
 
@@ -72,7 +72,7 @@ vtc analyze code.java --pathfinding-algorithm bfs
 
 Полный список команд: `vtc --help`; опции анализа: `vtc analyze --help`.
 
-### Оценка на реальных CVE
+### Локальный regression-набор
 
 Набор фикстур с реальными уязвимостями лежит в `tests/fixtures/real_world/`
 (5 проектов). Запуск оценочного прогона:
@@ -99,6 +99,32 @@ vtc evaluate --all-projects --backend static --phase-label static-honest
 .java-файлом(-ами). Схема и список покрытых CWE:
 [`tests/fixtures/real_world/README.md`](tests/fixtures/real_world/README.md).
 
+### Стандартные внешние benchmark-и
+
+OWASP BenchmarkJava и CWE-Bench-Java запускаются через тот же `vtc`, но не
+смешиваются с локальными regression-фикстурами:
+
+```bash
+# Показать зафиксированные версии и состояние локальных данных
+vtc benchmark list
+vtc benchmark validate
+
+# OWASP: repository уже содержит исходники и oracle
+vtc benchmark fetch owasp-java
+vtc benchmark run owasp-java --backend llm
+
+# CWE-Bench: сначала metadata, затем точные vulnerable revisions проектов
+vtc benchmark fetch cwe-bench-java
+vtc benchmark prepare cwe-bench-java --cwe CWE-22 --limit 10 --seed 42
+vtc benchmark run cwe-bench-java --cwe CWE-22 --limit 10 --seed 42 --backend llm
+```
+
+Без `--limit` запускается полный отфильтрованный набор. По умолчанию берутся
+только заявленные VTC классы CWE; `--all-cwes` явно расширяет область. Внешние
+репозитории хранятся в `.vtc-benchmarks/`, а JSON/Markdown-отчеты — в
+`evaluation/benchmarks/`. Архитектура, scoring и ограничения сравнимости
+описаны в [`docs/benchmarks.md`](docs/benchmarks.md).
+
 ## Конфигурация
 
 Настройки загружаются из файла `.env`. Основные параметры:
@@ -107,14 +133,16 @@ vtc evaluate --all-projects --backend static --phase-label static-honest
 |-----------|----------|-------------|
 | `LLM_PROVIDER` | `openai` или `ollama` | `openai` |
 | `OPENAI_API_KEY` | API-ключ OpenAI | — |
-| `OPENAI_TIMEOUT` | Таймаут одного OpenAI-запроса, сек. | `60` |
+| `OPENAI_TIMEOUT` | Таймаут одного OpenAI-запроса, сек. | `300` |
 | `OPENAI_JSON_MODE` | Запрашивать структурированный JSON-ответ | `true` |
 | `OPENAI_THINKING` | `enabled`/`disabled`; для `glm-*` автоматически `disabled` | auto |
 | `LLM_MAX_RETRIES` | Максимум попыток LLM-запроса | `2` |
+| `LLM_TRUNCATION_MAX_TOKENS` | Верхний предел ответа при повторе усеченного запроса | `16000` |
 | `LLM_BATCH_MAX_CHARS` | Максимальный размер файлового LLM-batch | `8000` |
 | `ANALYSIS_BACKEND` | `llm`, `static` или `hybrid`; метрики режимов не смешиваются | `llm` |
 | `LLM_ANALYSIS_MODE` | `targeted` или `exhaustive` | `targeted` |
 | `MAX_CONCURRENT_FUNCTIONS` | Параллельные функции внутри файла | `2` |
+| `MAX_CONCURRENT_LLM_REQUESTS` | Общий предел одновременных запросов к провайдеру | `5` |
 | `LOG_LEVEL` | Уровень stderr и файлового лога | `INFO` |
 | `LOG_FILE` | Путь к логу; `off` отключает файл | `~/.local/state/vtc/vtc.log` |
 | `LLM_MODEL` | Название модели | `gpt-4-turbo` / `llama3:latest` |
@@ -122,12 +150,15 @@ vtc evaluate --all-projects --backend static --phase-label static-honest
 | `VERIFICATION_LEVEL` | `cfg`, `symbolic` или `both` | `cfg` |
 | `MIN_CONFIDENCE` | Порог уверенности (0.0–1.0) | `0.5` |
 | `MAX_PATH_LENGTH` | Макс. длина пути | `15` |
+| `MAX_CANDIDATE_CHAINS` | Предел сохраняемых кандидатов; переполнение явно помечает неполный анализ | `10000` |
 
 Подробнее: [docs/configuration.md](docs/configuration.md)
 
 В режиме по умолчанию `ANALYSIS_BACKEND=llm` статические эвристики не создают
 `source` или `sink`. `static` предназначен только для отдельного baseline,
 `hybrid` — для явно помеченного ablation-эксперимента.
+В итоговые findings и benchmark scoring входят только цепочки со статусом
+`verified`; кандидаты `unverifiable` сохраняются отдельно для диагностики.
 
 ## Структура проекта
 
@@ -139,6 +170,7 @@ src/
 ├── stage3_verification/        # CFG-верификатор, символьное выполнение
 ├── stage4_explanation/         # Шаблоны объяснений, генератор
 ├── pipeline/                   # Оркестратор, CLI
+├── evaluation/benchmarks/      # Адаптеры внешних benchmark-ов
 └── utils/                      # Логирование, утилиты
 tests/
 ├── unit/                       # Модульные тесты

@@ -211,6 +211,7 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
         "llm_model": config.llm_model if uses_llm else "n/a",
         "min_confidence": config.min_confidence,
         "max_path_length": config.max_path_length,
+        "max_candidate_chains": config.max_candidate_chains,
         "pathfinding_algorithm": config.pathfinding_algorithm,
         "verification_enabled": config.verification_enabled,
         "verification_level": config.verification_level,
@@ -224,14 +225,19 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
         "llm_batch_max_chars": config.llm_batch_max_chars,
         "max_concurrent_files": config.max_concurrent_files,
         "max_concurrent_functions": config.max_concurrent_functions,
+        "max_concurrent_llm_requests": config.max_concurrent_llm_requests,
         "max_files": config.max_files,
         "cache_enabled": config.cache_enabled,
         "cache_read_enabled": config.cache_read_enabled,
         "openai_timeout": config.openai_timeout if uses_llm else "n/a",
         "llm_max_retries": config.llm_max_retries if uses_llm else "n/a",
         "llm_max_tokens": config.llm_max_tokens if uses_llm else "n/a",
+        "llm_truncation_max_tokens": (
+            config.llm_truncation_max_tokens if uses_llm else "n/a"
+        ),
         "openai_json_mode": config.openai_json_mode if uses_llm else "n/a",
         "openai_thinking": effective_thinking if uses_llm else "n/a",
+        "verification_result_policy": "verified_only",
         "evaluation_policy": {
             "all_labelled_true_positives": True,
             "exact_endpoint_identifiers": True,
@@ -241,6 +247,11 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
             "one_to_one_matching": True,
         },
     }
+
+
+def analysis_metadata(config: Any) -> Dict[str, Any]:
+    """Public metadata serializer shared by first- and third-party evaluators."""
+    return _analysis_metadata(config)
 
 
 # ---------------------------------------------------------------------------
@@ -859,7 +870,7 @@ def run_evaluation_command(
     analysis_backend: Optional[str] = None,
     llm_analysis_mode: Optional[str] = None,
 ) -> int:
-    """Run an evaluation request shared by Click and the legacy wrapper."""
+    """Run a regression-fixture evaluation request from the Click command."""
     if diff_paths:
         print(_diff(*diff_paths))
         return 0

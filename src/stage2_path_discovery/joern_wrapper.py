@@ -37,6 +37,8 @@ class JoernWrapper:
         fallback_builder: EnhancedGraphBuilder for fallback analysis.
     """
 
+    _fallback_warning_emitted = False
+
     def __init__(self) -> None:
         """Initialize Joern wrapper, detecting if Joern is available."""
         self.joern_available = self._check_joern_available()
@@ -44,11 +46,12 @@ class JoernWrapper:
 
         if self.joern_available:
             logger.info("Joern integration enabled")
-        else:
+        elif not self.__class__._fallback_warning_emitted:
             logger.warning(
                 "Joern not available, will use EnhancedGraphBuilder fallback. "
                 "To enable Joern, install from https://joern.io"
             )
+            self.__class__._fallback_warning_emitted = True
 
     def build_graph(
         self, source_code: str, sources: List[Source], sinks: List[Sink]

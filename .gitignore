@@ -95,11 +95,17 @@ check_installation.py
 /evaluation_*.json
 /evaluation_*.md
 .vtc-cache/
+.vtc-benchmarks/
+/evaluation/benchmarks/**/*.json
+/evaluation/benchmarks/**/*.md
+/evaluation/benchmarks/**/*.bak
 
 # Temporary analysis outputs
 *.cpg
 *.bin
 
+# Agents
 .claude
 .codex
 CLAUDE.md
+.agents

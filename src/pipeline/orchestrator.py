@@ -10,26 +10,33 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import networkx as nx
 
 from src.core.config import PipelineConfig
-from src.core.models import Source, Sink, TaintChain, SourceCategory, SinkCategory
 from src.core.exceptions import TaintAnalysisError
+from src.core.models import (
+    Sink,
+    SinkCategory,
+    Source,
+    SourceCategory,
+    Specification,
+    TaintChain,
+)
+from src.pipeline.result import PipelineResult
 from src.stage1_llm_inference.client_factory import create_llm_client
 from src.stage1_llm_inference.spec_cache import SpecCache, default_cache_dir
 from src.stage1_llm_inference.specification_extractor import SimpleSpecificationExtractor
-from src.stage2_path_discovery.simple_path_finder import (
-    SimpleGraphBuilder,
-    SimpleBFSPathFinder,
-)
-from src.stage2_path_discovery.graph_builder import EnhancedGraphBuilder
-from src.stage2_path_discovery.llm_graph_builder import LLMGraphBuilder
 from src.stage2_path_discovery.astar_search import (
     AStarPathFinder,
     SemanticHeuristic,
 )
+from src.stage2_path_discovery.graph_builder import EnhancedGraphBuilder
 from src.stage2_path_discovery.joern_wrapper import JoernWrapper
+from src.stage2_path_discovery.llm_graph_builder import LLMGraphBuilder
+from src.stage2_path_discovery.simple_path_finder import (
+    SimpleBFSPathFinder,
+    SimpleGraphBuilder,
+)
 from src.stage3_verification.simple_verifier import SimpleCFGVerifier
 from src.stage3_verification.verification_engine import VerificationEngine
 from src.stage4_explanation.explanation_generator import ExplanationGenerator
-from src.pipeline.result import PipelineResult
 from src.utils.logger import get_logger
 from src.utils.progress import ProgressReporter
 
@@ -45,6 +52,15 @@ class SimplePipeline:
     3. CFG-based verification (reachability checking)
     4. LLM-based explanation generation (human-readable output)
     """
+
+    # A full project graph keeps source text, AST-derived metadata and NetworkX
+    # objects for every file. Above this size, retain graph state only for files
+    # where Stage 1 found an endpoint. These are resource limits, not benchmark
+    # hints: they are independent of labels, CWE ids and expected locations.
+    FULL_PROJECT_GRAPH_FILE_LIMIT = 20_000
+    MAX_ENDPOINT_GRAPH_FILES = 10_000
+    STAGE1_BATCH_MULTIPLIER = 4
+    GRAPH_BATCH_MULTIPLIER = 2
 
     def __init__(self, config: PipelineConfig) -> None:
         """Initialize pipeline with configuration.
@@ -84,6 +100,7 @@ class SimplePipeline:
             llm_provider=config.llm_provider,
             max_concurrent_functions=config.max_concurrent_functions,
             batch_max_chars=config.llm_batch_max_chars,
+            truncation_max_tokens=config.llm_truncation_max_tokens,
             analysis_backend=config.analysis_backend,
             analysis_mode=config.llm_analysis_mode,
             cache_read_enabled=config.cache_read_enabled,
@@ -95,6 +112,8 @@ class SimplePipeline:
         self.semantic_heuristic: Optional[SemanticHeuristic] = None
         self.verifier: Optional[SimpleCFGVerifier] = None
         self.verification_engine: Optional[VerificationEngine] = None
+        self._encoding_warning_paths: set[str] = set()
+        self._global_method_owner: Optional[Dict[str, str]] = None
 
         # Stage 4 components
         self.explainer = ExplanationGenerator(llm_client=self.llm_client)
@@ -125,6 +144,17 @@ class SimplePipeline:
         """Release the LLM client's persistent HTTP resources."""
         if self.llm_client is not None:
             await self.llm_client.aclose()
+
+    def release_run_state(self) -> None:
+        """Drop per-run graphs before reusing this pipeline for another target."""
+        if self.semantic_heuristic is not None:
+            self.semantic_heuristic.clear_cache()
+        self.graph_builder = None
+        self.path_finder = None
+        self.semantic_heuristic = None
+        self.verifier = None
+        self.verification_engine = None
+        self._global_method_owner = None
 
     async def run(
         self,
@@ -165,11 +195,15 @@ class SimplePipeline:
             # ============ STAGE 1: LLM-based Specification Extraction ============
             logger.info("Stage 1: Extracting specifications...")
 
-            specification = await self.spec_extractor.extract(
-                source_code=source_code,
-                file_path=source_file,
-                model=self.config.llm_model,
-            )
+            if source_code.strip():
+                specification = await self.spec_extractor.extract(
+                    source_code=source_code,
+                    file_path=source_file,
+                    model=self.config.llm_model,
+                )
+            else:
+                logger.info(f"Skipping empty source file: {source_file}")
+                specification = self._empty_specification()
 
             sources = specification.sources
             sinks = specification.sinks
@@ -207,6 +241,10 @@ class SimplePipeline:
             )
             result["metrics"]["analysis_backend"] = self.config.analysis_backend
             result["metrics"]["llm_analysis_mode"] = self.config.llm_analysis_mode
+            result["metrics"]["analysis_errors"] = []
+            result["metrics"]["analysis_complete"] = bool(
+                specification.extraction_complete
+            )
 
             return result
 
@@ -293,6 +331,156 @@ class SimplePipeline:
         )
         return relevant, irrelevant
 
+    def _partition_file_paths(
+        self, java_files: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Partition paths without retaining every source file in memory."""
+        relevant: List[str] = []
+        irrelevant: List[str] = []
+
+        for java_file in java_files:
+            code = self._read_source_file(java_file)
+            if self._is_security_relevant(code):
+                relevant.append(java_file)
+            else:
+                irrelevant.append(java_file)
+
+        logger.info(
+            f"File priority: {len(relevant)}/{len(java_files)} files match known "
+            f"security patterns (analyzed first); {len(irrelevant)} analyzed after"
+        )
+        return relevant, irrelevant
+
+    def _select_taint_reachable_files(
+        self,
+        java_files: List[str],
+        endpoint_code: Dict[str, str],
+        file_sources: Dict[str, List[Source]],
+        file_sinks: Dict[str, List[Sink]],
+    ) -> Tuple[Dict[str, str], bool]:
+        """Select the complete supported call slice between endpoint files.
+
+        The inter-file graph builder only creates caller-argument to callee-
+        parameter edges for uniquely resolved method names. A compact global
+        method index therefore lets us prove that files outside the forward /
+        reverse intersection cannot participate in any supported taint path.
+        """
+        source_files = {path for path, values in file_sources.items() if values}
+        sink_files = {path for path, values in file_sinks.items() if values}
+        if not source_files or not sink_files:
+            self._global_method_owner = {}
+            return dict(endpoint_code), True
+
+        parser = self.spec_extractor.ast_parser
+        definitions: Dict[str, set[str]] = {}
+        calls_by_file: Dict[str, set[str]] = {}
+        code_cache = dict(endpoint_code)
+        index_complete = True
+
+        for index, path in enumerate(java_files, 1):
+            try:
+                code = code_cache.get(path)
+                if code is None:
+                    code = self._read_source_file(path)
+                method_names = {
+                    str(method.get("name", ""))
+                    for method in parser.extract_functions(code)
+                    if method.get("name")
+                }
+                calls = {
+                    str(call.get("name", ""))
+                    for call in parser.extract_method_calls(code)
+                    if call.get("name")
+                }
+                calls_by_file[path] = calls
+                for method_name in method_names:
+                    definitions.setdefault(method_name, set()).add(path)
+            except Exception as error:
+                index_complete = False
+                logger.warning(
+                    f"Call-index extraction failed for {path}: "
+                    f"{type(error).__name__}: {error}"
+                )
+            if index % 10_000 == 0:
+                logger.info(
+                    f"Large-project call index: {index}/{len(java_files)} files"
+                )
+
+        unique_owner = {
+            method_name: next(iter(owners))
+            for method_name, owners in definitions.items()
+            if len(owners) == 1
+        }
+        self._global_method_owner = unique_owner
+        forward_graph: Dict[str, set[str]] = {}
+        reverse_graph: Dict[str, set[str]] = {}
+        for caller, calls in calls_by_file.items():
+            for method_name in calls:
+                target = unique_owner.get(method_name)
+                if target is None or target == caller:
+                    continue
+                forward_graph.setdefault(caller, set()).add(target)
+                reverse_graph.setdefault(target, set()).add(caller)
+
+        def distances(
+            seeds: set[str], adjacency: Dict[str, set[str]]
+        ) -> Dict[str, int]:
+            found = {seed: 0 for seed in seeds}
+            queue = list(sorted(seeds))
+            cursor = 0
+            while cursor < len(queue):
+                current = queue[cursor]
+                cursor += 1
+                depth = found[current]
+                if depth >= self.config.max_path_length:
+                    continue
+                for neighbor in sorted(adjacency.get(current, ())):
+                    if neighbor in found:
+                        continue
+                    found[neighbor] = depth + 1
+                    queue.append(neighbor)
+            return found
+
+        forward = distances(source_files, forward_graph)
+        backward = distances(sink_files, reverse_graph)
+        selected = set(endpoint_code) | (set(forward) & set(backward))
+        ordered = sorted(
+            selected,
+            key=lambda path: (
+                forward.get(path, self.config.max_path_length + 1)
+                + backward.get(path, self.config.max_path_length + 1),
+                path,
+            ),
+        )
+        selection_complete = index_complete
+        if len(ordered) > self.MAX_ENDPOINT_GRAPH_FILES:
+            ordered = ordered[: self.MAX_ENDPOINT_GRAPH_FILES]
+            selection_complete = False
+            logger.warning(
+                "Taint-reachable graph slice exceeds retention limit: "
+                f"keeping {len(ordered)}/{len(selected)} files"
+            )
+
+        selected_code = {
+            path: code_cache[path] if path in code_cache else self._read_source_file(path)
+            for path in ordered
+        }
+        logger.info(
+            f"Large-project call slice: {len(selected_code)}/{len(java_files)} "
+            f"files can participate in a supported source-to-sink call path"
+        )
+        return selected_code, selection_complete
+
+    def _empty_specification(self) -> Specification:
+        """Return a complete no-endpoint result for an empty input file."""
+        return Specification(
+            sources=[],
+            sinks=[],
+            sanitizers=[],
+            llm_model=self.config.llm_model,
+            extraction_backend=self.config.analysis_backend,
+        )
+
     async def run_project(
         self,
         java_files: List[str],
@@ -343,7 +531,7 @@ class SimplePipeline:
             # every file is analyzed (security-matching ones first). The old
             # exclude-irrelevant behavior is opt-in via VTC_FAST_PREFILTER
             # (debug/CI only).
-            relevant, irrelevant = self._partition_files(java_files)
+            relevant, irrelevant = self._partition_file_paths(java_files)
             fast_prefilter = os.getenv(
                 "VTC_FAST_PREFILTER", "false"
             ).lower() in ("true", "1", "yes", "on")
@@ -355,6 +543,16 @@ class SimplePipeline:
             else:
                 relevant = relevant + irrelevant
                 irrelevant = []
+
+            skipped_files = list(irrelevant)
+            large_project_mode = (
+                len(java_files) > self.FULL_PROJECT_GRAPH_FILE_LIMIT
+            )
+            if large_project_mode:
+                logger.info(
+                    "Large-project memory mode: Stage 1 analyzes every selected "
+                    "file; Stage 2 builds a compact source-to-sink call slice"
+                )
 
             # Stage 1: concurrent per-file extraction on relevant files only
             all_sources: List = []
@@ -370,15 +568,14 @@ class SimplePipeline:
             semaphore = asyncio.Semaphore(max_concurrent)
             total_relevant = len(relevant)
             completed = 0
+            resource_limit_reached = False
             start_time = time.monotonic()
 
             progress: Optional[ProgressReporter] = None
             if show_progress and total_relevant > 0:
                 progress = ProgressReporter(total_relevant, "Stage 1: Extracting specs")
 
-            async def extract_one(
-                idx: int, java_file: str, code: str
-            ) -> Tuple[str, str, Any]:
+            async def extract_one(idx: int, java_file: str) -> Tuple[str, str, Any]:
                 nonlocal completed
                 async with semaphore:
                     elapsed = time.monotonic() - start_time
@@ -386,53 +583,166 @@ class SimplePipeline:
                     remaining = total_relevant - completed
                     eta = f", ETA ~{avg * remaining:.0f}s" if completed > 0 else ""
                     file_name = Path(java_file).name
-                    logger.info(
+                    progress_log = (
+                        logger.info
+                        if idx == 1 or idx == total_relevant or idx % 100 == 0
+                        else logger.debug
+                    )
+                    progress_log(
                         f"Stage 1 [{idx}/{total_relevant}]: "
                         f"Extracting from {file_name}... "
                         f"(avg {avg:.1f}s/file{eta})"
                     )
-                    spec = await self.spec_extractor.extract(
-                        source_code=code,
-                        file_path=java_file,
-                        model=self.config.llm_model,
-                    )
+                    code = self._read_source_file(java_file)
+                    if code.strip():
+                        spec = await self.spec_extractor.extract(
+                            source_code=code,
+                            file_path=java_file,
+                            model=self.config.llm_model,
+                        )
+                    else:
+                        logger.info(f"Skipping empty source file: {java_file}")
+                        spec = self._empty_specification()
                     completed += 1
                     if progress is not None:
                         progress.update()
                     return java_file, code, spec
 
-            tasks = [
-                extract_one(i, fpath, code)
-                for i, (fpath, code) in enumerate(relevant, 1)
-            ]
-            results = await asyncio.gather(*tasks)
+            # Bound both pending coroutine count and retained source/spec data.
+            # Creating one task per file caused six-figure projects to retain
+            # the entire corpus until the last extraction completed.
+            stage1_batch_size = max(
+                1, max_concurrent * self.STAGE1_BATCH_MULTIPLIER
+            )
+            for batch_start in range(0, total_relevant, stage1_batch_size):
+                batch_paths = relevant[
+                    batch_start : batch_start + stage1_batch_size
+                ]
+                results = await asyncio.gather(
+                    *(
+                        extract_one(batch_start + offset, java_file)
+                        for offset, java_file in enumerate(batch_paths, 1)
+                    )
+                )
+
+                for java_file, code, spec in results:
+                    all_sources.extend(spec.sources)
+                    all_sinks.extend(spec.sinks)
+                    all_sanitizers.extend(spec.sanitizers)
+                    has_endpoint = bool(spec.sources or spec.sinks)
+                    retain_file = not large_project_mode or has_endpoint
+                    if (
+                        retain_file
+                        and large_project_mode
+                        and java_file not in file_code_map
+                        and len(file_code_map) >= self.MAX_ENDPOINT_GRAPH_FILES
+                    ):
+                        resource_limit_reached = True
+                        retain_file = False
+                    if retain_file:
+                        file_code_map[java_file] = code
+                        file_sources[java_file] = list(spec.sources)
+                        file_sinks[java_file] = list(spec.sinks)
+                    if not spec.extraction_complete:
+                        extraction_errors[java_file] = list(
+                            spec.extraction_errors
+                        )
 
             if progress is not None:
                 progress.finish()
 
-            # Collect results from relevant files
-            for java_file, code, spec in results:
-                all_sources.extend(spec.sources)
-                all_sinks.extend(spec.sinks)
-                all_sanitizers.extend(spec.sanitizers)
-                file_code_map[java_file] = code
-                file_sources[java_file] = list(spec.sources)
-                file_sinks[java_file] = list(spec.sinks)
-                if not spec.extraction_complete:
-                    extraction_errors[java_file] = list(spec.extraction_errors)
+            # The provider already retries individual requests. Retrying the
+            # complete file once more catches transient connection failures
+            # after the provider/client retry budget without rerunning healthy
+            # files or caching an incomplete extraction.
+            for java_file in list(extraction_errors):
+                logger.warning(
+                    f"Retrying incomplete Stage 1 file once: {java_file}"
+                )
+                code = self._read_source_file(java_file)
+                try:
+                    retry_spec = await self.spec_extractor.extract(
+                        source_code=code,
+                        file_path=java_file,
+                        model=self.config.llm_model,
+                    )
+                except Exception as retry_error:
+                    logger.warning(
+                        "Stage 1 file retry failed: "
+                        f"{type(retry_error).__name__}: {retry_error}"
+                    )
+                    continue
+                if not retry_spec.extraction_complete:
+                    extraction_errors[java_file] = list(
+                        retry_spec.extraction_errors
+                    )
+                    continue
+
+                all_sources = [
+                    source
+                    for source in all_sources
+                    if source.location.file_path != java_file
+                ] + list(retry_spec.sources)
+                all_sinks = [
+                    sink
+                    for sink in all_sinks
+                    if sink.location.file_path != java_file
+                ] + list(retry_spec.sinks)
+                all_sanitizers = [
+                    sanitizer
+                    for sanitizer in all_sanitizers
+                    if sanitizer.location.file_path != java_file
+                ] + list(retry_spec.sanitizers)
+                extraction_errors.pop(java_file, None)
+
+                has_endpoint = bool(retry_spec.sources or retry_spec.sinks)
+                if not large_project_mode or has_endpoint:
+                    if (
+                        java_file in file_code_map
+                        or len(file_code_map) < self.MAX_ENDPOINT_GRAPH_FILES
+                    ):
+                        file_code_map[java_file] = code
+                        file_sources[java_file] = list(retry_spec.sources)
+                        file_sinks[java_file] = list(retry_spec.sinks)
+                    else:
+                        resource_limit_reached = True
+                logger.info(f"Stage 1 retry recovered {java_file}")
 
             # Include irrelevant files' code for graph building (no LLM calls)
-            for java_file, code in irrelevant:
-                file_code_map[java_file] = code
-                file_sources.setdefault(java_file, [])
-                file_sinks.setdefault(java_file, [])
+            if not large_project_mode:
+                for java_file in skipped_files:
+                    file_code_map[java_file] = self._read_source_file(java_file)
+                    file_sources.setdefault(java_file, [])
+                    file_sinks.setdefault(java_file, [])
 
+            graph_selection_complete = not resource_limit_reached
+            if large_project_mode:
+                selected_code, call_slice_complete = self._select_taint_reachable_files(
+                    java_files,
+                    file_code_map,
+                    file_sources,
+                    file_sinks,
+                )
+                file_code_map = selected_code
+                file_sources = {
+                    path: file_sources.get(path, []) for path in file_code_map
+                }
+                file_sinks = {
+                    path: file_sinks.get(path, []) for path in file_code_map
+                }
+                graph_selection_complete = (
+                    graph_selection_complete and call_slice_complete
+                )
+
+            graph_file_count = len(file_code_map)
             elapsed_total = time.monotonic() - start_time
+            stage1_status = "complete"
             logger.info(
-                f"✓ Stage 1 complete (project): Found {len(all_sources)} sources, "
+                f"Stage 1 {stage1_status} (project): Found "
+                f"{len(all_sources)} sources, "
                 f"{len(all_sinks)} sinks, {len(all_sanitizers)} sanitizers "
-                f"across {total_relevant} relevant files "
-                f"({len(irrelevant)} skipped) in {elapsed_total:.1f}s"
+                f"across {completed}/{total_relevant} relevant files "
+                f"({len(skipped_files)} skipped) in {elapsed_total:.1f}s"
             )
 
             if on_stage1_complete is not None:
@@ -440,15 +750,17 @@ class SimplePipeline:
                     on_stage1_complete({
                         "files_analyzed": len(java_files),
                         "files_llm_extracted": (
-                            total_relevant
+                            completed
                             if self.config.analysis_backend != "static"
                             else 0
                         ),
-                        "files_skipped": len(irrelevant),
+                        "files_skipped": len(skipped_files),
                         "file_list": java_files,
                         "sources": list(all_sources),
                         "sinks": list(all_sinks),
                         "sanitizers": list(all_sanitizers),
+                        "stage1_complete": True,
+                        "resource_limit_reached": resource_limit_reached,
                     })
                 except Exception as cb_err:
                     logger.warning(
@@ -459,18 +771,44 @@ class SimplePipeline:
             result = await self._run_stages_project(
                 file_code_map, file_sources, file_sinks,
                 all_sources, all_sinks, all_sanitizers,
+                allow_interfile_bridges=True,
             )
             result["file"] = f"project ({len(java_files)} files)"
             result["files_analyzed"] = len(java_files)
             result["files_llm_extracted"] = (
                 total_relevant if self.config.analysis_backend != "static" else 0
             )
-            result["files_skipped"] = len(irrelevant)
+            result["files_skipped"] = len(skipped_files)
             result["file_list"] = java_files
             result["metrics"]["extraction_complete"] = not extraction_errors
             result["metrics"]["extraction_errors"] = extraction_errors
             result["metrics"]["analysis_backend"] = self.config.analysis_backend
             result["metrics"]["llm_analysis_mode"] = self.config.llm_analysis_mode
+            result["metrics"]["graph_scope_mode"] = (
+                "taint_reachable_call_slice"
+                if large_project_mode
+                else "full_project"
+            )
+            result["metrics"]["graph_candidate_files"] = graph_file_count
+            result["metrics"]["graph_files_omitted"] = (
+                len(java_files) - graph_file_count
+            )
+            result["metrics"]["interfile_bridges_enabled"] = (
+                True
+            )
+            analysis_errors: List[str] = []
+            if large_project_mode and not graph_selection_complete:
+                analysis_errors.append(
+                    "Stage 2 source-to-sink call slice was incomplete"
+                )
+            if resource_limit_reached:
+                analysis_errors.append(
+                    "Stage 2 endpoint-file retention limit was reached"
+                )
+            result["metrics"]["analysis_errors"] = analysis_errors
+            result["metrics"]["analysis_complete"] = (
+                not extraction_errors and not analysis_errors
+            )
 
             return result
 
@@ -532,7 +870,7 @@ class SimplePipeline:
         try:
             # Partition for ORDERING only (security-matching files first); every
             # file is analyzed unless VTC_FAST_PREFILTER opts into the old skip.
-            relevant, irrelevant = self._partition_files(java_files)
+            relevant, irrelevant = self._partition_file_paths(java_files)
             fast_prefilter = os.getenv(
                 "VTC_FAST_PREFILTER", "false"
             ).lower() in ("true", "1", "yes", "on")
@@ -545,6 +883,8 @@ class SimplePipeline:
                 relevant = relevant + irrelevant
                 irrelevant = []
 
+            skipped_count = len(irrelevant)
+
             max_concurrent = self.config.max_concurrent_files
             semaphore = asyncio.Semaphore(max_concurrent)
             total_relevant = len(relevant)
@@ -555,9 +895,7 @@ class SimplePipeline:
             if show_progress and total_relevant > 0:
                 progress = ProgressReporter(total_relevant, "Stage 1: Extracting sinks")
 
-            async def extract_one(
-                idx: int, java_file: str, code: str
-            ) -> Tuple[str, Any]:
+            async def extract_one(idx: int, java_file: str) -> Tuple[str, Any]:
                 nonlocal completed
                 async with semaphore:
                     elapsed = time.monotonic() - start_time
@@ -565,16 +903,26 @@ class SimplePipeline:
                     remaining = total_relevant - completed
                     eta = f", ETA ~{avg * remaining:.0f}s" if completed > 0 else ""
                     file_name = Path(java_file).name
-                    logger.info(
+                    progress_log = (
+                        logger.info
+                        if idx == 1 or idx == total_relevant or idx % 100 == 0
+                        else logger.debug
+                    )
+                    progress_log(
                         f"Stage 1 [{idx}/{total_relevant}]: "
                         f"Extracting from {file_name}... "
                         f"(avg {avg:.1f}s/file{eta})"
                     )
-                    spec = await self.spec_extractor.extract(
-                        source_code=code,
-                        file_path=java_file,
-                        model=self.config.llm_model,
-                    )
+                    code = self._read_source_file(java_file)
+                    if code.strip():
+                        spec = await self.spec_extractor.extract(
+                            source_code=code,
+                            file_path=java_file,
+                            model=self.config.llm_model,
+                        )
+                    else:
+                        logger.info(f"Skipping empty source file: {java_file}")
+                        spec = self._empty_specification()
                     completed += 1
                     if progress is not None:
                         progress.update()
@@ -588,27 +936,36 @@ class SimplePipeline:
                             )
                     return java_file, spec
 
-            tasks = [
-                extract_one(i, fpath, code)
-                for i, (fpath, code) in enumerate(relevant, 1)
-            ]
-            results = await asyncio.gather(*tasks)
+            collected: List[Tuple[str, Sink]] = []
+            extraction_errors: Dict[str, List[str]] = {}
+            stage1_batch_size = max(
+                1, max_concurrent * self.STAGE1_BATCH_MULTIPLIER
+            )
+            for batch_start in range(0, total_relevant, stage1_batch_size):
+                batch_paths = relevant[
+                    batch_start : batch_start + stage1_batch_size
+                ]
+                results = await asyncio.gather(
+                    *(
+                        extract_one(batch_start + offset, java_file)
+                        for offset, java_file in enumerate(batch_paths, 1)
+                    )
+                )
+                for java_file, spec in results:
+                    for snk in spec.sinks:
+                        collected.append((java_file, snk))
+                    if not spec.extraction_complete:
+                        extraction_errors[java_file] = list(
+                            spec.extraction_errors
+                        )
 
             if progress is not None:
                 progress.finish()
 
-            collected: List[Tuple[str, Sink]] = []
-            extraction_errors: Dict[str, List[str]] = {}
-            for java_file, spec in results:
-                for snk in spec.sinks:
-                    collected.append((java_file, snk))
-                if not spec.extraction_complete:
-                    extraction_errors[java_file] = list(spec.extraction_errors)
-
             elapsed_total = time.monotonic() - start_time
             logger.info(
                 f"✓ Sink inventory complete: {len(collected)} sinks across "
-                f"{total_relevant} files ({len(irrelevant)} skipped) "
+                f"{total_relevant} files ({skipped_count} skipped) "
                 f"in {elapsed_total:.1f}s"
             )
 
@@ -617,7 +974,7 @@ class SimplePipeline:
                 "files_llm_extracted": (
                     total_relevant if self.config.analysis_backend != "static" else 0
                 ),
-                "files_skipped": len(irrelevant),
+                "files_skipped": skipped_count,
                 "sinks": collected,
                 "extraction_complete": not extraction_errors,
                 "extraction_errors": extraction_errors,
@@ -632,12 +989,13 @@ class SimplePipeline:
         file_code_map: Dict[str, str],
         file_sources: Dict[str, List[Source]],
         file_sinks: Dict[str, List[Sink]],
+        allow_interfile_bridges: bool = True,
     ) -> Tuple[nx.DiGraph, Dict[int, str]]:
         """Build a merged graph with per-file scoped node names.
 
         Each file gets its own sub-graph built by the configured graph builder.
-        Nodes are then relabelled to ``"ShortName.java:varName"`` so that
-        identically-named variables in different files stay distinct.
+        Nodes are then relabelled with the normalized absolute file path so
+        identically-named files and variables in different modules stay distinct.
 
         Cross-file bridge edges are added when the same ``variable_name``
         appears as a source output in one file and a sink input in another.
@@ -661,19 +1019,105 @@ class SimplePipeline:
             else:
                 builder_cls = SimpleGraphBuilder
 
-        # Detect duplicate short names so we can disambiguate
-        short_names: Dict[str, List[str]] = {}
-        for fpath in file_code_map:
-            short = Path(fpath).name
-            short_names.setdefault(short, []).append(fpath)
+        def _file_scope(fpath: str) -> str:
+            # Basename/parent scoping collides in multi-module repositories.
+            # abspath is lexical (unlike resolve) and therefore also works for
+            # benchmark checkouts containing symlinked or temporarily absent paths.
+            return os.path.normcase(os.path.abspath(fpath)).replace("\\", "/")
 
-        def _short_name(fpath: str) -> str:
-            short = Path(fpath).name
-            if len(short_names.get(short, [])) > 1:
-                return f"{Path(fpath).parent.name}/{short}"
-            return short
+        def _endpoint_name(kind: str, index: int) -> str:
+            return f"__vtc_{kind}_{index}"
 
-        graphs: List[nx.DiGraph] = []
+        def _annotate_local_graph(
+            graph: nx.DiGraph,
+            fpath: str,
+            code: str,
+            sources: List[Source],
+            sinks: List[Sink],
+        ) -> None:
+            """Attach source coordinates and keep equal-name endpoints distinct."""
+            lines = code.splitlines()
+            function_ranges = []
+            for function in self.spec_extractor.ast_parser.extract_functions(code):
+                start = int(function.get("start_line", 0) or 0)
+                end = int(function.get("end_line", start) or start)
+                function_ranges.append((start, end, function.get("name")))
+
+            def function_for_line(line_number: int) -> Optional[str]:
+                return next(
+                    (
+                        name
+                        for start, end, name in function_ranges
+                        if start <= line_number <= end
+                    ),
+                    None,
+                )
+
+            # Populate a deterministic best-effort location for intermediate
+            # identifiers. AST edges may later provide a more precise location.
+            local_nodes = {str(node): node for node in graph.nodes}
+            seen: set[str] = set()
+            for line_number, line in enumerate(lines, 1):
+                for identifier in re.findall(r"\b[A-Za-z_$][\w$]*\b", line):
+                    node = local_nodes.get(identifier)
+                    if node is None or identifier in seen:
+                        continue
+                    data = graph.nodes[node]
+                    data.setdefault("file_path", fpath)
+                    data.setdefault("line", line_number)
+                    data.setdefault("function_name", function_for_line(line_number))
+                    data.setdefault("code_snippet", line.strip())
+                    data.setdefault("variable_name", identifier)
+                    seen.add(identifier)
+
+            for node, data in graph.nodes(data=True):
+                data.setdefault("file_path", fpath)
+                data.setdefault("line", 1)
+                data.setdefault("variable_name", str(data.get("label", node)))
+
+            # A file-level variable graph cannot represent several endpoint
+            # occurrences with the same identifier. Dedicated boundary nodes
+            # preserve the exact endpoint identity while retaining the local
+            # variable as the data-flow entry/exit.
+            for kind, endpoints in (("source", sources), ("sink", sinks)):
+                for index, endpoint in enumerate(endpoints):
+                    base = endpoint.variable_name
+                    if base not in graph:
+                        graph.add_node(
+                            base,
+                            type="intermediate",
+                            file_path=fpath,
+                            line=endpoint.location.line_number,
+                            function_name=endpoint.location.function_name,
+                            variable_name=base,
+                            code_snippet=endpoint.code_snippet,
+                        )
+                    boundary = _endpoint_name(kind, index)
+                    base_data = graph.nodes[base]
+                    graph.add_node(
+                        boundary,
+                        type=kind,
+                        endpoint=endpoint,
+                        file_path=endpoint.location.file_path or fpath,
+                        line=endpoint.location.line_number,
+                        function_name=endpoint.location.function_name,
+                        class_name=endpoint.location.class_name,
+                        variable_name=endpoint.variable_name,
+                        code_snippet=endpoint.code_snippet,
+                        confidence=endpoint.confidence,
+                        is_field=base_data.get("is_field", False),
+                    )
+                    edge_data = {
+                        "edge_type": "endpoint_binding",
+                        "function_name": endpoint.location.function_name,
+                        "line": endpoint.location.line_number,
+                    }
+                    if kind == "source":
+                        graph.add_edge(boundary, base, **edge_data)
+                    else:
+                        graph.add_edge(base, boundary, **edge_data)
+
+        merged = nx.DiGraph()
         scope_map: Dict[int, str] = {}  # id(Source/Sink obj) -> scoped node id
         graph_semaphore = asyncio.Semaphore(self.config.max_concurrent_files)
 
@@ -709,32 +1153,40 @@ class SimplePipeline:
                     g = await llm_builder.enrich_graph(
                         g, code, sources_f, sinks_f
                     )
+                _annotate_local_graph(g, fpath, code, sources_f, sinks_f)
                 return fpath, g
 
-        built_graphs = await asyncio.gather(
-            *(_build_one(fpath, code) for fpath, code in file_code_map.items())
+        graph_batch_size = max(
+            1,
+            self.config.max_concurrent_files * self.GRAPH_BATCH_MULTIPLIER,
         )
+        graph_items = list(file_code_map.items())
+        for batch_start in range(0, len(graph_items), graph_batch_size):
+            batch = graph_items[batch_start : batch_start + graph_batch_size]
+            built_graphs = await asyncio.gather(
+                *(_build_one(fpath, code) for fpath, code in batch)
+            )
 
-        for fpath, g in built_graphs:
-            sources_f = file_sources.get(fpath, [])
-            sinks_f = file_sinks.get(fpath, [])
+            for fpath, g in built_graphs:
+                sources_f = file_sources.get(fpath, [])
+                sinks_f = file_sinks.get(fpath, [])
 
-            prefix = _short_name(fpath)
-            mapping = {n: f"{prefix}:{n}" for n in g.nodes()}
-            g = nx.relabel_nodes(g, mapping)
+                prefix = _file_scope(fpath)
+                mapping = {n: f"{prefix}:{n}" for n in g.nodes()}
+                nx.relabel_nodes(g, mapping, copy=False)
 
-            # Record scoped IDs for source/sink objects
-            for src in sources_f:
-                scope_map[id(src)] = f"{prefix}:{src.variable_name}"
-            for snk in sinks_f:
-                scope_map[id(snk)] = f"{prefix}:{snk.variable_name}"
+                # Record scoped IDs for source/sink objects.
+                for index, src in enumerate(sources_f):
+                    scope_map[id(src)] = f"{prefix}:{_endpoint_name('source', index)}"
+                for index, snk in enumerate(sinks_f):
+                    scope_map[id(snk)] = f"{prefix}:{_endpoint_name('sink', index)}"
 
-            graphs.append(g)
+                # Merge incrementally. nx.compose_all retained the full list of
+                # local graphs and then copied every graph a second time.
+                merged.add_nodes_from(g.nodes(data=True))
+                merged.add_edges_from(g.edges(data=True))
 
-        if graphs:
-            merged = nx.compose_all(graphs)
-        else:
-            merged = nx.DiGraph()
+            del built_graphs
 
         # Inter-file bridges are derived from actual call sites and positional
         # formal parameters. Equal variable names alone are not data flow.
@@ -742,32 +1194,37 @@ class SimplePipeline:
         method_defs: Dict[str, List[Tuple[str, List[str], Optional[str]]]] = {}
         class_to_file: Dict[str, str] = {}
         superclass_by_file: Dict[str, Optional[str]] = {}
-        for fpath, code in file_code_map.items():
-            classes = ast_parser.extract_classes(code)
-            if classes:
-                class_name = classes[0].get("name")
-                if class_name:
-                    class_to_file[class_name] = fpath
-                superclass_by_file[fpath] = classes[0].get("superclass")
-            for method in ast_parser.extract_functions(code):
-                params: List[str] = []
-                for raw in method.get("parameters", []):
-                    cleaned = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", raw)
-                    names = re.findall(r"\b[A-Za-z_$][\w$]*\b", cleaned)
-                    if names:
-                        params.append(names[-1])
-                method_defs.setdefault(method.get("name", ""), []).append(
-                    (fpath, params, method.get("class_name"))
-                )
+        if allow_interfile_bridges:
+            for fpath, code in file_code_map.items():
+                classes = ast_parser.extract_classes(code)
+                if classes:
+                    class_name = classes[0].get("name")
+                    if class_name:
+                        class_to_file[class_name] = fpath
+                    superclass_by_file[fpath] = classes[0].get("superclass")
+                for method in ast_parser.extract_functions(code):
+                    params: List[str] = []
+                    for raw in method.get("parameters", []):
+                        cleaned = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", raw)
+                        names = re.findall(r"\b[A-Za-z_$][\w$]*\b", cleaned)
+                        if names:
+                            params.append(names[-1])
+                    method_defs.setdefault(method.get("name", ""), []).append(
+                        (fpath, params, method.get("class_name"))
+                    )
 
         bridge_count = 0
-        for caller_path, code in file_code_map.items():
-            caller_prefix = _short_name(caller_path)
+        caller_files = file_code_map.items() if allow_interfile_bridges else ()
+        for caller_path, code in caller_files:
+            caller_prefix = _file_scope(caller_path)
             for call in ast_parser.extract_method_calls(code):
                 targets = [
                     target for target in method_defs.get(call["name"], [])
                     if target[0] != caller_path
                 ]
+                if self._global_method_owner is not None:
+                    owner = self._global_method_owner.get(call["name"])
+                    targets = [target for target in targets if target[0] == owner]
                 if call.get("receiver") == "super":
                     superclass = superclass_by_file.get(caller_path)
                     super_file = class_to_file.get(superclass or "")
@@ -778,7 +1235,7 @@ class SimplePipeline:
                     continue
 
                 for target_path, params, _class_name in targets:
-                    target_prefix = _short_name(target_path)
+                    target_prefix = _file_scope(target_path)
                     for argument, parameter in zip(call["arguments"], params):
                         identifiers = re.findall(r"\b[A-Za-z_$][\w$]*\b", argument)
                         if not identifiers:
@@ -826,7 +1283,8 @@ class SimplePipeline:
         logger.info(
             f"Scoped graph: {merged.number_of_nodes()} nodes, "
             f"{merged.number_of_edges()} edges across {len(file_code_map)} files "
-            f"({bridge_count} call-binding bridges)"
+            f"({bridge_count} call-binding bridges; "
+            f"inter-file={'enabled' if allow_interfile_bridges else 'disabled'})"
         )
         return merged, scope_map
 
@@ -838,6 +1296,7 @@ class SimplePipeline:
         all_sources: List,
         all_sinks: List,
         all_sanitizers: List,
+        allow_interfile_bridges: bool = True,
     ) -> Dict[str, Any]:
         """Run Stages 2-4 with per-file scoped graph.
 
@@ -861,6 +1320,7 @@ class SimplePipeline:
 
         graph, scope_map = await self._build_scoped_graph(
             file_code_map, file_sources, file_sinks,
+            allow_interfile_bridges=allow_interfile_bridges,
         )
 
         # Find all chains using selected algorithm
@@ -883,6 +1343,10 @@ class SimplePipeline:
             max_length=self.config.max_path_length,
             sanitizers=all_sanitizers,
             node_id_map=scope_map,
+            max_chains=self.config.max_candidate_chains,
+        )
+        candidate_chains_truncated = bool(
+            getattr(self.path_finder, "limit_exceeded", False)
         )
 
         # Drop hallucinated chains whose snippets don't match the variable name
@@ -899,50 +1363,51 @@ class SimplePipeline:
 
         # ============ STAGE 3: Verification ============
         if self.config.verification_enabled and chains:
-            if self.config.verification_level in ("symbolic", "both"):
-                logger.info(
-                    f"Stage 3: Verifying chains with verification_level="
-                    f"'{self.config.verification_level}' "
-                    f"(timeout={self.config.symbolic_timeout}s)..."
-                )
-                combined_code = "\n".join(file_code_map.values())
-                self.verification_engine = VerificationEngine(
-                    config=self.config,
-                    max_loop_iterations=10,
-                    symbolic_timeout=self.config.symbolic_timeout,
-                )
-                verification_results = self.verification_engine.verify_all_chains(
-                    chains, combined_code,
-                )
-            else:  # cfg
-                logger.info("Stage 3: Verifying chain reachability with CFG...")
-                self.verifier = SimpleCFGVerifier(graph)
-                verification_results = self.verifier.verify_all_chains(
-                    chains, node_id_map=scope_map,
-                )
-
-            verified_chains = (
-                verification_results["verified"]
-                + verification_results.get("unverifiable", [])
+            logger.info(
+                f"Stage 3: Verifying chains with independent source CFG "
+                f"(verification_level='{self.config.verification_level}', "
+                f"timeout={self.config.symbolic_timeout}s)..."
             )
-            verification_rate = verification_results["verification_rate"]
+            self.verification_engine = VerificationEngine(
+                config=self.config,
+                max_loop_iterations=10,
+                symbolic_timeout=self.config.symbolic_timeout,
+            )
+            verification_results = self.verification_engine.verify_all_chains_scoped(
+                chains, file_code_map,
+            )
 
-            if "unverifiable" in verification_results:
-                unverifiable_count = len(verification_results["unverifiable"])
-                if unverifiable_count > 0:
-                    logger.info(
-                        f"  ({unverifiable_count} chains unverifiable - "
-                        f"set verification_level='symbolic' or 'both' "
-                        f"for higher confidence)"
-                    )
+            verified_chains = list(verification_results["verified"])
+            unverifiable_chains = list(
+                verification_results.get("unverifiable", [])
+            )
+            rejected_chains = list(verification_results.get("false", []))
+            verification_rate = verification_results["verification_rate"]
+            verification_evidence = verification_results.get("results", [])
 
             logger.info(
-                f"✓ Stage 3 complete: {len(verified_chains)} chains verified "
-                f"({verification_rate:.1%})"
+                f"Stage 3 complete: {len(verified_chains)} confirmed, "
+                f"{len(unverifiable_chains)} unverifiable, "
+                f"{len(rejected_chains)} rejected "
+                f"(confirmation rate {verification_rate:.1%})"
             )
+        elif not chains:
+            verified_chains = []
+            unverifiable_chains = []
+            rejected_chains = []
+            verification_rate = 0.0
+            verification_evidence = []
+            logger.info("Stage 3: No candidate chains to verify")
         else:
-            verified_chains = chains
-            logger.info("Stage 3: Verification disabled, using all chains")
+            verified_chains = []
+            unverifiable_chains = list(chains)
+            rejected_chains = []
+            verification_rate = 0.0
+            verification_evidence = []
+            logger.warning(
+                "Stage 3: Verification disabled; candidate chains remain "
+                "unverified and will not be reported as confirmed"
+            )
 
         # ============ STAGE 4: Explanation Generation ============
         if verified_chains:
@@ -962,17 +1427,39 @@ class SimplePipeline:
             "sanitizers_found": len(all_sanitizers),
             "chains_found": len(chains),
             "chains_verified": len(verified_chains),
-            "verification_rate": (
-                len(verified_chains) / len(chains) if chains else 0.0
+            "chains_unverifiable": len(unverifiable_chains),
+            "chains_rejected": len(rejected_chains),
+            "verification_rate": verification_rate,
+            "chains_cfg_reachable": sum(
+                result.cfg_status.value == "verified"
+                for result in verification_evidence
+            ),
+            "chains_symbolically_verified": sum(
+                result.symbolic_status is not None
+                and result.symbolic_status.value == "verified"
+                for result in verification_evidence
             ),
             "explanations_generated": len(explanations),
             "graph_nodes": graph.number_of_nodes(),
             "graph_edges": graph.number_of_edges(),
+            "candidate_chains_truncated": candidate_chains_truncated,
+            "candidate_selection_limited": candidate_chains_truncated,
+            "candidate_pairs_ranked": int(
+                getattr(self.path_finder, "candidate_pairs_ranked", len(chains))
+            ),
+            "candidate_pairs_ranked_out": int(
+                getattr(self.path_finder, "ranked_out_count", 0)
+            ),
+            "reachable_pairs_seen": int(
+                getattr(self.path_finder, "reachable_pairs_seen", len(chains))
+            ),
         }
 
         result = {
             "total_chains": len(chains),
             "verified_chains": verified_chains,
+            "unverifiable_chains": unverifiable_chains,
+            "rejected_chains": rejected_chains,
             "explanations": explanations,
             "metrics": metrics,
         }
@@ -1252,7 +1739,7 @@ class SimplePipeline:
                 chain.confidence = new_confidence
                 adjusted.append(chain)
             else:
-                logger.info(
+                logger.debug(
                     f"Filtered low-risk chain: {chain.source.variable_name} -> "
                     f"{chain.sink.variable_name} ({src_cat.value} -> {sink_cat.value}, "
                     f"confidence {chain.confidence:.2f} * {multiplier} = {new_confidence:.2f})"
@@ -1389,6 +1876,10 @@ class SimplePipeline:
             sinks=sinks,
             max_length=self.config.max_path_length,
             sanitizers=sanitizers,
+            max_chains=self.config.max_candidate_chains,
+        )
+        candidate_chains_truncated = bool(
+            getattr(self.path_finder, "limit_exceeded", False)
         )
 
         # Drop hallucinated chains whose snippets don't match the variable name
@@ -1405,45 +1896,51 @@ class SimplePipeline:
 
         # ============ STAGE 3: CFG-based Verification ============
         if self.config.verification_enabled and chains:
-            if self.config.verification_level in ("symbolic", "both"):
-                logger.info(
-                    f"Stage 3: Verifying chains with verification_level='{self.config.verification_level}' "
-                    f"(timeout={self.config.symbolic_timeout}s)..."
-                )
-                self.verification_engine = VerificationEngine(
-                    config=self.config,
-                    max_loop_iterations=10,
-                    symbolic_timeout=self.config.symbolic_timeout
-                )
-                verification_results = self.verification_engine.verify_all_chains(
-                    chains, source_code
-                )
-            else:  # cfg
-                logger.info("Stage 3: Verifying chain reachability with CFG...")
-                self.verifier = SimpleCFGVerifier(graph)
-                verification_results = self.verifier.verify_all_chains(chains)
-
-            verified_chains = (
-                verification_results["verified"]
-                + verification_results.get("unverifiable", [])
+            logger.info(
+                "Stage 3: Verifying chains with independent source CFG "
+                f"(verification_level='{self.config.verification_level}', "
+                f"timeout={self.config.symbolic_timeout}s)..."
             )
-            verification_rate = verification_results["verification_rate"]
+            self.verification_engine = VerificationEngine(
+                config=self.config,
+                max_loop_iterations=10,
+                symbolic_timeout=self.config.symbolic_timeout,
+            )
+            verification_results = self.verification_engine.verify_all_chains(
+                chains, source_code
+            )
 
-            if "unverifiable" in verification_results:
-                unverifiable_count = len(verification_results["unverifiable"])
-                if unverifiable_count > 0:
-                    logger.info(
-                        f"  ({unverifiable_count} chains unverifiable - "
-                        f"set verification_level='symbolic' or 'both' for higher confidence)"
-                    )
+            verified_chains = list(verification_results["verified"])
+            unverifiable_chains = list(
+                verification_results.get("unverifiable", [])
+            )
+            rejected_chains = list(verification_results.get("false", []))
+            verification_rate = verification_results["verification_rate"]
+            verification_evidence = verification_results.get("results", [])
 
             logger.info(
-                f"✓ Stage 3 complete: {len(verified_chains)} chains verified "
-                f"({verification_rate:.1%})"
+                f"Stage 3 complete: {len(verified_chains)} confirmed, "
+                f"{len(unverifiable_chains)} unverifiable, "
+                f"{len(rejected_chains)} rejected "
+                f"(confirmation rate {verification_rate:.1%})"
             )
+        elif not chains:
+            verified_chains = []
+            unverifiable_chains = []
+            rejected_chains = []
+            verification_rate = 0.0
+            verification_evidence = []
+            logger.info("Stage 3: No candidate chains to verify")
         else:
-            verified_chains = chains
-            logger.info("Stage 3: Verification disabled, using all chains")
+            verified_chains = []
+            unverifiable_chains = list(chains)
+            rejected_chains = []
+            verification_rate = 0.0
+            verification_evidence = []
+            logger.warning(
+                "Stage 3: Verification disabled; candidate chains remain "
+                "unverified and will not be reported as confirmed"
+            )
 
         # ============ STAGE 4: Explanation Generation ============
         if verified_chains:
@@ -1461,17 +1958,39 @@ class SimplePipeline:
             "sanitizers_found": len(sanitizers),
             "chains_found": len(chains),
             "chains_verified": len(verified_chains),
-            "verification_rate": (
-                len(verified_chains) / len(chains) if chains else 0.0
+            "chains_unverifiable": len(unverifiable_chains),
+            "chains_rejected": len(rejected_chains),
+            "verification_rate": verification_rate,
+            "chains_cfg_reachable": sum(
+                result.cfg_status.value == "verified"
+                for result in verification_evidence
+            ),
+            "chains_symbolically_verified": sum(
+                result.symbolic_status is not None
+                and result.symbolic_status.value == "verified"
+                for result in verification_evidence
             ),
             "explanations_generated": len(explanations),
             "graph_nodes": graph.number_of_nodes(),
             "graph_edges": graph.number_of_edges(),
+            "candidate_chains_truncated": candidate_chains_truncated,
+            "candidate_selection_limited": candidate_chains_truncated,
+            "candidate_pairs_ranked": int(
+                getattr(self.path_finder, "candidate_pairs_ranked", len(chains))
+            ),
+            "candidate_pairs_ranked_out": int(
+                getattr(self.path_finder, "ranked_out_count", 0)
+            ),
+            "reachable_pairs_seen": int(
+                getattr(self.path_finder, "reachable_pairs_seen", len(chains))
+            ),
         }
 
         result = {
             "total_chains": len(chains),
             "verified_chains": verified_chains,
+            "unverifiable_chains": unverifiable_chains,
+            "rejected_chains": rejected_chains,
             "explanations": explanations,
             "metrics": metrics,
         }
@@ -1505,8 +2024,24 @@ class SimplePipeline:
                 logger.error(f"Path is not a file: {file_path}")
                 raise ValueError(f"Path is not a file: {file_path}")
 
-            with open(file, "r", encoding="utf-8") as f:
-                content = f.read()
+            raw = file.read_bytes()
+            if b"\x00" in raw:
+                logger.warning(
+                    f"Skipping binary-looking Java file containing NUL bytes: "
+                    f"{file_path}"
+                )
+                return ""
+
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError as error:
+                if file_path not in self._encoding_warning_paths:
+                    logger.warning(
+                        "Decoding non-UTF-8 Java file with replacement "
+                        f"characters: {file_path} (byte offset {error.start})"
+                    )
+                    self._encoding_warning_paths.add(file_path)
+                content = raw.decode("utf-8", errors="replace")
 
             logger.debug(f"Read {len(content)} bytes from {file_path}")
             return content

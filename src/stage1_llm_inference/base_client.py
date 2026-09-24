@@ -6,7 +6,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from src.core.exceptions import LLMError, ParsingError
+from src.core.exceptions import LLMError, ParsingError, TruncatedLLMResponseError
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -46,7 +46,16 @@ class BaseLLMClient(ABC):
         self.model = model
         self.default_max_tokens = default_max_tokens
         self.default_max_retries = default_max_retries
+        self.max_concurrent_requests = 5
+        self._request_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         logger.info(f"Initialized {self.__class__.__name__} with model: {model}")
+
+    def set_max_concurrent_requests(self, limit: int) -> None:
+        """Set the process-local cap for in-flight provider calls."""
+        if limit < 1:
+            raise ValueError("max concurrent requests must be at least 1")
+        self.max_concurrent_requests = limit
+        self._request_semaphore = asyncio.Semaphore(limit)
 
     @abstractmethod
     async def _make_api_call(
@@ -137,11 +146,12 @@ class BaseLLMClient(ABC):
                     f"API call attempt {attempt + 1}/{max_retries} with {len(messages)} messages"
                 )
 
-                response_text = await self._make_api_call(
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+                async with self._request_semaphore:
+                    response_text = await self._make_api_call(
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
 
                 logger.debug(f"API call succeeded on attempt {attempt + 1}")
                 return response_text
@@ -167,8 +177,13 @@ class BaseLLMClient(ABC):
                             f"API call failed after {max_retries} retries: {str(e)}"
                         ) from e
                 else:
-                    # Non-retryable error, fail immediately
-                    logger.error(f"Non-retryable error: {str(e)}")
+                    # Preserve typed LLM failures so a higher layer can apply
+                    # a semantic recovery strategy (for example splitting a
+                    # truncated extraction batch). Logging the recoverable
+                    # attempt as ERROR made successful runs look broken.
+                    logger.debug(f"Non-retryable provider error: {str(e)}")
+                    if isinstance(e, TruncatedLLMResponseError):
+                        raise
                     raise LLMError(f"API call failed: {str(e)}") from e
 
         # Should not reach here, but just in case
@@ -211,7 +226,7 @@ class BaseLLMClient(ABC):
         ]
 
         try:
-            logger.info("Starting LLM analysis with ready-made prompt")
+            logger.debug("Starting LLM analysis with ready-made prompt")
             response_text = await self.chat_completion(messages, max_tokens=max_tokens)
             logger.debug(f"Received response of length {len(response_text)}")
 
@@ -241,15 +256,20 @@ class BaseLLMClient(ABC):
                         # Last resort: truncate and salvage partial data
                         parsed = self._try_truncated_parse(stripped)
                         logger.info("Parsed JSON after truncation salvage")
-            logger.info("Successfully parsed JSON response from LLM")
+            logger.debug("Successfully parsed JSON response from LLM")
             return parsed
 
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON response: {str(e)}")
+            logger.debug(f"Failed to parse JSON response: {str(e)}")
             logger.debug(
                 f"Discarding malformed LLM response ({len(response_text)} characters)"
             )
             raise ParsingError(f"Invalid JSON in LLM response: {str(e)}") from e
+        except LLMError as e:
+            # Extraction owns semantic recovery (batch splitting / larger
+            # output budgets) and logs only a terminal failure as a warning.
+            logger.debug(f"Recoverable LLM analysis failure: {str(e)}")
+            raise
         except Exception as e:
             logger.error(f"LLM analysis failed: {str(e)}")
             raise
@@ -297,7 +317,7 @@ class BaseLLMClient(ABC):
             json_str = self._extract_json_from_response(response_text)
 
             parsed = json.loads(json_str)
-            logger.info("Successfully parsed JSON response from LLM")
+            logger.debug("Successfully parsed JSON response from LLM")
             return parsed
 
         except json.JSONDecodeError as e:

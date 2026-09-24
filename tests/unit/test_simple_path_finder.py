@@ -1,6 +1,5 @@
 """Unit tests for simple path finder."""
 
-import pytest
 import networkx as nx
 
 from src.stage2_path_discovery.simple_path_finder import (
@@ -388,6 +387,66 @@ class TestSimpleBFSPathFinderFindAllChains:
         assert chain.source == source
         assert chain.sink == sink
         assert len(chain.path) == 2
+
+    def test_chain_ids_are_deterministic(self) -> None:
+        graph = nx.DiGraph([("input", "query")])
+        source = Source(
+            location=CodeLocation(
+                file_path="Test.java", line_number=3, function_name="run"
+            ),
+            variable_name="input",
+            type="user_input",
+            confidence=0.9,
+            code_snippet="String input = request.getParameter(\"q\");",
+        )
+        sink = Sink(
+            location=CodeLocation(
+                file_path="Test.java", line_number=4, function_name="run"
+            ),
+            variable_name="query",
+            type="sql",
+            confidence=0.9,
+            code_snippet="statement.executeQuery(query);",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+        finder = SimpleBFSPathFinder(graph)
+
+        first = finder.find_all_chains([source], [sink])
+        second = finder.find_all_chains([source], [sink])
+
+        assert first[0].id == second[0].id
+
+    def test_candidate_limit_returns_bounded_result(self) -> None:
+        graph = nx.DiGraph([("first", "sink"), ("second", "sink")])
+        location = CodeLocation(file_path="Test.java", line_number=1)
+        sources = [
+            Source(
+                location=location,
+                variable_name=name,
+                type="user_input",
+                confidence=confidence,
+                code_snippet=name,
+            )
+            for name, confidence in (("first", 0.1), ("second", 0.9))
+        ]
+        sink = Sink(
+            location=location,
+            variable_name="sink",
+            type="sql",
+            confidence=0.9,
+            code_snippet="sink",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+
+        finder = SimpleBFSPathFinder(graph)
+        chains = finder.find_all_chains(sources, [sink], max_chains=1)
+
+        assert len(chains) == 1
+        assert chains[0].source.variable_name == "second"
+        assert finder.limit_exceeded is True
+        assert finder.reachable_pairs_seen == 2
+        assert finder.candidate_pairs_ranked == 2
+        assert finder.ranked_out_count == 1
 
 
 class TestCrossMethodFiltering:

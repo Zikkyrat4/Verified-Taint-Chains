@@ -1,11 +1,13 @@
 """Unit tests for BaseLLMClient abstract class."""
 
-import pytest
+import asyncio
 from typing import List
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
+from src.core.exceptions import LLMError, ParsingError, TruncatedLLMResponseError
 from src.stage1_llm_inference.base_client import BaseLLMClient
-from src.core.exceptions import LLMError, ParsingError
 from src.utils.logger import configure_logging, get_logger, shutdown_logging
 
 
@@ -31,7 +33,6 @@ class MockLLMClient(BaseLLMClient):
         return self.should_retry_value
 
 
-@pytest.mark.asyncio
 class TestBaseLLMClient:
     """Test suite for BaseLLMClient."""
 
@@ -110,6 +111,41 @@ class TestBaseLLMClient:
                 await client.chat_completion(messages, max_retries=3)
 
             # Should only be called once (no retries)
+            assert mock_call.call_count == 1
+
+    async def test_global_request_limit_caps_provider_calls(self):
+        client = MockLLMClient()
+        client.set_max_concurrent_requests(2)
+        active = 0
+        peak = 0
+
+        async def delayed_call(**_kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return "ok"
+
+        with patch.object(client, "_make_api_call", side_effect=delayed_call):
+            await asyncio.gather(*(
+                client.chat_completion([{"role": "user", "content": str(index)}])
+                for index in range(8)
+            ))
+
+        assert peak == 2
+
+    async def test_chat_completion_preserves_truncation_error_type(self):
+        client = MockLLMClient(should_retry=False)
+
+        with patch.object(client, "_make_api_call", new_callable=AsyncMock) as mock_call:
+            mock_call.side_effect = TruncatedLLMResponseError("truncated")
+
+            with pytest.raises(TruncatedLLMResponseError, match="truncated"):
+                await client.chat_completion(
+                    [{"role": "user", "content": "test"}], max_retries=3
+                )
+
             assert mock_call.call_count == 1
 
     async def test_analyze_code_success(self):
@@ -229,6 +265,21 @@ class TestBaseLLMClient:
 
             with pytest.raises(Exception):  # ParsingError
                 await client.chat_with_json_prompt("test prompt")
+
+    async def test_truncation_recovery_signal_is_not_logged_as_error(self, tmp_path):
+        client = MockLLMClient()
+        log_file = tmp_path / "truncation.log"
+        configure_logging(level="DEBUG", log_file=log_file, stderr=False)
+
+        with patch.object(client, "chat_completion", new_callable=AsyncMock) as mock_chat:
+            mock_chat.side_effect = TruncatedLLMResponseError("output limit")
+            with pytest.raises(TruncatedLLMResponseError):
+                await client.chat_with_json_prompt("test prompt")
+
+        get_logger().complete()
+        contents = log_file.read_text()
+        assert "Recoverable LLM analysis failure" in contents
+        assert "| ERROR" not in contents
 
     async def test_invalid_json_does_not_log_raw_response(self, tmp_path):
         """Malformed model output must not be persisted in diagnostic logs."""

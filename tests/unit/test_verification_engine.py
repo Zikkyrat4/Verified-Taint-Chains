@@ -1,16 +1,24 @@
 """Tests for VerificationEngine two-level verification."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
 
 from src.core.config import PipelineConfig
 from src.core.models import (
-    TaintChain, Source, Sink, PathNode, CodeLocation, VulnerabilityType, VerificationStatus,
+    CodeLocation,
+    PathNode,
+    Sink,
+    Source,
+    TaintChain,
+    VerificationStatus,
+    VulnerabilityType,
 )
+from src.stage3_verification.cfg_verifier import CFGVerifier
 from src.stage3_verification.verification_engine import (
-    VerificationEngine, VerificationResult,
+    VerificationEngine,
+    VerificationResult,
 )
-
 
 SAMPLE_CODE = """
 public class Test {
@@ -129,6 +137,7 @@ class TestVerificationEngine:
         engine = VerificationEngine(cfg_config)
         result = engine.verify_chain(sample_chain, SAMPLE_CODE)
         assert isinstance(result, VerificationResult)
+        assert result.status == VerificationStatus.VERIFIED
         assert result.cfg_status is not None
         assert result.method_used == "cfg"
 
@@ -136,6 +145,10 @@ class TestVerificationEngine:
         engine = VerificationEngine(cfg_config)
         result = engine.verify_chain(sample_chain, SAMPLE_CODE)
         assert sample_chain.verification_status == result.status
+        assert sample_chain.verification_method == result.method_used
+        assert sample_chain.verification_details == result.details
+        assert sample_chain.cfg_verification_status == result.cfg_status
+        assert sample_chain.verification_confidence == result.confidence
 
     @patch("src.stage3_verification.verification_engine.CFGVerifier")
     def test_verify_chain_cfg_false_is_inconclusive(self, mock_cfg_cls, cfg_config, sample_chain):
@@ -150,6 +163,17 @@ class TestVerificationEngine:
         assert result.status == VerificationStatus.UNVERIFIABLE
         assert result.confidence == 0.4
         assert result.method_used == "cfg"
+
+    def test_cfg_complexity_limit_is_inconclusive(self, cfg_config, sample_chain):
+        engine = VerificationEngine(cfg_config)
+        engine.cfg_verifier = CFGVerifier(max_source_chars=10)
+
+        result = engine.verify_chain(sample_chain, SAMPLE_CODE)
+
+        assert result.status == VerificationStatus.UNVERIFIABLE
+        assert result.cfg_status == VerificationStatus.FALSE
+        assert "complexity limit" in result.details
+        assert engine.cfg_verifier.get_cfg_info()["limit_exceeded"] is True
 
     @patch("src.stage3_verification.verification_engine.CFGVerifier")
     @patch("src.stage3_verification.verification_engine.SymbolicExecutor")
@@ -223,6 +247,27 @@ class TestVerificationEngine:
         results = engine.verify_all_chains([], SAMPLE_CODE)
         assert results["total"] == 0
         assert results["avg_confidence"] == 0.0
+
+    def test_verify_all_chains_scoped_uses_only_referenced_file(
+        self, cfg_config, sample_chain
+    ):
+        engine = VerificationEngine(cfg_config)
+        unrelated = "class Huge {\n" + "if (true) {\n" * 1000
+
+        with patch.object(
+            engine, "verify_all_chains", wraps=engine.verify_all_chains
+        ) as verify:
+            results = engine.verify_all_chains_scoped(
+                [sample_chain],
+                {
+                    "/project/test.java": SAMPLE_CODE,
+                    "/project/Huge.java": unrelated,
+                },
+            )
+
+        assert results["total"] == 1
+        assert verify.call_count == 1
+        assert verify.call_args.args[1] == SAMPLE_CODE
 
     def test_get_statistics_cfg_only(self, cfg_config):
         engine = VerificationEngine(cfg_config)

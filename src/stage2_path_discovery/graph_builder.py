@@ -192,7 +192,7 @@ class EnhancedGraphBuilder:
                         condition=condition,
                     )
 
-        logger.info(
+        logger.debug(
             f"Built enhanced graph with {graph.number_of_nodes()} nodes and {graph.number_of_edges()} edges"
         )
 

@@ -232,6 +232,63 @@ class TestAStarPathFinder:
         chains = finder.find_all_chains([source1], [sink1])
         assert len(chains) >= 1
 
+    def test_candidate_limit_returns_bounded_result(self):
+        graph = nx.DiGraph([("first", "sink"), ("second", "sink")])
+        location = CodeLocation(file_path="Test.java", line_number=1)
+        sources = [
+            Source(
+                location=location,
+                variable_name=name,
+                type="user_input",
+                confidence=confidence,
+                code_snippet=name,
+            )
+            for name, confidence in (("first", 0.1), ("second", 0.9))
+        ]
+        sink = Sink(
+            location=location,
+            variable_name="sink",
+            type="sql",
+            confidence=0.9,
+            code_snippet="sink",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+
+        finder = AStarPathFinder(graph, use_semantic=False)
+        chains = finder.find_all_chains(sources, [sink], max_chains=1)
+
+        assert len(chains) == 1
+        assert chains[0].source.variable_name == "second"
+        assert finder.limit_exceeded is True
+        assert finder.reachable_pairs_seen == 2
+        assert finder.candidate_pairs_ranked == 2
+        assert finder.ranked_out_count == 1
+
+    def test_intermediate_node_uses_graph_location(self, sample_source, sample_sink):
+        graph = nx.DiGraph()
+        graph.add_node("input", variable_name="input")
+        graph.add_node(
+            "converted",
+            variable_name="converted",
+            file_path="Transformer.java",
+            line=42,
+            function_name="convert",
+            code_snippet="String converted = normalize(input);",
+        )
+        graph.add_node("query", variable_name="query")
+        graph.add_edges_from([("input", "converted"), ("converted", "query")])
+
+        chain = AStarPathFinder(graph, use_semantic=False)._create_chain_from_path(
+            sample_source,
+            sample_sink,
+            ["input", "converted", "query"],
+            graph=graph,
+        )
+
+        assert chain.path[1].location.file_path == "Transformer.java"
+        assert chain.path[1].location.line_number == 42
+        assert chain.path[1].location.function_name == "convert"
+
     def test_create_chain_from_path(self, sample_source, sample_sink):
         path = ["userId", "temp", "query"]
         chain = AStarPathFinder._create_chain_from_path(sample_source, sample_sink, path)

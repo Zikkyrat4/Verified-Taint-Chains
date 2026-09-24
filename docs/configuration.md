@@ -37,11 +37,12 @@ OLLAMA_BASE_URL=http://localhost:11434
 |-----------|----------|----------|-------------|
 | `LLM_PROVIDER` | LLM-провайдер | `openai`, `ollama` | `openai` |
 | `OPENAI_API_KEY` | API-ключ OpenAI | строка | — (обязателен для OpenAI) |
-| `OPENAI_TIMEOUT` | Таймаут одного OpenAI-запроса, сек. | число > 0 | `60` |
+| `OPENAI_TIMEOUT` | Таймаут одного OpenAI-запроса, сек. | число > 0 | `300` |
 | `OPENAI_JSON_MODE` | Использовать `response_format=json_object` | `true`, `false` | `true` |
 | `OPENAI_THINKING` | Управление reasoning совместимого endpoint | `enabled`, `disabled` | `disabled` для `glm-*` |
 | `LLM_MAX_RETRIES` | Максимум попыток после временной ошибки/пустого ответа | целое >= 1 | `2` |
 | `LLM_MAX_TOKENS` | Максимальный размер ответа LLM | целое > 0 | `4000` |
+| `LLM_TRUNCATION_MAX_TOKENS` | Верхний предел ответа для повтора одиночного усеченного batch | целое >= `LLM_MAX_TOKENS` | `16000` |
 | `LLM_BATCH_MAX_CHARS` | Максимальный размер непрерывного batch методов (`0` отключает batching) | целое >= 0 | `8000` |
 | `ANALYSIS_BACKEND` | Генератор source/sink: только LLM / статический baseline / явное объединение | `llm`, `static`, `hybrid` | `llm` |
 | `LLM_ANALYSIS_MODE` | Охват LLM: релевантные методы / все нетривиальные методы | `targeted`, `exhaustive` | `targeted` |
@@ -60,12 +61,24 @@ backend и режиму охвата. Повторный прогон не вы�
 `MAX_CONCURRENT_FUNCTIONS=4` сокращает холодный прогон ценой большего числа
 одновременных запросов.
 
+Если batch не помещается в `LLM_MAX_TOKENS`, он рекурсивно делится по границам
+методов. Для одного неделимого метода output budget увеличивается ступенчато,
+но не выше `LLM_TRUNCATION_MAX_TOKENS`. Окончательная ошибка остается execution
+error и не превращается в отрицательную prediction.
+
 ### Параллелизм
 
 | Переменная | Описание | Значения | По умолчанию |
 |-----------|----------|----------|-------------|
 | `MAX_CONCURRENT_FILES` | Параллельно анализируемые файлы проекта | целое > 0 | `4` |
 | `MAX_CONCURRENT_FUNCTIONS` | Параллельные LLM-запросы функций одного файла | целое > 0 | `2` |
+| `MAX_CONCURRENT_LLM_REQUESTS` | Жесткий общий предел запросов к LLM по всем файлам | целое > 0 | `5` |
+
+Первые две настройки управляют планированием задач, но их произведение не
+увеличивает нагрузку на endpoint выше `MAX_CONCURRENT_LLM_REQUESTS`. CLI-флаг
+`--max-concurrent` у `analyze`/`sinks` и
+`--max-concurrent-llm-requests` у `benchmark run` переопределяют именно этот
+глобальный предел.
 
 ### Поиск путей
 
@@ -75,6 +88,7 @@ backend и режиму охвата. Повторный прогон не вы�
 | `USE_SEMANTIC_HEURISTIC` | Использовать семантическую эвристику в A* | `true`, `false` | `true` |
 | `VTC_USE_CODEBERT` | Загрузить CodeBERT вместо быстрой детерминированной эвристики | `true`, `false` | `false` |
 | `MAX_PATH_LENGTH` | Максимальная длина пути | целое число | `15` |
+| `MAX_CANDIDATE_CHAINS` | Предел сохраняемых кандидатов; переполнение помечается в metrics | целое > 0 | `10000` |
 | `USE_JOERN` | Использовать Joern для PDG | `true`, `false` | `false` |
 | `LLM_GRAPH_ENRICHMENT_ENABLED` | Добавлять спекулятивные LLM-рёбра поверх AST | `true`, `false` | `false` |
 
@@ -85,6 +99,12 @@ backend и режиму охвата. Повторный прогон не вы�
 | `VERIFICATION_LEVEL` | Уровень верификации | `cfg`, `symbolic`, `both` | `cfg` |
 | `SYMBOLIC_TIMEOUT` | Таймаут символьного выполнения (сек.) | целое число | `60` |
 | `VERIFICATION_ENABLED` | Включить верификацию | `true`, `false` | `true` |
+
+`MAX_CANDIDATE_CHAINS` не обрезает результат молча: при превышении анализ
+завершается явной resource-limit ошибкой. В пользовательские findings попадают
+только цепочки `verified`. Цепочки `unverifiable` и `false` возвращаются
+отдельно и не учитываются как обнаруженные уязвимости. Внешние benchmark-ы
+требуют `VERIFICATION_ENABLED=true`.
 
 ### Анализ
 

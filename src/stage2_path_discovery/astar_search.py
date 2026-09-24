@@ -8,7 +8,13 @@ from typing import Dict, List, Optional, Set, Tuple
 import networkx as nx
 import numpy as np
 
-from src.core.models import Source, Sink, Sanitizer, TaintChain, PathNode, CodeLocation
+from src.core.models import PathNode, Sanitizer, Sink, Source, TaintChain
+from src.stage2_path_discovery.simple_path_finder import (
+    _display_node_name,
+    _intermediate_path_node,
+    candidate_pair_priority,
+    stable_chain_id,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -185,6 +191,10 @@ class AStarPathFinder:
         """
         self.graph = graph
         self.use_semantic = use_semantic
+        self.limit_exceeded = False
+        self.reachable_pairs_seen = 0
+        self.candidate_pairs_ranked = 0
+        self.ranked_out_count = 0
 
         if semantic_heuristic is None:
             self.heuristic = SemanticHeuristic() if use_semantic else None
@@ -245,7 +255,7 @@ class AStarPathFinder:
 
             # Check if we reached the goal
             if current_node == sink_node:
-                logger.info(f"A* found path of length {len(path)}: {' -> '.join(path)}")
+                logger.debug(f"A* found path of length {len(path)}: {' -> '.join(path)}")
                 return path
 
             # Skip if already visited (cycle detection)
@@ -346,6 +356,7 @@ class AStarPathFinder:
         max_length: int = 15,
         sanitizers: Optional[List[Sanitizer]] = None,
         node_id_map: Optional[Dict[int, str]] = None,
+        max_chains: int = 0,
     ) -> List[TaintChain]:
         """Find all taint chains between sources and sinks using A*.
 
@@ -361,11 +372,17 @@ class AStarPathFinder:
                 graph node ID (e.g. ``"File.java:varName"``).  When *None*
                 (default) the plain ``variable_name`` is used — fully
                 backward-compatible with the old single-file behaviour.
+            max_chains: Maximum retained candidates. The finder records
+                ``limit_exceeded`` when additional reachable pairs exist.
 
         Returns:
             List of TaintChain objects representing found vulnerabilities.
         """
         chains: List[TaintChain] = []
+        self.limit_exceeded = False
+        self.reachable_pairs_seen = 0
+        self.candidate_pairs_ranked = 0
+        self.ranked_out_count = 0
 
         def _node_id(obj: object) -> str:
             if node_id_map is not None:
@@ -397,6 +414,7 @@ class AStarPathFinder:
             source_reachable[src_id] = reachable
 
         skipped = 0
+        candidate_pairs: List[Tuple[Tuple[object, ...], Source, Sink]] = []
         for source in sources:
             src_id = _node_id(source)
             reachable = source_reachable.get(src_id, set())
@@ -405,100 +423,128 @@ class AStarPathFinder:
                 if sink_id not in reachable:
                     skipped += 1
                     continue
-                # Same-file, cross-method flows are accepted only when the
-                # discovered path crosses a declared class field. This keeps
-                # legitimate setter -> renderer flows while preventing local
-                # variables with identical names from collapsing scopes.
-                src_func = getattr(source.location, "function_name", None)
-                sink_func = getattr(sink.location, "function_name", None)
-                src_file = getattr(source.location, "file_path", "")
-                sink_file = getattr(sink.location, "file_path", "")
-                cross_method = bool(
-                    src_func and sink_func and src_func != sink_func
-                    and src_file and sink_file and src_file == sink_file
+                candidate_pairs.append(
+                    (candidate_pair_priority(source, sink), source, sink)
                 )
 
-                logger.trace(f"A* search: {src_id} -> {sink_id}")
+        candidate_pairs.sort(key=lambda item: item[0], reverse=True)
+        self.candidate_pairs_ranked = len(candidate_pairs)
+        self.reachable_pairs_seen = len(candidate_pairs)
 
-                pair_function = None
-                if src_func and sink_func and src_func == sink_func and src_file == sink_file:
-                    pair_function = src_func
-                if cross_method:
-                    path_nodes = self._find_scoped_field_path(
-                        src_id,
-                        sink_id,
-                        {src_func, sink_func},
-                        max_length,
-                    )
-                else:
-                    path_nodes = self.find_path(
-                        src_id,
-                        sink_id,
-                        max_length,
-                        function_name=pair_function,
-                    )
+        for pair_index, (_, source, sink) in enumerate(candidate_pairs):
+            src_id = _node_id(source)
+            sink_id = _node_id(sink)
+            # Same-file, cross-method flows are accepted only when the
+            # discovered path crosses a declared class field. This keeps
+            # legitimate setter -> renderer flows while preventing local
+            # variables with identical names from collapsing scopes.
+            src_func = getattr(source.location, "function_name", None)
+            sink_func = getattr(sink.location, "function_name", None)
+            src_file = getattr(source.location, "file_path", "")
+            sink_file = getattr(sink.location, "file_path", "")
+            cross_method = bool(
+                src_func
+                and sink_func
+                and src_func != sink_func
+                and src_file
+                and sink_file
+                and src_file == sink_file
+            )
 
-                if path_nodes:
-                    cross_file = bool(
-                        src_file and sink_file and src_file != sink_file
-                    )
-                    if cross_file and src_func:
-                        bridge_functions = [
-                            self.graph[left][right].get("caller_function")
-                            for left, right in zip(path_nodes, path_nodes[1:])
-                            if self.graph[left][right].get("bridge")
-                        ]
-                        if (
-                            bridge_functions
-                            and src_func not in bridge_functions
-                        ):
-                            logger.debug(
-                                "Skipping cross-file path whose call bridge "
-                                f"belongs to another method: {src_id} -> {sink_id}"
-                            )
-                            continue
-                    if cross_method:
-                        allowed_functions = {src_func, sink_func}
-                        edges_in_scope = True
-                        has_field_flow = False
-                        for left, right in zip(path_nodes, path_nodes[1:]):
-                            edge = self.graph[left][right]
-                            if edge.get("bridge"):
-                                continue
-                            edge_functions = set(edge.get("function_names", []))
-                            if edge.get("function_name"):
-                                edge_functions.add(edge["function_name"])
-                            if not edge_functions or edge_functions.isdisjoint(
-                                allowed_functions
-                            ):
-                                edges_in_scope = False
-                                break
-                            field_functions = set(
-                                edge.get("field_flow_functions", [])
-                            )
-                            if not field_functions.isdisjoint(allowed_functions):
-                                has_field_flow = True
-                        if not has_field_flow or not edges_in_scope:
-                            logger.debug(
-                                "Skipping unscoped cross-method path: "
-                                f"{src_id} -> {sink_id}"
-                            )
-                            continue
-                    # Filter self-loops: a single-node path means
-                    # source and sink map to the same graph node
-                    # — no actual data flow exists.
-                    if len(path_nodes) <= 1:
+            logger.trace(f"A* search: {src_id} -> {sink_id}")
+
+            pair_function = None
+            if (
+                src_func
+                and sink_func
+                and src_func == sink_func
+                and src_file == sink_file
+            ):
+                pair_function = src_func
+            if cross_method:
+                path_nodes = self._find_scoped_field_path(
+                    src_id,
+                    sink_id,
+                    {src_func, sink_func},
+                    max_length,
+                )
+            else:
+                path_nodes = self.find_path(
+                    src_id,
+                    sink_id,
+                    max_length,
+                    function_name=pair_function,
+                )
+
+            if path_nodes:
+                cross_file = bool(
+                    src_file and sink_file and src_file != sink_file
+                )
+                if cross_file and src_func:
+                    bridge_functions = [
+                        self.graph[left][right].get("caller_function")
+                        for left, right in zip(path_nodes, path_nodes[1:])
+                        if self.graph[left][right].get("bridge")
+                    ]
+                    if bridge_functions and src_func not in bridge_functions:
                         logger.debug(
-                            f"Skipping self-loop chain: {src_id} (path length {len(path_nodes)})"
+                            "Skipping cross-file path whose call bridge "
+                            f"belongs to another method: {src_id} -> {sink_id}"
                         )
                         continue
-
-                    # Create TaintChain from path
-                    chain = self._create_chain_from_path(
-                        source, sink, path_nodes, sanitizers or []
+                if cross_method:
+                    allowed_functions = {src_func, sink_func}
+                    edges_in_scope = True
+                    has_field_flow = False
+                    for left, right in zip(path_nodes, path_nodes[1:]):
+                        edge = self.graph[left][right]
+                        if edge.get("bridge"):
+                            continue
+                        edge_functions = set(edge.get("function_names", []))
+                        if edge.get("function_name"):
+                            edge_functions.add(edge["function_name"])
+                        if not edge_functions or edge_functions.isdisjoint(
+                            allowed_functions
+                        ):
+                            edges_in_scope = False
+                            break
+                        field_functions = set(
+                            edge.get("field_flow_functions", [])
+                        )
+                        if not field_functions.isdisjoint(allowed_functions):
+                            has_field_flow = True
+                    if not has_field_flow or not edges_in_scope:
+                        logger.debug(
+                            "Skipping unscoped cross-method path: "
+                            f"{src_id} -> {sink_id}"
+                        )
+                        continue
+                # Filter self-loops: a single-node path means
+                # source and sink map to the same graph node
+                # — no actual data flow exists.
+                if len(path_nodes) <= 1:
+                    logger.debug(
+                        f"Skipping self-loop chain: {src_id} "
+                        f"(path length {len(path_nodes)})"
                     )
-                    chains.append(chain)
-                    logger.info(f"Found optimal chain: {src_id} -> {sink_id}")
+                    continue
+
+                # Create TaintChain from path
+                chain = self._create_chain_from_path(
+                    source, sink, path_nodes, sanitizers or [], self.graph
+                )
+                chains.append(chain)
+                logger.debug(f"Found optimal chain: {src_id} -> {sink_id}")
+                if max_chains and len(chains) >= max_chains:
+                    self.ranked_out_count = len(candidate_pairs) - pair_index - 1
+                    self.limit_exceeded = self.ranked_out_count > 0
+                    if self.limit_exceeded:
+                        logger.warning(
+                            "Global top-k candidate selection retained "
+                            f"{max_chains} of {len(candidate_pairs)} ranked "
+                            "graph-reachable endpoint pairs"
+                        )
+                    break
 
         if skipped:
             logger.debug(f"Skipped {skipped} unreachable source-sink pairs via pre-filter")
@@ -557,6 +603,7 @@ class AStarPathFinder:
         sink: Sink,
         path_nodes: List[str],
         sanitizers: Optional[List[Sanitizer]] = None,
+        graph: Optional[nx.DiGraph] = None,
     ) -> TaintChain:
         """Create a TaintChain object from a path.
 
@@ -573,27 +620,47 @@ class AStarPathFinder:
         path_objs: List[PathNode] = []
 
         for i, node_name in enumerate(path_nodes):
-            # Strip scope prefix (e.g. "File.java:varName" -> "varName")
-            display_name = node_name.split(":", 1)[-1] if ":" in node_name else node_name
-
             if i == 0:
                 # First node is the source
                 node_type = "source"
                 location = source.location
                 code_snippet = source.code_snippet
+                display_name = source.variable_name
             elif i == len(path_nodes) - 1:
                 # Last node is the sink
                 node_type = "sink"
                 location = sink.location
                 code_snippet = sink.code_snippet
+                display_name = sink.variable_name
             else:
-                # Intermediate nodes
+                if graph is not None:
+                    display_name = _display_node_name(graph, node_name)
+                    from_endpoint = graph.has_edge(path_nodes[i - 1], node_name) and (
+                        graph[path_nodes[i - 1]][node_name].get("edge_type")
+                        == "endpoint_binding"
+                    )
+                    to_endpoint = graph.has_edge(node_name, path_nodes[i + 1]) and (
+                        graph[node_name][path_nodes[i + 1]].get("edge_type")
+                        == "endpoint_binding"
+                    )
+                    if (
+                        from_endpoint and display_name == source.variable_name
+                    ) or (to_endpoint and display_name == sink.variable_name):
+                        continue
+                    path_objs.append(
+                        _intermediate_path_node(
+                            graph,
+                            node_name,
+                            path_nodes[i - 1],
+                            path_nodes[i + 1],
+                            source.location,
+                        )
+                    )
+                    continue
                 node_type = "intermediate"
-                location = CodeLocation(
-                    file_path=source.location.file_path,
-                    line_number=source.location.line_number + i,
-                )
+                location = source.location.model_copy()
                 code_snippet = ""
+                display_name = node_name.rsplit(":", 1)[-1]
 
             path_obj = PathNode(
                 location=location,
@@ -604,7 +671,7 @@ class AStarPathFinder:
             path_objs.append(path_obj)
 
         # Create TaintChain
-        chain_id = f"{source.variable_name}_to_{sink.variable_name}_{id(path_nodes)}"
+        chain_id = stable_chain_id(source, sink, path_nodes)
 
         # Calculate confidence as average of source and sink confidence
         confidence = (source.confidence + sink.confidence) / 2.0
@@ -621,7 +688,11 @@ class AStarPathFinder:
             # Collect chain variable names for variable-aware matching
             chain_vars = {source.variable_name, sink.variable_name}
             for node_name in path_nodes:
-                display = node_name.split(":", 1)[-1] if ":" in node_name else node_name
+                display = (
+                    _display_node_name(graph, node_name)
+                    if graph is not None
+                    else node_name.rsplit(":", 1)[-1]
+                )
                 chain_vars.add(display)
 
             for san in sanitizers:

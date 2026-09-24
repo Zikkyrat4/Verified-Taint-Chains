@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.stage1_llm_inference.specification_extractor import SimpleSpecificationExtractor
 from src.stage1_llm_inference.llm_client import SimpleLLMClient
-from src.core.exceptions import ParsingError, LLMError
-from src.core.models import CodeLocation, SinkCategory, Source, VulnerabilityType
+from src.core.exceptions import LLMError, ParsingError, TruncatedLLMResponseError
+from src.core.models import CodeLocation, Sink, SinkCategory, Source, VulnerabilityType
 
 
 class TestSimpleSpecificationExtractorInit:
@@ -331,6 +331,19 @@ class TestParseLLMSinks:
 
         with pytest.raises(ParsingError):
             extractor._parse_llm_sinks("not a dict", "test.java")
+
+    def test_parse_sinks_missing_required_field_raises(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client)
+
+        with pytest.raises(
+            ParsingError,
+            match=r"sinks\[0\] missing required field\(s\): type",
+        ):
+            extractor._parse_llm_sinks(
+                {"sinks": [{"line": 20, "variable": "query"}]},
+                "test.java",
+            )
 
     def test_parse_sinks_with_line_offset(self) -> None:
         """Test that line offset is applied correctly."""
@@ -976,6 +989,149 @@ class TestLLMBatching:
         assert client.chat_with_json_prompt.await_count == 4
 
     @pytest.mark.asyncio
+    async def test_incomplete_endpoint_schema_is_retried_before_parsing(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(side_effect=[
+            {
+                "sources": [],
+                "sinks": [{"line": 3, "variable": "value"}],
+            },
+            {"sources": [], "sinks": [], "sanitizers": []},
+        ])
+        extractor = SimpleSpecificationExtractor(
+            client,
+            batch_max_chars=10_000,
+        )
+        code = """public class Consumer {
+    public void consume(String value) {
+        service.accept(value);
+    }
+}
+"""
+
+        spec = await extractor.extract(code, "Consumer.java")
+
+        assert spec.extraction_complete is True
+        assert spec.extraction_errors == []
+        assert client.chat_with_json_prompt.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unsplittable_truncation_retries_with_larger_output_budget(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(side_effect=[
+            TruncatedLLMResponseError("response exceeded max_tokens=4000"),
+            {
+                "sources": [{
+                    "line": 3,
+                    "variable": "cmd",
+                    "type": "user_input",
+                    "confidence": 0.95,
+                }],
+                "sinks": [{
+                    "line": 4,
+                    "variable": "cmd",
+                    "type": "command_execution",
+                    "vulnerability_type": "command_injection",
+                    "confidence": 0.95,
+                }],
+                "sanitizers": [],
+            },
+        ])
+        extractor = SimpleSpecificationExtractor(
+            client,
+            batch_max_chars=10_000,
+            truncation_max_tokens=16_000,
+        )
+        code = """public class CommandRunner {
+    public void run(HttpServletRequest request) {
+        String cmd = request.getParameter("cmd");
+        Runtime.getRuntime().exec(cmd);
+    }
+}
+"""
+
+        spec = await extractor.extract(code, "CommandRunner.java")
+
+        assert spec.extraction_complete is True
+        assert client.chat_with_json_prompt.await_count == 2
+        assert client.chat_with_json_prompt.await_args_list[1].kwargs == {
+            "max_tokens": 8000
+        }
+
+    def test_failed_oversized_method_is_split_with_stable_offsets(self):
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=8000)
+        lines = [
+            "    String value = request.getParameter(\"q\");\n"
+            if index % 2
+            else "    Runtime.getRuntime().exec(value);\n"
+            for index in range(300)
+        ]
+        method = "    public void run() {\n" + "".join(lines) + "    }\n"
+        code = "public class Huge {\n" + method + "}\n"
+        functions = extractor._split_into_functions(code)
+        entry = ("__batch_1", method, 1, None)
+
+        parts = extractor._split_failed_llm_batch(
+            code, functions, entry, max_chars=8000
+        )
+
+        assert len(parts) > 2
+        assert all(name.startswith("__batch_1_part_") for name, *_ in parts)
+        assert all(len(part_code) <= 4000 for _, part_code, *_ in parts)
+        assert [offset for _, _, offset, _ in parts] == sorted(
+            offset for _, _, offset, _ in parts
+        )
+        assert parts[0][2] == 1
+        assert parts[1][2] < parts[0][2] + parts[0][1].count("\n")
+
+    @pytest.mark.asyncio
+    async def test_failed_batches_are_split_recursively_to_methods(self):
+        client = SimpleLLMClient(api_key="test-key")
+        valid = {
+            "sources": [{
+                "line": 2,
+                "variable": "value",
+                "type": "user_input",
+                "confidence": 0.9,
+            }],
+            "sinks": [{
+                "line": 3,
+                "variable": "value",
+                "type": "command_execution",
+                "vulnerability_type": "command_injection",
+                "confidence": 0.9,
+            }],
+            "sanitizers": [],
+        }
+        client.chat_with_json_prompt = AsyncMock(side_effect=[
+            LLMError("full batch failed"),
+            LLMError("left half failed"),
+            LLMError("right half failed"),
+            valid,
+            valid,
+            valid,
+            valid,
+        ])
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=10_000)
+        methods = "\n".join(
+            f"""    public void {name}(HttpServletRequest request) {{
+        String value = request.getParameter("q");
+        Runtime.getRuntime().exec(value);
+    }}"""
+            for name in ("first", "second", "third", "fourth")
+        )
+        code = f"public class RecursiveBatch {{\n{methods}\n}}\n"
+
+        spec = await extractor.extract(code, "RecursiveBatch.java")
+
+        assert spec.extraction_complete is True
+        assert client.chat_with_json_prompt.await_count == 7
+        assert {
+            source.location.function_name for source in spec.sources
+        } == {"first", "second", "third", "fourth"}
+
+    @pytest.mark.asyncio
     async def test_successful_large_batch_is_not_mistaken_for_failure(self):
         client = SimpleLLMClient(api_key="test-key")
         client.chat_with_json_prompt = AsyncMock(return_value={
@@ -997,9 +1153,9 @@ class TestLLMBatching:
         spec = await extractor.extract(code, "SuccessfulBatch.java")
 
         assert spec.extraction_complete is True
-        # The empty batch is reviewed once per suspicious method, not treated
-        # as a failed batch and recursively split/retried.
-        assert client.chat_with_json_prompt.await_count == 3
+        # Recovery is bounded to one additional request per file, not one per
+        # suspicious method.
+        assert client.chat_with_json_prompt.await_count == 2
 
     @pytest.mark.asyncio
     async def test_sink_without_sources_gets_one_llm_consistency_repair(self):
@@ -1093,7 +1249,9 @@ class TestLLMBatching:
                 "sources": [{
                     "line": 7, "variable": "target",
                     "type": "user_input", "confidence": 0.9,
-                }]
+                }],
+                "sinks": [],
+                "sanitizers": [],
             },
         ])
         extractor = SimpleSpecificationExtractor(client, batch_max_chars=10_000)
@@ -1135,6 +1293,32 @@ class TestLLMAnalysisModes:
 
         client.chat_with_json_prompt.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "engine.eval(expression)",
+            "new GroovyShell().parse(script)",
+            "response.getWriter().print(value)",
+            "parser.parseExpression(expression).getValue()",
+            "Class.forName(className)",
+        ],
+    )
+    def test_targeted_routes_generic_security_operations(self, operation):
+        assert SimpleSpecificationExtractor._FUNC_SECURITY_RE.search(operation)
+
+    def test_plain_exception_throw_is_not_a_sink(self):
+        sink = Sink(
+            location=CodeLocation(file_path="Parser.java", line_number=10),
+            variable_name="codeString",
+            type="reflected_error",
+            confidence=0.9,
+            code_snippet='throw new FHIRException("Unknown " + codeString);',
+            vulnerability_type=VulnerabilityType.XSS,
+            sink_category=SinkCategory.OUTPUT_RENDERING,
+        )
+
+        assert SimpleSpecificationExtractor._is_plausible_sink(sink) is False
+
     @pytest.mark.asyncio
     async def test_llm_backend_does_not_mix_in_deterministic_endpoints(self):
         client = SimpleLLMClient(api_key="test-key")
@@ -1172,6 +1356,25 @@ class TestLLMAnalysisModes:
         assert any(sink.variable_name == "cmd" for sink in spec.sinks)
         assert spec.extraction_backend == "static"
         assert spec.llm_model == ""
+
+    @pytest.mark.asyncio
+    async def test_static_backend_recognizes_standard_class_for_name(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock()
+        extractor = SimpleSpecificationExtractor(client, analysis_backend="static")
+
+        spec = await extractor.extract(
+            "class T { Class<?> load(String className) throws Exception { "
+            "return Class.forName(className); } }",
+            "T.java",
+        )
+
+        client.chat_with_json_prompt.assert_not_called()
+        assert any(
+            sink.variable_name in {"className", "return_value"}
+            and sink.vulnerability_type == VulnerabilityType.CODE_INJECTION
+            for sink in spec.sinks
+        )
 
 
 class TestParseLLMSanitizers:

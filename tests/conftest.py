@@ -8,10 +8,12 @@ Provides common fixtures for all tests including:
 """
 
 import json
-import pytest
+import os
 from pathlib import Path
 from typing import Dict, List
 from unittest.mock import Mock, AsyncMock
+
+import pytest
 
 from src.core.config import PipelineConfig
 from src.core.models import (
@@ -24,6 +26,9 @@ from src.core.models import (
     VerificationStatus,
 )
 from src.stage1_llm_inference.llm_client import SimpleLLMClient
+
+# Tests must not append synthetic records to the user's persistent CLI log.
+os.environ.setdefault("LOG_FILE", "off")
 
 
 # ============================================================================

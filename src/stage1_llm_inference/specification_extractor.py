@@ -15,7 +15,7 @@ from src.core.models import (
     VulnerabilityType,
 )
 from src.core.source_sink_classifier import classify_source, classify_sink
-from src.core.exceptions import ParsingError, LLMError
+from src.core.exceptions import LLMError, ParsingError, TruncatedLLMResponseError
 from src.stage1_llm_inference.llm_client import SimpleLLMClient
 from src.stage1_llm_inference.ast_parser import JavaASTParser
 from src.stage1_llm_inference.prompt_templates import (
@@ -48,6 +48,7 @@ class SimpleSpecificationExtractor:
         llm_provider: str = "",
         max_concurrent_functions: int = 1,
         batch_max_chars: int = 0,
+        truncation_max_tokens: int = 16000,
         analysis_backend: str = "llm",
         analysis_mode: str = "exhaustive",
         cache_read_enabled: bool = True,
@@ -79,6 +80,7 @@ class SimpleSpecificationExtractor:
         self.llm_provider = llm_provider
         self.max_concurrent_functions = max_concurrent_functions
         self.batch_max_chars = batch_max_chars
+        self.truncation_max_tokens = truncation_max_tokens
         if analysis_backend not in ("llm", "static", "hybrid"):
             raise ValueError(
                 "analysis_backend must be 'llm', 'static', or 'hybrid'"
@@ -93,7 +95,7 @@ class SimpleSpecificationExtractor:
         self.analysis_mode = analysis_mode
         self.cache_read_enabled = cache_read_enabled
 
-        logger.info(
+        logger.debug(
             f"Initialized SimpleSpecificationExtractor with threshold={confidence_threshold}"
         )
         logger.debug("AST parser initialized for improved code analysis")
@@ -112,9 +114,15 @@ class SimpleSpecificationExtractor:
         r"|new\s+File\(|new\s+FileInputStream|Paths\.get|Files\."
         r"|DocumentBuilder|SAXParser|XMLReader|TransformerFactory"
         r"|URL\(|HttpURLConnection|HttpClient|openConnection"
-        r"|ObjectInputStream|readObject|XMLDecoder|classForName|\.deserialize\s*\("
+        r"|ObjectInputStream|readObject|XMLDecoder|Class\s*\.\s*forName|classForName|\.deserialize\s*\("
         r"|getAttribute"
-        r"|RuntimeException|throw\s+new"
+        r"|ScriptEngine|GroovyShell|GroovyClassLoader|BeanShell|Interpreter"
+        r"|SpelExpressionParser|ExpressionParser|MVEL|OGNL|Janino"
+        r"|\.eval\s*\(|evaluate\s*\(|parseExpression|parseClass|compile\s*\(|defineClass"
+        r"|ClassLoader|MethodHandles|\.invoke\s*\(|getDeclaredMethod"
+        r"|Template|Renderer|render\s*\(|processTemplate|mergeTemplate"
+        r"|getWriter\s*\(|getOutputStream\s*\(|sendError\s*\("
+        r"|setHeader\s*\(|addHeader\s*\(|setStatus\s*\("
     )
 
     _EMPTY_REVIEW_SOURCE_RE = re.compile(
@@ -127,7 +135,7 @@ class SimpleSpecificationExtractor:
         r"executeQuery|executeUpdate|Runtime\.getRuntime|ProcessBuilder|\.exec\s*\("
         r"|sendRedirect"
         r"|new\s+File\s*\(|Files\.(?:copy|write|move)|openConnection"
-        r"|classForName|\.deserialize\s*\(|\.readValue\s*\("
+        r"|Class\s*\.\s*forName|classForName|\.deserialize\s*\(|\.readValue\s*\("
     )
 
     @staticmethod
@@ -242,7 +250,7 @@ class SimpleSpecificationExtractor:
         ):
             cached = self.spec_cache.get(source_code, **cache_kwargs)
             if cached is not None:
-                logger.info(
+                logger.debug(
                     f"Cache hit for {file_path or 'inline code'} "
                     f"(skipping Stage 1 LLM)"
                 )
@@ -257,7 +265,7 @@ class SimpleSpecificationExtractor:
 
         # Step 2: AST prefilter — zero possibility of a sink in this file.
         if not self._has_potential_sinks(source_code):
-            logger.info(
+            logger.debug(
                 f"Skipping {file_path or 'inline code'}: AST prefilter "
                 f"found no method invocations (sink impossible)"
             )
@@ -313,7 +321,7 @@ class SimpleSpecificationExtractor:
         Split out from ``extract`` so the cache/prefilter layer can wrap it
         without touching the LLM logic.
         """
-        logger.info(f"Starting extraction from {file_path or 'inline code'}")
+        logger.debug(f"Starting extraction from {file_path or 'inline code'}")
 
         # Extract global context (imports, classes)
         imports = self._extract_imports(source_code)
@@ -365,7 +373,7 @@ class SimpleSpecificationExtractor:
             analysis_entries = self._build_llm_batches(
                 source_code, analyzable, self.batch_max_chars
             )
-            logger.info(
+            logger.debug(
                 f"Batched {len(analyzable)} functions into "
                 f"{len(analysis_entries)} LLM request(s)"
             )
@@ -377,8 +385,9 @@ class SimpleSpecificationExtractor:
         semaphore = asyncio.Semaphore(self.max_concurrent_functions)
 
         async def _analyze_function(
-            entry: Tuple[str, str, int, Optional[Dict[str, Any]]]
-        ) -> Tuple[List[Source], List[Sink], List[Sanitizer], Optional[str]]:
+            entry: Tuple[str, str, int, Optional[Dict[str, Any]]],
+            max_tokens: Optional[int] = None,
+        ) -> Tuple[List[Source], List[Sink], List[Sanitizer], Optional[Exception]]:
             func_name, func_code, line_offset, func_info = entry
             try:
                 async with semaphore:
@@ -403,9 +412,15 @@ class SimpleSpecificationExtractor:
                         response = None
                         for attempt in range(2):
                             try:
-                                response = await self.llm_client.chat_with_json_prompt(
-                                    combined_prompt
+                                kwargs = (
+                                    {"max_tokens": max_tokens}
+                                    if max_tokens is not None
+                                    else {}
                                 )
+                                response = await self.llm_client.chat_with_json_prompt(
+                                    combined_prompt, **kwargs
+                                )
+                                self._validate_combined_response(response)
                                 break
                             except ParsingError:
                                 if attempt == 0:
@@ -436,33 +451,6 @@ class SimpleSpecificationExtractor:
                         function_name=func_name,
                     ))
                     sources = self._deduplicate_sources(sources)
-                if sinks and not sources:
-                    try:
-                        async with semaphore:
-                            with logger.contextualize(
-                                target=file_path or "inline-code",
-                                function_name=func_name,
-                            ):
-                                repair_response = await self.llm_client.chat_with_json_prompt(
-                                    build_missing_source_repair_prompt(
-                                        func_code, response.get("sinks", [])
-                                    )
-                                )
-                        sources = self._parse_llm_sources(
-                            repair_response, file_path, line_offset,
-                            function_name=func_name,
-                        )
-                        logger.info(
-                            f"Source consistency repair for {func_name}: "
-                            f"recovered {len(sources)} source(s)"
-                        )
-                    except Exception as e:
-                        # The complete first-pass answer remains usable; this
-                        # bounded repair is recall enhancement, not extraction.
-                        logger.warning(
-                            f"Source consistency repair failed for {func_name}: "
-                            f"{type(e).__name__}: {e}"
-                        )
                 if response and "sanitizers" in response:
                     sanitizers = self._parse_llm_sanitizers(
                         response, file_path, line_offset,
@@ -474,46 +462,66 @@ class SimpleSpecificationExtractor:
                 return sources, sinks, sanitizers, None
 
             except (ParsingError, LLMError) as e:
-                logger.warning(f"Failed to analyze function {func_name}: {str(e)}")
-                logger.debug(f"Raw error details for {func_name}: {repr(e)}")
-                return [], [], [], f"{func_name}: {e}"
+                return [], [], [], e
             except Exception as e:
-                logger.error(f"Unexpected error analyzing {func_name}: {str(e)}")
                 logger.debug(f"Raw error details for {func_name}: {repr(e)}")
-                return [], [], [], f"{func_name}: {type(e).__name__}: {e}"
+                return [], [], [], e
 
-        # gather preserves input order while allowing a bounded number of calls.
-        initial_results = await asyncio.gather(
-            *(_analyze_function(entry) for entry in analysis_entries)
-        )
         function_results: List[
-            Tuple[List[Source], List[Sink], List[Sanitizer], Optional[str]]
+            Tuple[List[Source], List[Sink], List[Sanitizer], Optional[Exception]]
         ] = []
-        retry_entries: List[Tuple[str, str, int, Optional[Dict[str, Any]]]] = []
-        for entry, result in zip(analysis_entries, initial_results):
-            if result[3] is None:
-                function_results.append(result)
-                continue
-
-            split_entries = self._split_failed_llm_batch(
-                source_code,
-                analyzable,
-                entry,
-                self.batch_max_chars,
-            )
-            if len(split_entries) > 1:
-                logger.warning(
-                    f"Retrying failed {entry[0]} as {len(split_entries)} "
-                    "smaller LLM batches"
-                )
-                retry_entries.extend(split_entries)
-            else:
-                function_results.append(result)
-
-        if retry_entries:
-            function_results.extend(await asyncio.gather(
-                *(_analyze_function(entry) for entry in retry_entries)
+        pending = [(entry, None) for entry in analysis_entries]
+        while pending:
+            current = pending
+            pending = []
+            current_results = await asyncio.gather(*(
+                _analyze_function(entry, max_tokens)
+                for entry, max_tokens in current
             ))
+            for (entry, max_tokens), result in zip(current, current_results):
+                error = result[3]
+                if error is None:
+                    function_results.append(result)
+                    continue
+
+                split_entries = self._split_failed_llm_batch(
+                    source_code,
+                    analyzable,
+                    entry,
+                    self.batch_max_chars,
+                )
+                if len(split_entries) > 1:
+                    logger.warning(
+                        f"Retrying failed {entry[0]} as {len(split_entries)} "
+                        "smaller LLM batches"
+                    )
+                    pending.extend((split_entry, None) for split_entry in split_entries)
+                    continue
+
+                default_tokens = int(
+                    getattr(self.llm_client, "default_max_tokens", 4000)
+                )
+                current_tokens = max_tokens or default_tokens
+                if (
+                    isinstance(error, TruncatedLLMResponseError)
+                    and current_tokens < self.truncation_max_tokens
+                ):
+                    next_tokens = min(
+                        self.truncation_max_tokens,
+                        max(current_tokens * 2, current_tokens + 1024),
+                    )
+                    logger.warning(
+                        f"Retrying unsplittable {entry[0]} with "
+                        f"max_tokens={next_tokens} after truncated response"
+                    )
+                    pending.append((entry, next_tokens))
+                    continue
+
+                logger.warning(
+                    f"Failed to analyze {entry[0]}: "
+                    f"{type(error).__name__}: {error}"
+                )
+                function_results.append(result)
 
         extraction_errors: List[str] = []
         for sources, sinks, sanitizers, error in function_results:
@@ -521,16 +529,17 @@ class SimpleSpecificationExtractor:
             all_sinks.extend(sinks)
             all_sanitizers.extend(sanitizers)
             if error:
-                extraction_errors.append(error)
+                extraction_errors.append(f"{type(error).__name__}: {error}")
 
         if extraction_errors:
             logger.warning(
                 f"Stage 1 incomplete for {file_path or 'inline code'}: "
-                f"{len(extraction_errors)}/{len(analysis_entries)} LLM requests failed"
+                f"{len(extraction_errors)}/{len(function_results)} terminal "
+                "LLM batches failed"
             )
 
         if skipped_funcs:
-            logger.info(
+            logger.debug(
                 f"Analyzed {len(analyzable)}/{len(functions)} functions; "
                 f"skipped {skipped_funcs} "
                 f"({self.analysis_mode} analysis)"
@@ -542,7 +551,7 @@ class SimpleSpecificationExtractor:
             static_sources, static_sinks = self._extract_static_candidates(
                 source_code, file_path, functions
             )
-            logger.info(
+            logger.debug(
                 f"Static backend contributed {len(static_sources)} sources and "
                 f"{len(static_sinks)} sinks"
             )
@@ -702,7 +711,7 @@ class SimpleSpecificationExtractor:
                     entry[0] not in source_functions
                     or entry[0] not in sink_functions
                 )
-            ][:4]
+            ][:1]
             if uncovered_entries:
                 coverage_results = await asyncio.gather(*(
                     _analyze_function(entry) for entry in uncovered_entries
@@ -717,7 +726,7 @@ class SimpleSpecificationExtractor:
                     all_sinks.extend(sinks)
                     all_sanitizers.extend(sanitizers)
                     recovered += len(sources) + len(sinks)
-                logger.info(
+                logger.debug(
                     f"Method coverage review recovered {recovered} endpoint(s) "
                     f"across {len(uncovered_entries)} scope(s)"
                 )
@@ -742,7 +751,7 @@ class SimpleSpecificationExtractor:
             if update:
                 sanitizer.location = sanitizer.location.model_copy(update=update)
 
-        if use_llm:
+        if use_llm and not all_sources:
             source_functions = {
                 source.location.function_name
                 for source in all_sources
@@ -756,11 +765,17 @@ class SimpleSpecificationExtractor:
             for sink in all_sinks:
                 function_name = sink.location.function_name
                 entry = function_entries.get(function_name or "")
+                if entry is None:
+                    resolved_function, _ = _scope_for_line(
+                        sink.location.line_number
+                    )
+                    if resolved_function:
+                        function_name = resolved_function
+                        entry = function_entries.get(resolved_function)
                 if (
                     function_name
                     and function_name not in source_functions
                     and entry is not None
-                    and self._needs_empty_security_review(entry[0])
                     and self._is_plausible_sink(sink)
                 ):
                     missing_source_scopes.setdefault(function_name, []).append(sink)
@@ -799,12 +814,13 @@ class SimpleSpecificationExtractor:
                     )
                     return []
 
-            if missing_source_scopes:
+            remaining_recovery_budget = max(0, 1 - len(uncovered_entries))
+            if missing_source_scopes and remaining_recovery_budget:
                 repaired_groups = await asyncio.gather(*(
                     _repair_method_sources(function_name, method_sinks)
                     for function_name, method_sinks in list(
                         missing_source_scopes.items()
-                    )[:4]
+                    )[:remaining_recovery_budget]
                 ))
                 for repaired_sources in repaired_groups:
                     for source in repaired_sources:
@@ -820,7 +836,7 @@ class SimpleSpecificationExtractor:
                             )
                         source.source_category = classify_source(source)
                     all_sources.extend(repaired_sources)
-                logger.info(
+                logger.debug(
                     "Method source consistency review recovered "
                     f"{sum(map(len, repaired_groups))} source(s) across "
                     f"{len(repaired_groups)} scope(s)"
@@ -833,12 +849,12 @@ class SimpleSpecificationExtractor:
         plausible_sinks = [sink for sink in all_sinks if self._is_plausible_sink(sink)]
         rejected_sinks = len(all_sinks) - len(plausible_sinks)
         if rejected_sinks:
-            logger.info(
+            logger.debug(
                 f"Structural sink filter removed {rejected_sinks} non-operation endpoints"
             )
         all_sinks = self._deduplicate_sinks(plausible_sinks)
 
-        logger.info(
+        logger.debug(
             f"Extraction complete: {len(all_sources)} sources, {len(all_sinks)} sinks, "
             f"{len(all_sanitizers)} sanitizers"
         )
@@ -978,12 +994,79 @@ class SimpleSpecificationExtractor:
             if start >= failed_start and end <= failed_end:
                 members.append(entry)
 
-        if len(members) < 2:
-            return [failed_entry]
+        retry_limit = max(1, min(max_chars, len(failed_code) - 1) // 2)
+        if len(members) >= 2:
+            split_entries = cls._build_llm_batches(
+                source_code, members, retry_limit
+            )
+            if len(split_entries) > 1:
+                return split_entries
 
-        retry_limit = max(1, max_chars // 2)
-        split_entries = cls._build_llm_batches(source_code, members, retry_limit)
-        return split_entries if len(split_entries) > 1 else [failed_entry]
+        # Generated parsers occasionally contain a single 10k+ character
+        # method. Method-aligned splitting cannot reduce those prompts, so
+        # recover by slicing the method itself. Line overlap keeps boundary
+        # statements visible in both prompts; endpoint deduplication later in
+        # extraction removes duplicates from the overlap.
+        already_sliced = "_part_" in failed_name
+        if len(failed_code) > max(1024, max_chars // 2) or (
+            already_sliced and len(failed_code) > 1024
+        ):
+            slice_limit = max(1024, retry_limit)
+            split_entries = cls._split_source_slice(
+                failed_entry, slice_limit, overlap_lines=8
+            )
+            if len(split_entries) > 1:
+                return split_entries
+
+        return [failed_entry]
+
+    @staticmethod
+    def _split_source_slice(
+        entry: Tuple[str, str, int, Optional[Dict[str, Any]]],
+        max_chars: int,
+        *,
+        overlap_lines: int,
+    ) -> List[Tuple[str, str, int, Optional[Dict[str, Any]]]]:
+        """Split one synthetic source slice while preserving line offsets."""
+        name, code, line_offset, _info = entry
+        if max_chars < 1 or len(code) <= max_chars:
+            return [entry]
+
+        chunks: List[Tuple[str, str, int, Optional[Dict[str, Any]]]] = []
+        cursor = 0
+        part = 1
+        while cursor < len(code):
+            limit = min(len(code), cursor + max_chars)
+            end = limit
+            if limit < len(code):
+                newline = code.rfind("\n", cursor + 1, limit + 1)
+                if newline >= cursor:
+                    end = newline + 1
+            if end <= cursor:
+                end = limit
+
+            chunk = code[cursor:end]
+            chunk_offset = line_offset + code.count("\n", 0, cursor)
+            chunks.append(
+                (f"{name}_part_{part}", chunk, chunk_offset, None)
+            )
+            part += 1
+            if end >= len(code):
+                break
+
+            next_cursor = end
+            scan = end - 1
+            for _ in range(max(0, overlap_lines)):
+                newline = code.rfind("\n", cursor, scan)
+                if newline < cursor:
+                    break
+                next_cursor = newline + 1
+                scan = newline
+            # Tiny chunks can contain fewer lines than the overlap window.
+            # In that case skip overlap rather than looping forever.
+            cursor = next_cursor if next_cursor > cursor else end
+
+        return chunks if len(chunks) > 1 else [entry]
 
     def _extract_static_candidates(
         self,
@@ -1021,7 +1104,7 @@ class SimpleSpecificationExtractor:
         )
         dangerous_body = re.compile(
             r"Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder|new\s+File\s*\(|"
-            r"Paths\.get\s*\(|classForName\s*\(|\.deserialize\s*\(|"
+            r"Paths\.get\s*\(|(?:Class\s*\.\s*forName|classForName)\s*\(|\.deserialize\s*\(|"
             r"\.readObject\s*\(|\.readValue\s*\(|"
             r"\.(?:print|write|sendRedirect)\s*\("
         )
@@ -1146,10 +1229,26 @@ class SimpleSpecificationExtractor:
                 target, rhs = assignment.group(1), assignment.group(2)
                 if re.search(r"new\s+File\s*\(|Paths\.get\s*\(", rhs):
                     add_sink(target, line_number, VulnerabilityType.PATH_TRAVERSAL, "file_path", statement)
-                elif re.search(r"classForName\s*\(", rhs):
+                elif re.search(
+                    r"(?:Class\s*\.\s*forName|classForName)\s*\(", rhs
+                ):
                     add_sink(target, line_number, VulnerabilityType.CODE_INJECTION, "dynamic_class_loading", statement)
                 elif re.search(r"\.deserialize\s*\(|\.readObject\s*\(|\.readValue\s*\(", rhs):
                     add_sink(target, line_number, VulnerabilityType.UNSAFE_DESERIALIZATION, "deserialization", statement)
+
+            class_load_arg = re.search(
+                r"(?:Class\s*\.\s*forName|classForName)\s*\(\s*"
+                r"([A-Za-z_$][\w$]*)",
+                compact,
+            )
+            if class_load_arg and not assignment:
+                add_sink(
+                    class_load_arg.group(1),
+                    line_number,
+                    VulnerabilityType.CODE_INJECTION,
+                    "dynamic_class_loading",
+                    statement,
+                )
 
             deserialize_arg = re.search(
                 r"(?:\.deserialize|\.readValue)\s*\(\s*([A-Za-z_$][\w$]*)",
@@ -1191,7 +1290,7 @@ class SimpleSpecificationExtractor:
                     VulnerabilityType.SQL_INJECTION, "query_execution", statement,
                 )
 
-        logger.info(
+        logger.debug(
             f"Static endpoint pass: {len(sources)} sources, {len(sinks)} sinks"
         )
         return sources, sinks
@@ -1254,6 +1353,10 @@ class SimpleSpecificationExtractor:
 
         text = sink.code_snippet or ""
         compact = re.sub(r"\s+", " ", text).strip()
+        # An exception constructor is not an execution or response boundary.
+        # Report the concrete renderer later in the flow, if one exists.
+        if re.match(r"^throw\s+new\s+[A-Za-z_$][\w$.<>]*\s*\(", compact):
+            return False
         if re.match(
             rf"^this\.{re.escape(sink.variable_name)}\s*=\s*"
             rf"{re.escape(sink.variable_name)}\s*;\s*$",
@@ -1492,6 +1595,65 @@ class SimpleSpecificationExtractor:
 
         return functions
 
+    @classmethod
+    def _validate_combined_response(cls, response: dict) -> None:
+        """Reject structurally incomplete endpoint arrays before caching."""
+        cls._validated_entries(
+            response, "sources", ("line", "variable", "type")
+        )
+        cls._validated_entries(
+            response, "sinks", ("line", "variable", "type")
+        )
+        cls._validated_entries(
+            response,
+            "sanitizers",
+            ("line", "variable", "type"),
+            optional=True,
+        )
+
+    @staticmethod
+    def _validated_entries(
+        response: dict,
+        key: str,
+        required_fields: Tuple[str, ...],
+        *,
+        optional: bool = False,
+    ) -> List[dict]:
+        if not isinstance(response, dict):
+            raise ParsingError("Response must be a dictionary")
+        if key not in response:
+            if optional:
+                return []
+            raise ParsingError(f"Response missing '{key}' key")
+        entries = response[key]
+        if not isinstance(entries, list):
+            raise ParsingError(f"Response field '{key}' must be an array")
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ParsingError(f"{key}[{index}] must be an object")
+            missing = [
+                field
+                for field in required_fields
+                if entry.get(field) is None
+                or (
+                    isinstance(entry.get(field), str)
+                    and not entry[field].strip()
+                )
+            ]
+            if missing:
+                raise ParsingError(
+                    f"{key}[{index}] missing required field(s): "
+                    f"{', '.join(missing)}"
+                )
+            try:
+                if int(entry["line"]) < 1:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError) as error:
+                raise ParsingError(
+                    f"{key}[{index}] has invalid line number"
+                ) from error
+        return entries
+
     def _parse_llm_sources(
         self, response: dict, file_path: str, line_offset: int = 0,
         function_name: Optional[str] = None,
@@ -1510,30 +1672,20 @@ class SimpleSpecificationExtractor:
         Raises:
             ParsingError: If response format is invalid.
         """
-        if not isinstance(response, dict):
-            raise ParsingError("Response must be a dictionary")
-
-        if "sources" not in response:
-            raise ParsingError("Response missing 'sources' key")
-
         sources: List[Source] = []
 
-        for source_data in response.get("sources", []):
-            if not isinstance(source_data, dict):
-                logger.warning("Skipping non-object source entry")
-                continue
+        source_entries = self._validated_entries(
+            response, "sources", ("line", "variable", "type")
+        )
+        for index, source_data in enumerate(source_entries):
             try:
                 # Extract required fields
-                line = source_data.get("line")
+                line = int(source_data["line"])
                 raw_variable = source_data.get("variable")
                 variable = self._normalize_llm_source_identifier(raw_variable)
                 source_type = source_data.get("type")
                 confidence = float(source_data.get("confidence", 0.8))
 
-                # Validate required fields
-                if not line or not raw_variable or not source_type:
-                    logger.warning("Skipping source with missing required fields")
-                    continue
                 if variable is None:
                     logger.debug("Skipping non-identifier source variable")
                     continue
@@ -1564,9 +1716,10 @@ class SimpleSpecificationExtractor:
                 sources.append(source)
                 logger.debug(f"Parsed source: {variable} at line {line + line_offset}")
 
-            except (KeyError, ValueError, TypeError) as e:
-                logger.warning(f"Error parsing source entry ({type(e).__name__})")
-                continue
+            except (KeyError, ValueError, TypeError) as error:
+                raise ParsingError(
+                    f"Invalid sources[{index}] value: {type(error).__name__}"
+                ) from error
 
         logger.debug(f"Parsed {len(sources)} sources from LLM response")
         return sources
@@ -1589,21 +1742,15 @@ class SimpleSpecificationExtractor:
         Raises:
             ParsingError: If response format is invalid.
         """
-        if not isinstance(response, dict):
-            raise ParsingError("Response must be a dictionary")
-
-        if "sinks" not in response:
-            raise ParsingError("Response missing 'sinks' key")
-
         sinks: List[Sink] = []
 
-        for sink_data in response.get("sinks", []):
-            if not isinstance(sink_data, dict):
-                logger.warning("Skipping non-object sink entry")
-                continue
+        sink_entries = self._validated_entries(
+            response, "sinks", ("line", "variable", "type")
+        )
+        for index, sink_data in enumerate(sink_entries):
             try:
                 # Extract required fields
-                line = sink_data.get("line")
+                line = int(sink_data["line"])
                 variable = sink_data.get("variable")
                 sink_type = sink_data.get("type")
                 # Open-vocabulary: do NOT default to a concrete class. An
@@ -1621,10 +1768,6 @@ class SimpleSpecificationExtractor:
                     cwe_id = None
                 confidence = float(sink_data.get("confidence", 0.8))
 
-                # Validate required fields
-                if not line or not variable or not sink_type:
-                    logger.warning("Skipping sink with missing required fields")
-                    continue
                 if not self._is_java_identifier(variable):
                     logger.debug("Skipping non-identifier sink variable")
                     continue
@@ -1646,7 +1789,7 @@ class SimpleSpecificationExtractor:
                         vulnerability_type_str, sink_type, cwe_id
                     )
                     if vuln_type is VulnerabilityType.OTHER:
-                        logger.info(
+                        logger.debug(
                             f"Open-vocabulary vuln class kept as OTHER: "
                             f"label={raw_label!r} cwe={cwe_id!r}"
                         )
@@ -1678,9 +1821,10 @@ class SimpleSpecificationExtractor:
                 sinks.append(sink)
                 logger.debug(f"Parsed sink: {variable} at line {line + line_offset}")
 
-            except (KeyError, ValueError, TypeError) as e:
-                logger.warning(f"Error parsing sink entry ({type(e).__name__})")
-                continue
+            except (KeyError, ValueError, TypeError) as error:
+                raise ParsingError(
+                    f"Invalid sinks[{index}] value: {type(error).__name__}"
+                ) from error
 
         logger.debug(f"Parsed {len(sinks)} sinks from LLM response")
         return sinks
@@ -1694,12 +1838,15 @@ class SimpleSpecificationExtractor:
             raise ParsingError("Response must be a dictionary")
 
         sanitizers: List[Sanitizer] = []
-        for sanitizer_data in response.get("sanitizers", []):
-            if not isinstance(sanitizer_data, dict):
-                logger.warning("Skipping non-object sanitizer entry")
-                continue
+        sanitizer_entries = self._validated_entries(
+            response,
+            "sanitizers",
+            ("line", "variable", "type"),
+            optional=True,
+        )
+        for index, sanitizer_data in enumerate(sanitizer_entries):
             try:
-                line = sanitizer_data.get("line")
+                line = int(sanitizer_data["line"])
                 variable = sanitizer_data.get("variable")
                 sanitizer_type = sanitizer_data.get("type")
                 confidence = float(sanitizer_data.get("confidence", 0.8))
@@ -1709,9 +1856,6 @@ class SimpleSpecificationExtractor:
                 vulnerability_types = sanitizer_data.get(
                     "vulnerability_types", []
                 )
-                if not line or not variable or not sanitizer_type:
-                    logger.warning("Skipping sanitizer with missing required fields")
-                    continue
                 if not self._is_java_identifier(variable):
                     logger.debug("Skipping non-identifier sanitizer variable")
                     continue
@@ -1736,8 +1880,10 @@ class SimpleSpecificationExtractor:
                     ],
                     effectiveness=max(0.0, min(1.0, effectiveness)),
                 ))
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Error parsing sanitizer entry ({type(e).__name__})")
+            except (KeyError, ValueError, TypeError) as error:
+                raise ParsingError(
+                    f"Invalid sanitizers[{index}] value: {type(error).__name__}"
+                ) from error
 
         return sanitizers
 

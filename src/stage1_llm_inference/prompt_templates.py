@@ -212,13 +212,16 @@ concretely could go wrong?" If there is a concrete impact, it is a sink —
 Illustrative (NON-exhaustive): query/command interpreters (SQL, OS, LDAP,
 XPath, NoSQL); code/expression evaluation & reflection; deserialization of
 untrusted data; unsafe XML parsing; filesystem path construction; outbound
-request / redirect / URL targets; unencoded response/header/cookie rendering
-and reflected error messages; any other trust-boundary crossing.
+request / redirect / URL targets; unencoded response/header/cookie rendering;
+error messages only where this code concretely renders them to a response; any
+other trust-boundary crossing.
 
 NOT a sink:
 - Pure reads; conditional/null-check usage
 - Passing data to a view layer known to auto-escape it
 - Logging — unless rendered back to users
+- Constructing or throwing an exception is not itself a sink. Report the later
+  response/rendering operation only when it is present in the shown code.
 - Internal builders/setters that only store data on framework state objects, framework object constructors, and event/audit logging calls
 - Speculative downstream risk based only on a method/variable name. Report the
   concrete operation shown in this snippet, not what another unknown method

@@ -30,7 +30,7 @@ class OpenAIClient(BaseLLMClient):
         model: str = "gpt-4-turbo",
         base_url: Optional[str] = None,
         user_agent: Optional[str] = None,
-        timeout: float = 60.0,
+        timeout: float = 300.0,
         json_mode: bool = True,
         thinking: Optional[str] = None,
         max_retries: int = 2,

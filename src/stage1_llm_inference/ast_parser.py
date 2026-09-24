@@ -44,7 +44,7 @@ class JavaASTParser:
         try:
             self.parser = Parser()
             self.parser.language = JAVA_LANGUAGE
-            logger.info("Initialized tree-sitter Java parser")
+            logger.debug("Initialized tree-sitter Java parser")
 
         except Exception as e:
             logger.warning(f"Failed to initialize tree-sitter: {str(e)}")

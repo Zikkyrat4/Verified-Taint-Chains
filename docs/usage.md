@@ -99,6 +99,8 @@ vtc analyze code.java --verification-level both
     "sinks_found": 19,
     "chains_found": 43,
     "chains_verified": 21,
+    "chains_unverifiable": 20,
+    "chains_rejected": 2,
     "verification_rate": 0.49,
     "explanations_generated": 20
   },
@@ -141,7 +143,7 @@ vtc analyze code.java --verification-level both
 | `sink` | object | Сток: переменная, строка, уверенность |
 | `path` | array | Список переменных по пути от source к sink |
 | `confidence` | float | Общая уверенность (0.0–1.0) |
-| `verification` | string | Статус верификации: `verified`, `false`, `unverifiable` |
+| `verification` | string | Для элемента `vulnerabilities` всегда `verified` |
 | `explanation` | object | Объяснение (при наличии) |
 
 ### Поля explanation
@@ -153,3 +155,7 @@ vtc analyze code.java --verification-level both
 | `example_fix` | string | Пример безопасного кода |
 | `severity` | string | `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` |
 | `cwe_id` | string | CWE-идентификатор (например `CWE-89`) |
+
+`vulnerabilities` содержит только подтвержденные цепочки. Неподтвержденные и
+отклоненные кандидаты не отображаются как уязвимости; их количества доступны в
+`chains_unverifiable` и `chains_rejected`.

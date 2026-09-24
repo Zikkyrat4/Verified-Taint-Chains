@@ -42,10 +42,10 @@ CACHE_SCHEMA_VERSION = "1"
 # (e.g. classification rules or snippet resolution). Independent
 # from CACHE_SCHEMA_VERSION because old caches stay readable — they just don't
 # match the new extractor's expected output.
-EXTRACTOR_VERSION = "24"
+EXTRACTOR_VERSION = "25"
 
 # Bump when prompt templates change. Same rationale as EXTRACTOR_VERSION.
-PROMPT_TEMPLATE_VERSION = "12"
+PROMPT_TEMPLATE_VERSION = "13"
 
 
 @dataclass

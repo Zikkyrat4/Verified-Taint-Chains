@@ -37,16 +37,18 @@ class PipelineConfig:
     llm_model: str = ""  # Will be set based on provider in __post_init__
     openai_base_url: Optional[str] = None  # override for OpenAI-compatible endpoints
     openai_user_agent: Optional[str] = None  # override User-Agent (proxies that block the SDK UA)
-    openai_timeout: float = 60.0
+    openai_timeout: float = 300.0
     openai_json_mode: bool = True
     openai_thinking: Optional[str] = None
     llm_max_retries: int = 2
     llm_max_tokens: int = 4000
+    llm_truncation_max_tokens: int = 16000
     llm_batch_max_chars: int = 8000
     analysis_backend: str = "llm"
     llm_analysis_mode: str = "targeted"
     ollama_base_url: str = "http://localhost:11434"
     max_path_length: int = 15
+    max_candidate_chains: int = 10000
     min_confidence: float = 0.6
     verification_enabled: bool = True
     symbolic_execution_enabled: bool = False
@@ -58,6 +60,7 @@ class PipelineConfig:
     pathfinding_algorithm: str = "astar"  # "astar" or "bfs" (default: astar)
     max_concurrent_files: int = 4  # max concurrent Stage 1 extractions
     max_concurrent_functions: int = 2  # max concurrent functions within one file
+    max_concurrent_llm_requests: int = 5  # global provider request limit
     max_files: int = 0  # max files for project mode (0 = unlimited)
     use_llm_graph_builder: bool = True  # use LLM-driven graph builder (AST + LLM enrichment)
     llm_graph_enrichment_enabled: bool = False
@@ -121,6 +124,9 @@ class PipelineConfig:
         if self.max_concurrent_functions < 1:
             raise ValueError("max_concurrent_functions must be at least 1")
 
+        if self.max_concurrent_llm_requests < 1:
+            raise ValueError("max_concurrent_llm_requests must be at least 1")
+
         if self.openai_timeout <= 0:
             raise ValueError("openai_timeout must be positive")
 
@@ -133,8 +139,16 @@ class PipelineConfig:
         if self.llm_max_tokens < 1:
             raise ValueError("llm_max_tokens must be at least 1")
 
+        if self.llm_truncation_max_tokens < self.llm_max_tokens:
+            raise ValueError(
+                "llm_truncation_max_tokens must be at least llm_max_tokens"
+            )
+
         if self.llm_batch_max_chars < 0:
             raise ValueError("llm_batch_max_chars must be non-negative")
+
+        if self.max_candidate_chains < 1:
+            raise ValueError("max_candidate_chains must be at least 1")
 
         if self.llm_analysis_mode not in ("targeted", "exhaustive"):
             raise ValueError(
@@ -197,6 +211,7 @@ def load_config_from_env(
         USE_SEMANTIC_HEURISTIC (optional): Use semantic heuristic in A* (default: true)
         PATHFINDING_ALGORITHM (optional): Algorithm choice 'astar' or 'bfs' (default: astar)
         MAX_CONCURRENT_FILES (optional): Max concurrent file extractions (default: 4)
+        MAX_CONCURRENT_LLM_REQUESTS (optional): Global provider request cap (default: 5)
         MAX_FILES (optional): Maximum files to analyze in project mode (default: 0 = unlimited)
 
     Returns:
@@ -233,10 +248,10 @@ def load_config_from_env(
         openai_thinking = openai_thinking.lower()
 
     try:
-        openai_timeout = float(os.getenv("OPENAI_TIMEOUT", "60"))
+        openai_timeout = float(os.getenv("OPENAI_TIMEOUT", "300"))
     except ValueError:
-        logger.warning("Invalid OPENAI_TIMEOUT, using default 60")
-        openai_timeout = 60.0
+        logger.warning("Invalid OPENAI_TIMEOUT, using default 300")
+        openai_timeout = 300.0
 
     try:
         llm_max_retries = int(os.getenv("LLM_MAX_RETRIES", "2"))
@@ -249,6 +264,14 @@ def load_config_from_env(
     except ValueError:
         logger.warning("Invalid LLM_MAX_TOKENS, using default 4000")
         llm_max_tokens = 4000
+
+    try:
+        llm_truncation_max_tokens = int(
+            os.getenv("LLM_TRUNCATION_MAX_TOKENS", "16000")
+        )
+    except ValueError:
+        logger.warning("Invalid LLM_TRUNCATION_MAX_TOKENS, using default 16000")
+        llm_truncation_max_tokens = 16000
 
     try:
         llm_batch_max_chars = int(os.getenv("LLM_BATCH_MAX_CHARS", "8000"))
@@ -272,6 +295,12 @@ def load_config_from_env(
     except ValueError:
         logger.warning("Invalid MAX_PATH_LENGTH, using default 15")
         max_path_length = 15
+
+    try:
+        max_candidate_chains = int(os.getenv("MAX_CANDIDATE_CHAINS", "10000"))
+    except ValueError:
+        logger.warning("Invalid MAX_CANDIDATE_CHAINS, using default 10000")
+        max_candidate_chains = 10000
 
     try:
         min_confidence = float(os.getenv("MIN_CONFIDENCE", "0.6"))
@@ -320,6 +349,14 @@ def load_config_from_env(
         max_concurrent_functions = 2
 
     try:
+        max_concurrent_llm_requests = int(
+            os.getenv("MAX_CONCURRENT_LLM_REQUESTS", "5")
+        )
+    except ValueError:
+        logger.warning("Invalid MAX_CONCURRENT_LLM_REQUESTS, using default 5")
+        max_concurrent_llm_requests = 5
+
+    try:
         max_files = int(os.getenv("MAX_FILES", "0"))
     except ValueError:
         logger.warning("Invalid MAX_FILES, using default 0 (unlimited)")
@@ -366,11 +403,13 @@ def load_config_from_env(
         openai_thinking=openai_thinking,
         llm_max_retries=llm_max_retries,
         llm_max_tokens=llm_max_tokens,
+        llm_truncation_max_tokens=llm_truncation_max_tokens,
         llm_batch_max_chars=llm_batch_max_chars,
         analysis_backend=analysis_backend,
         llm_analysis_mode=llm_analysis_mode,
         ollama_base_url=ollama_base_url,
         max_path_length=max_path_length,
+        max_candidate_chains=max_candidate_chains,
         min_confidence=min_confidence,
         verification_enabled=verification_enabled,
         symbolic_execution_enabled=symbolic_execution_enabled,
@@ -382,6 +421,7 @@ def load_config_from_env(
         pathfinding_algorithm=pathfinding_algorithm,
         max_concurrent_files=max_concurrent_files,
         max_concurrent_functions=max_concurrent_functions,
+        max_concurrent_llm_requests=max_concurrent_llm_requests,
         max_files=max_files,
         use_llm_graph_builder=use_llm_graph_builder,
         llm_graph_enrichment_enabled=llm_graph_enrichment_enabled,

@@ -172,6 +172,8 @@ class TestFindJavaFiles:
             "src/main/java/com/app/UserController.java",
             "src/main/java/com/app/Dao.java",
             "src/test/java/com/app/UserControllerTest.java",
+            "tests/devtests/client/ManualClient.java",
+            "devtest/fixtures/Fixture.java",
             "src/main/java/com/app/HelperIT.java",
             "target/classes/com/app/UserController.java",
             "target/generated-sources/Proto.java",
@@ -202,6 +204,8 @@ class TestFindJavaFiles:
         result = _find_java_files(str(root))
         assert not any("UserControllerTest.java" in r for r in result)
         assert not any("HelperIT.java" in r for r in result)
+        assert not any("ManualClient.java" in r for r in result)
+        assert not any("Fixture.java" in r for r in result)
         # Only the two production files remain.
         assert len(result) == 2
 

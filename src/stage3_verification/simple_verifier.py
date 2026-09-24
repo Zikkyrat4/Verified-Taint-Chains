@@ -35,7 +35,7 @@ class SimpleCFGVerifier:
             raise ValueError("graph must be a NetworkX DiGraph")
 
         self.graph = graph
-        logger.info(
+        logger.debug(
             f"Initialized SimpleCFGVerifier with graph containing "
             f"{graph.number_of_nodes()} nodes and {graph.number_of_edges()} edges"
         )
@@ -75,12 +75,12 @@ class SimpleCFGVerifier:
         is_reachable = self.verify_reachability(src_id, sink_id)
 
         if is_reachable:
-            logger.info(
+            logger.debug(
                 f"✓ Chain VERIFIED: {chain.source.variable_name} -> {chain.sink.variable_name}"
             )
             return VerificationStatus.VERIFIED
         else:
-            logger.info(
+            logger.debug(
                 f"✗ Chain FALSE: {chain.source.variable_name} -> {chain.sink.variable_name}"
             )
             return VerificationStatus.FALSE
@@ -172,7 +172,7 @@ class SimpleCFGVerifier:
         verified: list[TaintChain] = []
         false: list[TaintChain] = []
 
-        logger.info(f"Verifying {len(chains)} chains...")
+        logger.debug(f"Verifying {len(chains)} chains...")
 
         for chain in chains:
             status = self.verify_chain(chain, node_id_map=node_id_map)

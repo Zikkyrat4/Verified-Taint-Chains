@@ -19,7 +19,7 @@ _DISABLED_FILE_VALUES = frozenset({"", "-", "none", "off", "false", "disabled"})
 _FILE_FORMAT = (
     "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
     "{name}:{function}:{line} | run={extra[run_id]} command={extra[command]} "
-    "target={extra[target]} function={extra[function_name]} | {message}\n{exception}"
+    "target={extra[target]} function={extra[function_name]} | {message}"
 )
 _STDERR_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
@@ -45,6 +45,20 @@ _run_id = "-"
 # A library import must not write files or emit terminal noise. CLI entry points
 # explicitly enable this namespace through ``configure_logging()``.
 logger.disable(_PACKAGE)
+
+
+def _format_record(base_format: str, record: dict[str, Any]) -> str:
+    """Append a traceback only when the record actually has an exception."""
+    suffix = "\n{exception}" if record["exception"] is not None else ""
+    return f"{base_format}{suffix}\n"
+
+
+def _file_formatter(record: dict[str, Any]) -> str:
+    return _format_record(_FILE_FORMAT, record)
+
+
+def _stderr_formatter(record: dict[str, Any]) -> str:
+    return _format_record(_STDERR_FORMAT, record)
 
 
 def default_log_file() -> Path:
@@ -151,7 +165,7 @@ def configure_logging(
         if stderr:
             handler_id = logger.add(
                 sys.stderr,
-                format=_STDERR_FORMAT,
+                format=_stderr_formatter,
                 level=resolved_level,
                 colorize=None,
                 filter=_vtc_record,
@@ -167,7 +181,7 @@ def configure_logging(
                     resolved_file.chmod(0o600)
                 handler_id = logger.add(
                     resolved_file,
-                    format=_FILE_FORMAT,
+                    format=_file_formatter,
                     level=resolved_level,
                     rotation="10 MB",
                     retention="7 days",

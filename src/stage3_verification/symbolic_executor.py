@@ -6,7 +6,10 @@ Supports multiple backends:
 3. Fallback to UNVERIFIABLE if neither available
 """
 
+import ast
+import hashlib
 import importlib.util
+import operator
 import re
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -91,6 +94,7 @@ class PathConstraints:
         self.variables: Dict[str, SymbolicVariable] = {}
         self.modeled_edges = 0
         self.expected_edges = 0
+        self.integer_constants: Dict[str, int] = {}
 
     def add_variable(self, name: str, var_type: str = "String") -> SymbolicVariable:
         """Add a symbolic variable.
@@ -153,7 +157,9 @@ class SymbolicExecutor:
         else:
             self.backend = backend
 
-        logger.info(f"Initialized SymbolicExecutor with backend: {self.backend.value}")
+        logger.debug(
+            f"Initialized SymbolicExecutor with backend: {self.backend.value}"
+        )
 
         if self.backend == SymbolicBackend.NONE:
             logger.warning(
@@ -185,7 +191,7 @@ class SymbolicExecutor:
         elif self.backend == SymbolicBackend.JPF:
             return self._execute_with_jpf(chain, source_code)
         else:
-            logger.warning(
+            logger.debug(
                 "No backend available for symbolic execution, returning UNVERIFIABLE"
             )
             return VerificationStatus.UNVERIFIABLE
@@ -218,7 +224,7 @@ class SymbolicExecutor:
                 not constraints.constraints
                 or constraints.modeled_edges < constraints.expected_edges
             ):
-                logger.info(
+                logger.debug(
                     "Symbolic execution inconclusive: "
                     f"modeled {constraints.modeled_edges}/"
                     f"{constraints.expected_edges} path edges"
@@ -238,28 +244,33 @@ class SymbolicExecutor:
             result = solver.check()
 
             if result == z3.sat:
-                logger.info(
+                logger.debug(
                     f"✓ Symbolic execution: {chain.source.variable_name} -> "
                     f"{chain.sink.variable_name} VERIFIED (SAT)"
                 )
                 return VerificationStatus.VERIFIED
 
             elif result == z3.unsat:
-                logger.info(
+                logger.debug(
                     f"✗ Symbolic execution: {chain.source.variable_name} -> "
                     f"{chain.sink.variable_name} FALSE (UNSAT)"
                 )
                 return VerificationStatus.FALSE
 
             else:  # unknown
-                logger.warning(
+                logger.debug(
                     f"? Symbolic execution: {chain.source.variable_name} -> "
                     f"{chain.sink.variable_name} UNKNOWN (timeout or solver limitation)"
                 )
                 return VerificationStatus.UNVERIFIABLE
 
-        except Exception as e:
-            logger.error(f"Z3 symbolic execution failed: {str(e)}")
+        except Exception:
+            logger.exception(
+                "Z3 symbolic execution failed for "
+                f"chain={chain.id!r}, "
+                f"source={chain.source.variable_name!r}, "
+                f"sink={chain.sink.variable_name!r}"
+            )
             return VerificationStatus.UNVERIFIABLE
 
     def _build_path_constraints(
@@ -277,6 +288,7 @@ class SymbolicExecutor:
             PathConstraints object with Z3 constraints.
         """
         constraints = PathConstraints()
+        constraints.integer_constants = self._collect_integer_constants(source_code)
 
         # Add source variable as symbolic
         constraints.add_variable(
@@ -305,7 +317,13 @@ class SymbolicExecutor:
             next_var = next_node.variable_name if hasattr(next_node, 'variable_name') else str(next_node)
 
             # Find the statement connecting current -> next
-            stmt = self._find_statement_for_edge(source_code, current, next_var)
+            snippets = [
+                getattr(next_node, "code_snippet", ""),
+                getattr(current_node, "code_snippet", ""),
+            ]
+            stmt = self._find_statement_for_edge(
+                source_code, current, next_var, snippets=snippets
+            )
 
             if stmt:
                 constraint = self._extract_constraint_from_statement(
@@ -325,7 +343,9 @@ class SymbolicExecutor:
         self,
         source_code: str,
         var1: str,
-        var2: str
+        var2: str,
+        *,
+        snippets: Optional[List[str]] = None,
     ) -> Optional[str]:
         """Find statement that connects two variables.
 
@@ -337,11 +357,26 @@ class SymbolicExecutor:
         Returns:
             Statement string or None.
         """
-        lines = source_code.split('\n')
+        lines = [*(snippets or []), *source_code.split('\n')]
 
         for line in lines:
-            # Look for assignment: var2 = ... var1 ...
-            if var2 in line and var1 in line and '=' in line:
+            if not line:
+                continue
+            # Assignment/call/return evidence must mention the exact Java
+            # identifiers. Substring matching joined unrelated names such as
+            # `id` and `identity` and produced misleading SAT results.
+            has_source = re.search(
+                rf"(?<![A-Za-z0-9_$]){re.escape(var1)}(?![A-Za-z0-9_$])",
+                line,
+            )
+            has_target = re.search(
+                rf"(?<![A-Za-z0-9_$]){re.escape(var2)}(?![A-Za-z0-9_$])",
+                line,
+            )
+            return_flow = var2 == "return_value" and re.search(
+                rf"\breturn\b[^;]*\b{re.escape(var1)}\b", line
+            )
+            if (has_source and has_target) or return_flow:
                 return line.strip()
 
         return None
@@ -374,15 +409,72 @@ class SymbolicExecutor:
         if src.z3_var is None or dst.z3_var is None:
             return None
 
-        # Simple assignment: dest = source
-        if re.match(rf'{dest_var}\s*=\s*{source_var}\s*;?', stmt):
-            return dst.z3_var == src.z3_var
+        assignment = re.search(
+            rf"(?<![A-Za-z0-9_$]){re.escape(dest_var)}\s*=\s*(.+?);?\s*$",
+            stmt,
+        )
+        if assignment:
+            rhs = assignment.group(1).rstrip(";").strip()
+            ternary = self._split_ternary(rhs)
+            if ternary is not None:
+                condition, true_branch, false_branch = ternary
+                condition_value = self._evaluate_integer_condition(
+                    condition, constraints.integer_constants
+                )
+                if condition_value is not None:
+                    selected = true_branch if condition_value else false_branch
+                    if (
+                        self._mentions_identifier(rhs, source_var)
+                        and not self._mentions_identifier(selected, source_var)
+                    ):
+                        # The graph edge exists syntactically, but its tainted
+                        # branch is impossible under compile-time constants.
+                        return z3.BoolVal(False)
+                    rhs = selected.strip()
+            if re.fullmatch(re.escape(source_var), rhs):
+                return dst.z3_var == src.z3_var
 
         # String concatenation: dest = source + something
-        if '+' in stmt and source_var in stmt:
+        if assignment and '+' in rhs and self._mentions_identifier(rhs, source_var):
             # For string concat, dest contains source
             if isinstance(src.z3_var, z3.SeqRef):
                 return z3.Contains(dst.z3_var, src.z3_var)
+
+        # A syntactically proven transformation/call preserves a dependency
+        # unless Stage 1 identified an effective sanitizer. Model its value as
+        # an uninterpreted function rather than pretending to understand the
+        # Java library implementation.
+        if assignment and re.search(
+            rf"(?<![A-Za-z0-9_$]){re.escape(source_var)}(?![A-Za-z0-9_$])",
+            rhs,
+        ):
+            function_name = "flow_" + hashlib.sha256(
+                stmt.encode("utf-8")
+            ).hexdigest()[:16]
+            opaque = z3.Function(
+                function_name, z3.StringSort(), z3.StringSort()
+            )
+            return dst.z3_var == opaque(src.z3_var)
+
+        if dest_var == "return_value" and re.search(
+            rf"\breturn\b[^;]*\b{re.escape(source_var)}\b", stmt
+        ):
+            return dst.z3_var == src.z3_var
+
+        if re.search(
+            rf"\b[A-Za-z_$][\w$]*\s*\([^;]*\b{re.escape(source_var)}\b[^;]*\)",
+            stmt,
+        ) and re.search(
+            rf"(?<![A-Za-z0-9_$]){re.escape(dest_var)}(?![A-Za-z0-9_$])",
+            stmt,
+        ):
+            function_name = "call_" + hashlib.sha256(
+                stmt.encode("utf-8")
+            ).hexdigest()[:16]
+            opaque = z3.Function(
+                function_name, z3.StringSort(), z3.StringSort()
+            )
+            return dst.z3_var == opaque(src.z3_var)
 
         # Conditional statements
         if 'if' in stmt:
@@ -393,6 +485,116 @@ class SymbolicExecutor:
                 return self._parse_condition(condition, constraints)
 
         return None
+
+    @staticmethod
+    def _mentions_identifier(expression: str, identifier: str) -> bool:
+        return bool(re.search(
+            rf"(?<![A-Za-z0-9_$]){re.escape(identifier)}(?![A-Za-z0-9_$])",
+            expression,
+        ))
+
+    @staticmethod
+    def _split_ternary(expression: str) -> Optional[tuple[str, str, str]]:
+        """Split a simple Java ternary; nested ternaries stay inconclusive."""
+        if expression.count("?") != 1 or expression.count(":") != 1:
+            return None
+        condition, question, remainder = expression.partition("?")
+        true_branch, colon, false_branch = remainder.partition(":")
+        if not question or not colon:
+            return None
+        if not condition.strip() or not true_branch.strip() or not false_branch.strip():
+            return None
+        return condition.strip(), true_branch.strip(), false_branch.strip()
+
+    @classmethod
+    def _collect_integer_constants(cls, source_code: str) -> Dict[str, int]:
+        """Collect local integer constants using a restricted AST evaluator."""
+        declarations = re.findall(
+            r"\b(?:byte|short|int|long|Integer|Long)\s+"
+            r"([A-Za-z_$][\w$]*)\s*=\s*([^;]+);",
+            source_code,
+        )
+        values: Dict[str, int] = {}
+        pending = list(declarations)
+        while pending:
+            unresolved = []
+            changed = False
+            for name, expression in pending:
+                value = cls._safe_integer_expression(expression, values)
+                if value is None:
+                    unresolved.append((name, expression))
+                    continue
+                values[name] = value
+                changed = True
+            if not changed:
+                break
+            pending = unresolved
+        return values
+
+    @classmethod
+    def _evaluate_integer_condition(
+        cls, condition: str, constants: Dict[str, int]
+    ) -> Optional[bool]:
+        condition = condition.strip()
+        while condition.startswith("(") and condition.endswith(")"):
+            condition = condition[1:-1].strip()
+        match = re.fullmatch(r"(.+?)\s*(>=|<=|==|!=|>|<)\s*(.+)", condition)
+        if not match:
+            return None
+        left = cls._safe_integer_expression(match.group(1), constants)
+        right = cls._safe_integer_expression(match.group(3), constants)
+        if left is None or right is None:
+            return None
+        comparisons = {
+            ">": operator.gt,
+            "<": operator.lt,
+            ">=": operator.ge,
+            "<=": operator.le,
+            "==": operator.eq,
+            "!=": operator.ne,
+        }
+        return comparisons[match.group(2)](left, right)
+
+    @staticmethod
+    def _safe_integer_expression(
+        expression: str, constants: Dict[str, int]
+    ) -> Optional[int]:
+        """Evaluate arithmetic made only from integer literals and constants."""
+        expression = re.sub(r"(?<=\d)[lL]\b", "", expression.strip())
+        try:
+            root = ast.parse(expression, mode="eval")
+        except SyntaxError:
+            return None
+
+        binary_ops = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: lambda left, right: int(left / right),
+            ast.FloorDiv: lambda left, right: int(left / right),
+            ast.Mod: operator.mod,
+        }
+        unary_ops = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+        def evaluate(node: ast.AST) -> int:
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body)
+            if isinstance(node, ast.Constant) and type(node.value) is int:
+                return node.value
+            if isinstance(node, ast.Name) and node.id in constants:
+                return constants[node.id]
+            if isinstance(node, ast.BinOp) and type(node.op) in binary_ops:
+                return binary_ops[type(node.op)](
+                    evaluate(node.left), evaluate(node.right)
+                )
+            if isinstance(node, ast.UnaryOp) and type(node.op) in unary_ops:
+                return unary_ops[type(node.op)](evaluate(node.operand))
+            raise ValueError("unsupported integer expression")
+
+        try:
+            return evaluate(root)
+        except (ArithmeticError, ValueError):
+            return None
 
     def _parse_condition(
         self,

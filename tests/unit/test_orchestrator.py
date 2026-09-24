@@ -1,14 +1,20 @@
 """Tests for pipeline orchestrator."""
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import networkx as nx
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
-from pathlib import Path
 
 from src.core.config import PipelineConfig
-from src.core.exceptions import TaintAnalysisError
 from src.core.models import (
-    Source, Sink, TaintChain, PathNode, CodeLocation,
-    VulnerabilityType, VerificationStatus,
+    CodeLocation,
+    PathNode,
+    Sink,
+    Source,
+    Specification,
+    TaintChain,
+    VerificationStatus,
+    VulnerabilityType,
 )
 from src.pipeline.orchestrator import SimplePipeline
 from src.pipeline.result import PipelineResult
@@ -87,6 +93,22 @@ class TestSimplePipeline:
         with pytest.raises(ValueError, match="not a file"):
             pipeline._read_source_file(str(tmp_path))
 
+    def test_read_source_file_replaces_invalid_utf8(self, test_config, tmp_path):
+        source_file = tmp_path / "Legacy.java"
+        source_file.write_bytes(b"class Legacy { // \xff\n}")
+
+        pipeline = SimplePipeline(test_config)
+
+        assert "class Legacy" in pipeline._read_source_file(str(source_file))
+
+    def test_read_source_file_skips_binary_input(self, test_config, tmp_path):
+        source_file = tmp_path / "Binary.java"
+        source_file.write_bytes(b"class Binary {}\x00compiled-data")
+
+        pipeline = SimplePipeline(test_config)
+
+        assert pipeline._read_source_file(str(source_file)) == ""
+
     def test_create_result(self, test_config, sample_java_file):
         pipeline = SimplePipeline(test_config)
         run_output = {
@@ -157,6 +179,13 @@ class TestSimplePipeline:
         assert "verified_chains" in result
         assert result["metrics"]["sources_found"] == 1
         assert result["metrics"]["sinks_found"] == 1
+
+        pipeline.release_run_state()
+        assert pipeline.graph_builder is None
+        assert pipeline.path_finder is None
+        assert pipeline.semantic_heuristic is None
+        assert pipeline.verifier is None
+        assert pipeline.verification_engine is None
 
 
 class TestIsSecurityRelevant:
@@ -274,6 +303,226 @@ class TestRunProject:
     """Tests for run_project (unified cross-file analysis)."""
 
     @pytest.mark.asyncio
+    async def test_global_candidate_limit_is_reported_but_not_an_error(
+        self, test_config, tmp_path
+    ):
+        source_file = tmp_path / "Case.java"
+        source_file.write_text("class Case {}")
+        empty_spec = Specification(
+            sources=[],
+            sinks=[],
+            llm_model=test_config.llm_model,
+        )
+        stage_result = {
+            "total_chains": 1,
+            "verified_chains": [],
+            "unverifiable_chains": [],
+            "rejected_chains": [],
+            "explanations": {},
+            "metrics": {
+                "candidate_chains_truncated": True,
+                "candidate_selection_limited": True,
+                "candidate_pairs_ranked": 10_001,
+                "candidate_pairs_ranked_out": 1,
+            },
+        }
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor.extract = AsyncMock(return_value=empty_spec)
+        pipeline._run_stages_project = AsyncMock(return_value=stage_result)
+
+        result = await pipeline.run_project([str(source_file)])
+
+        assert result["metrics"]["candidate_selection_limited"] is True
+        assert result["metrics"]["analysis_complete"] is True
+        assert result["metrics"]["analysis_errors"] == []
+
+    @pytest.mark.asyncio
+    async def test_scoped_graph_uses_full_paths_for_duplicate_module_files(
+        self, test_config, tmp_path
+    ):
+        first_file = tmp_path / "module-a" / "src" / "Same.java"
+        second_file = tmp_path / "module-b" / "src" / "Same.java"
+        first_file.parent.mkdir(parents=True)
+        second_file.parent.mkdir(parents=True)
+        code = "class Same { void run(String input) { String copy = input; } }"
+        first_file.write_text(code)
+        second_file.write_text(code)
+        first_source = Source(
+            location=CodeLocation(
+                file_path=str(first_file), line_number=1, function_name="run"
+            ),
+            variable_name="input",
+            type="user_input",
+            confidence=0.9,
+            code_snippet=code,
+        )
+        second_source = first_source.model_copy(
+            update={
+                "location": first_source.location.model_copy(
+                    update={"file_path": str(second_file)}
+                )
+            },
+            deep=True,
+        )
+        pipeline = SimplePipeline(test_config)
+
+        graph, scope_map = await pipeline._build_scoped_graph(
+            {str(first_file): code, str(second_file): code},
+            {str(first_file): [first_source], str(second_file): [second_source]},
+            {str(first_file): [], str(second_file): []},
+        )
+
+        assert scope_map[id(first_source)] != scope_map[id(second_source)]
+        assert scope_map[id(first_source)].startswith(str(first_file.absolute()))
+        assert scope_map[id(second_source)].startswith(str(second_file.absolute()))
+        assert graph.nodes[scope_map[id(first_source)]]["file_path"] == str(first_file)
+        assert graph.nodes[scope_map[id(second_source)]]["file_path"] == str(second_file)
+
+    def test_large_project_call_slice_keeps_only_source_to_sink_connectors(
+        self, test_config, tmp_path
+    ):
+        controller = tmp_path / "Controller.java"
+        service = tmp_path / "Service.java"
+        repository = tmp_path / "Repository.java"
+        unrelated = tmp_path / "Unrelated.java"
+        controller.write_text(
+            "class Controller { void handle(String input) { process(input); } }"
+        )
+        service.write_text(
+            "class Service { void process(String input) { execute(input); } }"
+        )
+        repository.write_text(
+            "class Repository { void execute(String query) { db.run(query); } }"
+        )
+        unrelated.write_text("class Unrelated { void idle() { helper(); } }")
+        source = Source(
+            location=CodeLocation(
+                file_path=str(controller), line_number=1, function_name="handle"
+            ),
+            variable_name="input",
+            type="user_input",
+            confidence=0.9,
+            code_snippet=controller.read_text(),
+        )
+        sink = Sink(
+            location=CodeLocation(
+                file_path=str(repository), line_number=1, function_name="execute"
+            ),
+            variable_name="query",
+            type="sql",
+            confidence=0.9,
+            code_snippet=repository.read_text(),
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+        pipeline = SimplePipeline(test_config)
+
+        selected, complete = pipeline._select_taint_reachable_files(
+            [str(controller), str(service), str(repository), str(unrelated)],
+            {str(controller): controller.read_text(), str(repository): repository.read_text()},
+            {str(controller): [source], str(repository): []},
+            {str(controller): [], str(repository): [sink]},
+        )
+
+        assert complete is True
+        assert set(selected) == {str(controller), str(service), str(repository)}
+        assert str(unrelated) not in selected
+
+    @pytest.mark.asyncio
+    async def test_unverifiable_chain_is_not_reported_as_verified(
+        self, test_config
+    ):
+        test_config.verification_level = "both"
+        test_config.symbolic_execution_enabled = True
+        source = Source(
+            location=CodeLocation(
+                file_path="Case.java", line_number=2, function_name="run"
+            ),
+            variable_name="input",
+            type="user_input",
+            confidence=0.9,
+            code_snippet="String input = request.getParameter(\"q\");",
+        )
+        sink = Sink(
+            location=CodeLocation(
+                file_path="Case.java", line_number=3, function_name="run"
+            ),
+            variable_name="query",
+            type="sql",
+            confidence=0.9,
+            code_snippet="statement.executeQuery(query);",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+        chain = TaintChain(
+            id="candidate",
+            source=source,
+            sink=sink,
+            path=[
+                PathNode(
+                    location=source.location,
+                    variable_name="input",
+                    node_type="source",
+                    code_snippet=source.code_snippet,
+                ),
+                PathNode(
+                    location=sink.location,
+                    variable_name="query",
+                    node_type="sink",
+                    code_snippet=sink.code_snippet,
+                ),
+            ],
+            length=2,
+            confidence=0.9,
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+            verification_status=VerificationStatus.UNVERIFIABLE,
+        )
+        graph = nx.DiGraph([("Case.java:input", "Case.java:query")])
+        finder = MagicMock()
+        finder.find_all_chains.return_value = [chain]
+        finder.limit_exceeded = True
+        finder.candidate_pairs_ranked = 2
+        finder.ranked_out_count = 1
+        finder.reachable_pairs_seen = 2
+        verifier = MagicMock()
+        verifier.verify_all_chains_scoped.return_value = {
+            "verified": [],
+            "unverifiable": [chain],
+            "false": [],
+            "verification_rate": 0.0,
+        }
+
+        pipeline = SimplePipeline(test_config)
+        pipeline._build_scoped_graph = AsyncMock(return_value=(
+            graph,
+            {id(source): "Case.java:input", id(sink): "Case.java:query"},
+        ))
+        with (
+            patch(
+                "src.pipeline.orchestrator.AStarPathFinder",
+                return_value=finder,
+            ),
+            patch(
+                "src.pipeline.orchestrator.VerificationEngine",
+                return_value=verifier,
+            ),
+        ):
+            result = await pipeline._run_stages_project(
+                {"Case.java": "class Case {}"},
+                {"Case.java": [source]},
+                {"Case.java": [sink]},
+                [source],
+                [sink],
+                [],
+            )
+
+        assert result["verified_chains"] == []
+        assert result["unverifiable_chains"] == [chain]
+        assert result["metrics"]["chains_verified"] == 0
+        assert result["metrics"]["chains_unverifiable"] == 1
+        assert result["metrics"]["candidate_selection_limited"] is True
+        assert result["metrics"]["candidate_pairs_ranked"] == 2
+        assert result["metrics"]["candidate_pairs_ranked_out"] == 1
+
+    @pytest.mark.asyncio
     async def test_run_project_analyzes_all_files_by_default(
         self, test_config, tmp_path, monkeypatch
     ):
@@ -306,6 +555,107 @@ class TestRunProject:
         assert result["files_llm_extracted"] == 2
         assert result["files_skipped"] == 0
         assert result["files_analyzed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_run_project_skips_empty_file_without_extractor_call(
+        self, test_config, tmp_path
+    ):
+        empty_file = tmp_path / "Empty.java"
+        empty_file.write_text("")
+        mock_extractor = MagicMock()
+        mock_extractor.extract = AsyncMock()
+
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor = mock_extractor
+
+        result = await pipeline.run_project([str(empty_file)])
+
+        mock_extractor.extract.assert_not_awaited()
+        assert result["metrics"]["sources_found"] == 0
+        assert result["metrics"]["extraction_complete"] is True
+
+    @pytest.mark.asyncio
+    async def test_large_project_retains_only_endpoint_files(
+        self, test_config, tmp_path, monkeypatch
+    ):
+        files = []
+        for name in ("A.java", "B.java"):
+            source_file = tmp_path / name
+            source_file.write_text(f"class {name[0]} {{ int value; }}")
+            files.append(str(source_file))
+
+        empty_spec = Specification(
+            sources=[],
+            sinks=[],
+            llm_model=test_config.llm_model,
+        )
+        mock_extractor = MagicMock()
+        mock_extractor.extract = AsyncMock(return_value=empty_spec)
+        monkeypatch.setattr(SimplePipeline, "FULL_PROJECT_GRAPH_FILE_LIMIT", 1)
+
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor = mock_extractor
+        result = await pipeline.run_project(files)
+
+        assert mock_extractor.extract.await_count == 2
+        assert result["metrics"]["graph_scope_mode"] == "taint_reachable_call_slice"
+        assert result["metrics"]["graph_candidate_files"] == 0
+        assert result["metrics"]["graph_files_omitted"] == 2
+        assert result["metrics"]["interfile_bridges_enabled"] is True
+        assert result["metrics"]["analysis_complete"] is True
+        assert result["metrics"]["analysis_errors"] == []
+
+    @pytest.mark.asyncio
+    async def test_large_project_limit_preserves_stage1_snapshot(
+        self, test_config, tmp_path, monkeypatch
+    ):
+        source_file = tmp_path / "Endpoint.java"
+        other_file = tmp_path / "Other.java"
+        source_file.write_text(
+            'class Endpoint { String q = request.getParameter("q"); }'
+        )
+        other_file.write_text("class Other {}")
+        source = Source(
+            location=CodeLocation(file_path=str(source_file), line_number=1),
+            variable_name="q",
+            type="User Input",
+            confidence=0.9,
+            code_snippet='request.getParameter("q")',
+        )
+        endpoint_spec = Specification(
+            sources=[source],
+            sinks=[],
+            llm_model=test_config.llm_model,
+        )
+        empty_spec = Specification(
+            sources=[],
+            sinks=[],
+            llm_model=test_config.llm_model,
+        )
+        mock_extractor = MagicMock()
+        mock_extractor.extract = AsyncMock(
+            side_effect=[endpoint_spec, empty_spec]
+        )
+        monkeypatch.setattr(SimplePipeline, "FULL_PROJECT_GRAPH_FILE_LIMIT", 1)
+        monkeypatch.setattr(SimplePipeline, "MAX_ENDPOINT_GRAPH_FILES", 0)
+        snapshots = []
+
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor = mock_extractor
+
+        result = await pipeline.run_project(
+            [str(source_file), str(other_file)],
+            on_stage1_complete=snapshots.append,
+        )
+
+        assert len(snapshots) == 1
+        assert snapshots[0]["sources"] == [source]
+        assert snapshots[0]["stage1_complete"] is True
+        assert snapshots[0]["resource_limit_reached"] is True
+        assert result["metrics"]["analysis_complete"] is False
+        assert "Stage 2 endpoint-file retention limit was reached" in result[
+            "metrics"
+        ]["analysis_errors"]
 
     @pytest.mark.asyncio
     async def test_run_project_fast_prefilter_excludes_irrelevant(
