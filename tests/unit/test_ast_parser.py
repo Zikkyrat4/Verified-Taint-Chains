@@ -248,3 +248,30 @@ public class Outer {
 
         consume = next(call for call in calls if call["name"] == "consume")
         assert consume["function_name"] == "delegate"
+
+    def test_data_flows_through_mutating_collection_calls(self):
+        parser = JavaASTParser()
+        if parser.parser is None:
+            pytest.skip("tree-sitter unavailable; AST path not exercised")
+
+        flows = parser.extract_data_flows(
+            """
+class T {
+    void run(String input) {
+        java.util.List<String> values = new java.util.ArrayList<>();
+        values.add(input);
+        ProcessBuilder process = new ProcessBuilder();
+        process.command(values);
+    }
+}
+"""
+        )
+
+        assert any(
+            flow["from_var"] == "input" and flow["to_var"] == "values"
+            for flow in flows
+        )
+        assert any(
+            flow["from_var"] == "values" and flow["to_var"] == "process"
+            for flow in flows
+        )

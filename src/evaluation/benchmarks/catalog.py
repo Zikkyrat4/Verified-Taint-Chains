@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from src.core.config_loader import environment_or_file_setting
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_BENCHMARK_ROOT = ROOT / ".vtc-benchmarks"
@@ -81,9 +82,11 @@ def benchmark_root(override: Path | None = None) -> Path:
     """Resolve the external data root without placing upstream code in Git."""
     if override is not None:
         return override.expanduser().resolve()
-    configured = os.getenv("VTC_BENCHMARK_DIR")
+    configured = environment_or_file_setting(
+        "VTC_BENCHMARK_DIR", "benchmark", "directory"
+    )
     if configured:
-        return Path(configured).expanduser().resolve()
+        return Path(str(configured)).expanduser().resolve()
     return DEFAULT_BENCHMARK_ROOT
 
 

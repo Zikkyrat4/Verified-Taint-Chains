@@ -316,6 +316,23 @@ class SymbolicExecutor:
             current = current_node.variable_name if hasattr(current_node, 'variable_name') else str(current_node)
             next_var = next_node.variable_name if hasattr(next_node, 'variable_name') else str(next_node)
 
+            # Dedicated endpoint nodes can represent two occurrences of the
+            # same Java variable. Check intervening assignments before
+            # modeling identity: ``param = \"safe\"`` kills the original taint.
+            if current == next_var:
+                symbolic = constraints.add_variable(current, "String")
+                if symbolic.z3_var is not None:
+                    preservation = self._same_variable_preservation(
+                        current_node, next_node, current, source_code
+                    )
+                    if preservation is not None:
+                        constraints.add_constraint(
+                            symbolic.z3_var == symbolic.z3_var
+                            if preservation else z3.BoolVal(False)
+                        )
+                        constraints.modeled_edges += 1
+                        continue
+
             # Find the statement connecting current -> next
             snippets = [
                 getattr(next_node, "code_snippet", ""),
@@ -339,6 +356,33 @@ class SymbolicExecutor:
         logger.debug(f"Built path constraints: {constraints}")
         return constraints
 
+    @classmethod
+    def _same_variable_preservation(
+        cls,
+        source_node: Any,
+        sink_node: Any,
+        variable: str,
+        source_code: str,
+    ) -> Optional[bool]:
+        """Decide whether a same-name value survives between two endpoints."""
+        source_location = getattr(source_node, "location", None)
+        sink_location = getattr(sink_node, "location", None)
+        start = int(getattr(source_location, "line_number", 0) or 0)
+        end = int(getattr(sink_location, "line_number", 0) or 0)
+        if start <= 0 or end <= start:
+            return None
+
+        lines = source_code.splitlines()
+        escaped = re.escape(variable)
+        assignment = re.compile(
+            rf"(?<![A-Za-z0-9_$]){escaped}\s*=\s*(.+?);"
+        )
+        for line in lines[start:end]:
+            match = assignment.search(line)
+            if match and not cls._mentions_identifier(match.group(1), variable):
+                return False
+        return True
+
     def _find_statement_for_edge(
         self,
         source_code: str,
@@ -357,7 +401,12 @@ class SymbolicExecutor:
         Returns:
             Statement string or None.
         """
-        lines = [*(snippets or []), *source_code.split('\n')]
+        # Java formatters routinely split one assignment or invocation across
+        # several physical lines. Prefer complete semicolon-terminated
+        # statements, then retain the line scan for signatures/returns without
+        # a terminator.
+        statements = re.findall(r"[^;{}]*;", source_code, re.DOTALL)
+        lines = [*(snippets or []), *statements, *source_code.split('\n')]
 
         for line in lines:
             if not line:
@@ -365,14 +414,8 @@ class SymbolicExecutor:
             # Assignment/call/return evidence must mention the exact Java
             # identifiers. Substring matching joined unrelated names such as
             # `id` and `identity` and produced misleading SAT results.
-            has_source = re.search(
-                rf"(?<![A-Za-z0-9_$]){re.escape(var1)}(?![A-Za-z0-9_$])",
-                line,
-            )
-            has_target = re.search(
-                rf"(?<![A-Za-z0-9_$]){re.escape(var2)}(?![A-Za-z0-9_$])",
-                line,
-            )
+            has_source = self._mentions_identifier(line, var1)
+            has_target = self._mentions_identifier(line, var2)
             return_flow = var2 == "return_value" and re.search(
                 rf"\breturn\b[^;]*\b{re.escape(var1)}\b", line
             )
@@ -488,6 +531,9 @@ class SymbolicExecutor:
 
     @staticmethod
     def _mentions_identifier(expression: str, identifier: str) -> bool:
+        expression = re.sub(r'"(?:\\.|[^"\\])*"', "", expression)
+        expression = re.sub(r"'(?:\\.|[^'\\])*'", "", expression)
+        expression = re.sub(r"//.*?$|/\*.*?\*/", "", expression, flags=re.MULTILINE | re.DOTALL)
         return bool(re.search(
             rf"(?<![A-Za-z0-9_$]){re.escape(identifier)}(?![A-Za-z0-9_$])",
             expression,

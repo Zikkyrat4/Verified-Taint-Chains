@@ -52,7 +52,7 @@ def build_pipeline_config(
     max_concurrent_functions: int | None = None,
     max_concurrent_llm_requests: int | None = None,
 ) -> Any:
-    """Build a benchmark config while preventing an environment-driven file cap."""
+    """Build a benchmark config without environment-driven coverage limits."""
     config = load_config_from_env(
         analysis_backend_override=backend,
         llm_analysis_mode_override=llm_analysis_mode,
@@ -63,6 +63,10 @@ def build_pipeline_config(
             "unverified candidates are not benchmark findings"
         )
     config.max_files = 0
+    # External benchmark results must cover every selected source file. The
+    # targeted/exhaustive method policy remains explicit, but the debug-only
+    # file prefilter must never be inherited from a local profile.
+    config.fast_prefilter = False
     config.cache_dir = str(cache_dir)
     config.cache_read_enabled = not refresh_specs
     if max_concurrent_files is not None:

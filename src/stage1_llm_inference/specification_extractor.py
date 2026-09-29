@@ -1,23 +1,24 @@
 """Specification extractor using LLM for source and sink detection."""
 
 import asyncio
-import os
+import hashlib
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.core.exceptions import LLMError, ParsingError, TruncatedLLMResponseError
 from src.core.models import (
     CodeLocation,
     Sanitizer,
-    Source,
     Sink,
     SinkCategory,
+    Source,
     Specification,
     VulnerabilityType,
 )
-from src.core.source_sink_classifier import classify_source, classify_sink
-from src.core.exceptions import LLMError, ParsingError, TruncatedLLMResponseError
-from src.stage1_llm_inference.llm_client import SimpleLLMClient
+from src.core.source_sink_classifier import classify_sink, classify_source
 from src.stage1_llm_inference.ast_parser import JavaASTParser
+from src.stage1_llm_inference.llm_client import SimpleLLMClient
+from src.stage1_llm_inference.project_context import strip_java_comments
 from src.stage1_llm_inference.prompt_templates import (
     build_combined_prompt,
     build_missing_source_repair_prompt,
@@ -51,6 +52,8 @@ class SimpleSpecificationExtractor:
         truncation_max_tokens: int = 16000,
         analysis_backend: str = "llm",
         analysis_mode: str = "exhaustive",
+        fast_prefilter: bool = False,
+        cache_identity: str = "",
         cache_read_enabled: bool = True,
     ) -> None:
         """Initialize the specification extractor.
@@ -93,6 +96,8 @@ class SimpleSpecificationExtractor:
             )
         self.analysis_backend = analysis_backend
         self.analysis_mode = analysis_mode
+        self.fast_prefilter = fast_prefilter
+        self.cache_identity = cache_identity
         self.cache_read_enabled = cache_read_enabled
 
         logger.debug(
@@ -140,13 +145,12 @@ class SimpleSpecificationExtractor:
 
     @staticmethod
     def _is_trivial_function(func_code: str) -> bool:
-        """True if a function structurally cannot contain taint logic.
+        """Return whether a function is cheap to omit in targeted mode.
 
-        Structural (not keyword-based) so it never hides a 0-day: a function
-        is trivial only when its body has no method/constructor calls and is
-        at most two statements — i.e. an empty body, a plain field accessor
-        (`return this.x;` / `this.x = x;`), or a constant return. Anything
-        that calls into other code is analyzed.
+        A method is considered trivial when its body has no method/constructor
+        calls and at most two statements. Exhaustive mode deliberately bypasses
+        this optimization because an accessor or annotated parameter can still
+        be the source boundary of a cross-file flow.
         """
         brace = func_code.find("{")
         if brace == -1:
@@ -168,18 +172,11 @@ class SimpleSpecificationExtractor:
         return len(statements) <= 2
 
     def _has_potential_sinks(self, source_code: str) -> bool:
-        """True if the file structurally COULD contain a sink.
+        """Return whether a file contains an invocation that could be a sink.
 
-        A sink is, by definition, a method invocation (or constructor call)
-        that consumes tainted data. A file with **zero** method invocations
-        / object creations anywhere — pure DTOs, marker interfaces, enums
-        without methods, ``package-info.java``, empty class shells —
-        provably cannot contain a sink.
-
-        We therefore skip the entire LLM call on such files. This is strict-
-        ly stronger than the keyword regex prefilter (which guards 0-day
-        coverage by definition): "no method invocations" is an AST fact, not
-        a heuristic. It cannot hide a sink that uses an unfamiliar API.
+        Targeted mode can skip pure DTOs, marker interfaces and similar files
+        with no method/object calls. Exhaustive mode does not use this filter:
+        a no-call file can still define a source boundary used in another file.
 
         Falls back to ``True`` (analyze) when tree-sitter is unavailable so
         the prefilter never introduces false negatives in degraded mode.
@@ -211,7 +208,13 @@ class SimpleSpecificationExtractor:
         return False
 
     async def extract(
-        self, source_code: str, file_path: str = "", model: str = "gpt-4-turbo"
+        self,
+        source_code: str,
+        file_path: str = "",
+        model: str = "gpt-4-turbo",
+        project_context: str = "",
+        prompt_redactions: Optional[Dict[str, str]] = None,
+        proven_constant_calls: Optional[set[str]] = None,
     ) -> Specification:
         """Extract security specification from Java source code.
 
@@ -219,9 +222,8 @@ class SimpleSpecificationExtractor:
 
         1. ``spec_cache.get`` — if a prior identical run cached this file's
            specification, replay it verbatim (no LLM call).
-        2. ``_has_potential_sinks`` — if the file structurally has no method
-           invocations, return an empty specification (no LLM call). The
-           result is cached so subsequent runs short-circuit at step 1.
+        2. In targeted/fast mode, ``_has_potential_sinks`` skips files with no
+           method invocations. Exhaustive mode bypasses this optimization.
         3. ``_extract_uncached`` — the original full LLM-driven pipeline. The
            result is cached for next time.
 
@@ -240,7 +242,14 @@ class SimpleSpecificationExtractor:
         if not source_code or not source_code.strip():
             raise ValueError("source_code cannot be empty")
 
-        cache_kwargs = self._cache_kwargs(model)
+        prompt_redactions = prompt_redactions or {}
+        proven_constant_calls = proven_constant_calls or set()
+        cache_kwargs = self._cache_kwargs(
+            model,
+            project_context=project_context,
+            prompt_redactions=prompt_redactions,
+            proven_constant_calls=proven_constant_calls,
+        )
 
         # Step 1: cache hit?
         if (
@@ -263,8 +272,10 @@ class SimpleSpecificationExtractor:
                     cached = cached.model_copy(update={"sinks": plausible})
                 return cached
 
-        # Step 2: AST prefilter — zero possibility of a sink in this file.
-        if not self._has_potential_sinks(source_code):
+        # Step 2: targeted-only structural prefilter. Exhaustive mode must keep
+        # source-only boundaries even when this file contains no local sink.
+        structural_prefilter = self.analysis_mode == "targeted" or self.fast_prefilter
+        if structural_prefilter and not self._has_potential_sinks(source_code):
             logger.debug(
                 f"Skipping {file_path or 'inline code'}: AST prefilter "
                 f"found no method invocations (sink impossible)"
@@ -281,7 +292,14 @@ class SimpleSpecificationExtractor:
             return empty
 
         # Step 3: the full LLM-driven extraction (original logic).
-        spec = await self._extract_uncached(source_code, file_path, model)
+        spec = await self._extract_uncached(
+            source_code,
+            file_path,
+            model,
+            project_context=project_context,
+            prompt_redactions=prompt_redactions,
+            proven_constant_calls=proven_constant_calls,
+        )
         if (
             spec.extraction_complete
             and self.spec_cache is not None
@@ -294,7 +312,14 @@ class SimpleSpecificationExtractor:
             )
         return spec
 
-    def _cache_kwargs(self, model: str) -> Optional[Dict[str, Any]]:
+    def _cache_kwargs(
+        self,
+        model: str,
+        *,
+        project_context: str = "",
+        prompt_redactions: Optional[Dict[str, str]] = None,
+        proven_constant_calls: Optional[set[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Build the keyword args used to compute a stable cache key.
 
         Returns ``None`` if no provider was wired in — caching is skipped
@@ -302,6 +327,25 @@ class SimpleSpecificationExtractor:
         """
         if not self.llm_provider:
             return None
+        context_identity = (
+            "project_context_sha256="
+            f"{hashlib.sha256(project_context.encode('utf-8')).hexdigest()};"
+            if project_context else ""
+        )
+        redactions = prompt_redactions or {}
+        redaction_material = "\0".join(
+            f"{source}\0{replacement}"
+            for source, replacement in sorted(redactions.items())
+        )
+        redaction_identity = (
+            "prompt_redactions_sha256="
+            f"{hashlib.sha256(redaction_material.encode('utf-8')).hexdigest()};"
+            if redaction_material else ""
+        )
+        constant_calls = ",".join(sorted(proven_constant_calls or set()))
+        constant_call_identity = (
+            f"proven_constant_calls={constant_calls};" if constant_calls else ""
+        )
         return {
             "llm_provider": self.llm_provider,
             "llm_model": model,
@@ -309,19 +353,55 @@ class SimpleSpecificationExtractor:
             "extractor_options": (
                 f"analysis_backend={self.analysis_backend};"
                 f"analysis_mode={self.analysis_mode};"
-                f"batch_max_chars={self.batch_max_chars}"
+                f"fast_prefilter={self.fast_prefilter};"
+                f"batch_max_chars={self.batch_max_chars};"
+                f"{context_identity}"
+                f"{redaction_identity}"
+                f"{constant_call_identity}"
+                f"{self.cache_identity}"
             ),
         }
 
     async def _extract_uncached(
-        self, source_code: str, file_path: str = "", model: str = "gpt-4-turbo"
+        self,
+        source_code: str,
+        file_path: str = "",
+        model: str = "gpt-4-turbo",
+        *,
+        project_context: str = "",
+        prompt_redactions: Optional[Dict[str, str]] = None,
+        proven_constant_calls: Optional[set[str]] = None,
     ) -> Specification:
-        """Original LLM-driven extraction pipeline (no cache, no prefilter).
+        """Run LLM extraction with the selected method-coverage policy.
 
         Split out from ``extract`` so the cache/prefilter layer can wrap it
         without touching the LLM logic.
         """
         logger.debug(f"Starting extraction from {file_path or 'inline code'}")
+        prompt_redactions = prompt_redactions or {}
+        proven_constant_calls = proven_constant_calls or set()
+
+        def redact(text: str) -> str:
+            for original, replacement in prompt_redactions.items():
+                text = text.replace(original, replacement)
+            return text
+
+        def prepare_code_for_prompt(text: str) -> str:
+            # Comments are not executable semantics and benchmark corpora may
+            # include labels such as "safe" in them. Preserve newlines so LLM
+            # endpoint line numbers still map to the unmodified source.
+            return redact(strip_java_comments(text))
+
+        def redact_metadata(value: Any) -> Any:
+            if isinstance(value, str):
+                return redact(value)
+            if isinstance(value, list):
+                return [redact_metadata(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(redact_metadata(item) for item in value)
+            if isinstance(value, dict):
+                return {key: redact_metadata(item) for key, item in value.items()}
+            return value
 
         # Extract global context (imports, classes)
         imports = self._extract_imports(source_code)
@@ -333,21 +413,18 @@ class SimpleSpecificationExtractor:
         logger.debug(f"Split code into {len(functions)} functions")
 
         # Targeted mode bounds provider cost by sending only known security
-        # boundaries/operations. Exhaustive mode keeps novel-API coverage by
-        # analyzing every non-trivial function. Backend selection is orthogonal:
+        # boundaries/operations. Exhaustive mode sends every discovered
+        # function, including trivial/source-only boundaries. Backend selection is orthogonal:
         # static never calls the model, while llm/hybrid do.
-        # VTC_FAST_PREFILTER additionally enables project-level file exclusion.
-        fast_prefilter = os.getenv("VTC_FAST_PREFILTER", "false").lower() in (
-            "true", "1", "yes", "on"
-        )
-        targeted = self.analysis_mode == "targeted" or fast_prefilter
+        # fast_prefilter additionally enables project-level file exclusion.
+        targeted = self.analysis_mode == "targeted" or self.fast_prefilter
         use_llm = self.analysis_backend in ("llm", "hybrid")
 
         analyzable: List[Tuple[str, str, int, Optional[Dict[str, Any]]]] = []
         skipped_funcs = 0
         for entry in functions:
             func_name, func_code = entry[0], entry[1]
-            if self._is_trivial_function(func_code):
+            if targeted and self._is_trivial_function(func_code):
                 skipped_funcs += 1
                 continue
             if not use_llm:
@@ -400,11 +477,14 @@ class SimpleSpecificationExtractor:
                         # Build context for this function
                         class_info = classes[0] if classes else None
 
+                        prompt_function_info = redact_metadata(dict(func_info or {}))
+                        prompt_class_info = redact_metadata(dict(class_info or {}))
                         combined_prompt = build_combined_prompt(
-                            code=func_code,
-                            function_info=func_info,
-                            class_info=class_info,
-                            imports=imports,
+                            code=prepare_code_for_prompt(func_code),
+                            function_info=prompt_function_info,
+                            class_info=prompt_class_info,
+                            imports=[redact(item) for item in imports],
+                            project_context=redact(project_context),
                         )
 
                         # A parse retry asks the model to regenerate malformed JSON.
@@ -582,6 +662,7 @@ class SimpleSpecificationExtractor:
             line_number: int,
             variable_name: str,
             *,
+            prefer_source_operation: bool = False,
             prefer_sink_operation: bool = False,
             function_name: Optional[str] = None,
         ) -> Tuple[str, int]:
@@ -617,8 +698,14 @@ class SimpleSpecificationExtractor:
                 ):
                     return False
                 return not (
-                    prefer_sink_operation
-                    and self._is_non_operation_sink_text(line, variable_name)
+                    (
+                        prefer_source_operation
+                        and self._is_non_operation_source_text(line, variable_name)
+                    )
+                    or (
+                        prefer_sink_operation
+                        and self._is_non_operation_sink_text(line, variable_name)
+                    )
                 )
 
             if in_scope(primary_idx) and is_candidate(primary):
@@ -643,6 +730,7 @@ class SimpleSpecificationExtractor:
             snippet, resolved_line = _resolve_snippet(
                 src.location.line_number,
                 src.variable_name,
+                prefer_source_operation=True,
                 function_name=src.location.function_name,
             )
             src.code_snippet = snippet
@@ -798,7 +886,7 @@ class SimpleSpecificationExtractor:
                     async with semaphore:
                         response = await self.llm_client.chat_with_json_prompt(
                             build_missing_source_repair_prompt(
-                                func_code, sink_payload
+                                prepare_code_for_prompt(func_code), sink_payload
                             )
                         )
                     return self._parse_llm_sources(
@@ -827,6 +915,7 @@ class SimpleSpecificationExtractor:
                         snippet, resolved_line = _resolve_snippet(
                             source.location.line_number,
                             source.variable_name,
+                            prefer_source_operation=True,
                             function_name=source.location.function_name,
                         )
                         source.code_snippet = snippet
@@ -840,6 +929,21 @@ class SimpleSpecificationExtractor:
                     "Method source consistency review recovered "
                     f"{sum(map(len, repaired_groups))} source(s) across "
                     f"{len(repaired_groups)} scope(s)"
+                )
+
+        if proven_constant_calls:
+            before = len(all_sources)
+            all_sources = [
+                source for source in all_sources
+                if not self._source_uses_proven_constant_call(
+                    source, proven_constant_calls
+                )
+            ]
+            removed = before - len(all_sources)
+            if removed:
+                logger.debug(
+                    f"Removed {removed} source(s) whose project-local call "
+                    "is proven to return constants only"
                 )
 
         # Batch endpoints initially carry a synthetic scope. Deduplicate again
@@ -877,8 +981,8 @@ class SimpleSpecificationExtractor:
             and cls._EMPTY_REVIEW_SINK_RE.search(func_code)
         )
 
-    @staticmethod
     def _find_terminal_sink_use(
+        self,
         source_lines: List[str],
         functions: List[Tuple[str, str, int, Optional[Dict[str, Any]]]],
         sink: Sink,
@@ -898,33 +1002,109 @@ class SimpleSpecificationExtractor:
             return None
         start = max(1, info.get("start_line", current_line))
         end = min(len(source_lines), info.get("end_line", current_line))
-        escaped = re.escape(variable)
-        vuln = sink.vulnerability_type
-        if vuln is VulnerabilityType.COMMAND_INJECTION:
-            pattern = re.compile(
-                rf"(?:\.exec|ProcessBuilder)\s*\([^;]*\b{escaped}\b"
-            )
-        elif vuln is VulnerabilityType.OPEN_REDIRECT:
-            pattern = re.compile(
-                rf"(?:sendRedirect|redirect)\s*\([^;]*\b{escaped}\b"
-                rf"|setHeader\s*\(\s*[\"']Location[\"'][^;]*\b{escaped}\b"
-            )
-        elif vuln is VulnerabilityType.XSS:
-            pattern = re.compile(
-                rf"(?:print|write|sendError)\w*\s*\([^;]*\b{escaped}\b"
-            )
-        else:
-            return None
+        operation_names = {
+            VulnerabilityType.COMMAND_INJECTION: {
+                "exec", "command", "start",
+            },
+            VulnerabilityType.SQL_INJECTION: {
+                "execute", "executeQuery", "executeUpdate", "executeBatch",
+                "prepareCall", "prepareStatement", "createQuery",
+                "createNativeQuery",
+            },
+            VulnerabilityType.XSS: {
+                "append", "format", "printf", "print", "println", "write",
+                "sendError", "setHeader", "addHeader",
+            },
+            VulnerabilityType.PATH_TRAVERSAL: {
+                "get", "newInputStream", "newOutputStream", "readAllBytes",
+                "readString", "write", "copy", "move", "delete",
+            },
+            VulnerabilityType.OPEN_REDIRECT: {
+                "sendRedirect", "redirect", "setHeader", "addHeader",
+            },
+            VulnerabilityType.SSRF: {
+                "openConnection", "openStream", "send", "execute",
+            },
+            VulnerabilityType.CODE_INJECTION: {
+                "eval", "evaluate", "invoke", "forName", "parseClass",
+                "parseExpression", "compile", "defineClass",
+            },
+            VulnerabilityType.UNSAFE_DESERIALIZATION: {
+                "readObject", "readValue", "deserialize", "fromXML",
+            },
+            VulnerabilityType.XXE: {
+                "parse", "unmarshal", "transform",
+            },
+        }.get(sink.vulnerability_type, set())
 
-        candidates = [
-            (line_number, source_lines[line_number - 1].strip())
-            for line_number in range(start, end + 1)
-            if pattern.search(source_lines[line_number - 1])
-        ]
+        def statement_at(line_number: int) -> str:
+            first = line_number - 1
+            while first > start - 1 and ";" not in source_lines[first - 1]:
+                first -= 1
+                if line_number - first >= 8:
+                    break
+            last = line_number - 1
+            while last + 1 < end and ";" not in source_lines[last]:
+                last += 1
+                if last - line_number >= 8:
+                    break
+            return " ".join(
+                line.strip() for line in source_lines[first:last + 1]
+                if line.strip()
+            )
+
+        candidates: List[Tuple[int, str]] = []
+        if operation_names:
+            method_code = "\n".join(source_lines[start - 1:end])
+            for call in self.ast_parser.extract_method_calls(method_code):
+                if call.get("name") not in operation_names:
+                    continue
+                arguments = " ".join(str(arg) for arg in call.get("arguments", []))
+                if not self._mentions_identifier(arguments, variable):
+                    continue
+                absolute_line = start - 1 + int(call.get("line", 1))
+                candidates.append((absolute_line, statement_at(absolute_line)))
+
+        # Constructors are not method_invocation nodes. Keep a narrow fallback
+        # for value-consuming security constructors and multi-line statements.
+        if sink.vulnerability_type in {
+            VulnerabilityType.COMMAND_INJECTION,
+            VulnerabilityType.PATH_TRAVERSAL,
+            VulnerabilityType.SSRF,
+        }:
+            escaped = re.escape(variable)
+            qualified_class = (
+                r"(?:[A-Za-z_$][\w$]*\.)*(?:ProcessBuilder|File|"
+                r"FileInputStream|FileOutputStream|URL|URI)"
+            )
+            constructor = re.compile(
+                rf"\bnew\s+{qualified_class}\s*\([^;]*?"
+                rf"(?<![A-Za-z0-9_$]){escaped}(?![A-Za-z0-9_$])",
+                re.DOTALL,
+            )
+            method_text = "\n".join(source_lines[start - 1:end])
+            for match in constructor.finditer(method_text):
+                absolute_line = start + method_text.count("\n", 0, match.start())
+                candidates.append((absolute_line, statement_at(absolute_line)))
+            assigned_constructor = re.compile(
+                rf"(?<![A-Za-z0-9_$]){escaped}(?![A-Za-z0-9_$])\s*=\s*"
+                rf"new\s+{qualified_class}\s*\(",
+                re.DOTALL,
+            )
+            for match in assigned_constructor.finditer(method_text):
+                absolute_line = start + method_text.count("\n", 0, match.start())
+                candidates.append((absolute_line, statement_at(absolute_line)))
+
         if not candidates:
             return None
-        later = [candidate for candidate in candidates if candidate[0] >= current_line]
-        return (later or candidates)[-1]
+        return min(
+            set(candidates),
+            key=lambda candidate: (
+                abs(candidate[0] - current_line),
+                candidate[0] < current_line,
+                candidate[0],
+            ),
+        )
 
     @staticmethod
     def _build_llm_batches(
@@ -1228,13 +1408,33 @@ class SimpleSpecificationExtractor:
             if assignment:
                 target, rhs = assignment.group(1), assignment.group(2)
                 if re.search(r"new\s+File\s*\(|Paths\.get\s*\(", rhs):
-                    add_sink(target, line_number, VulnerabilityType.PATH_TRAVERSAL, "file_path", statement)
+                    add_sink(
+                        target,
+                        line_number,
+                        VulnerabilityType.PATH_TRAVERSAL,
+                        "file_path",
+                        statement,
+                    )
                 elif re.search(
                     r"(?:Class\s*\.\s*forName|classForName)\s*\(", rhs
                 ):
-                    add_sink(target, line_number, VulnerabilityType.CODE_INJECTION, "dynamic_class_loading", statement)
-                elif re.search(r"\.deserialize\s*\(|\.readObject\s*\(|\.readValue\s*\(", rhs):
-                    add_sink(target, line_number, VulnerabilityType.UNSAFE_DESERIALIZATION, "deserialization", statement)
+                    add_sink(
+                        target,
+                        line_number,
+                        VulnerabilityType.CODE_INJECTION,
+                        "dynamic_class_loading",
+                        statement,
+                    )
+                elif re.search(
+                    r"\.deserialize\s*\(|\.readObject\s*\(|\.readValue\s*\(", rhs
+                ):
+                    add_sink(
+                        target,
+                        line_number,
+                        VulnerabilityType.UNSAFE_DESERIALIZATION,
+                        "deserialization",
+                        statement,
+                    )
 
             class_load_arg = re.search(
                 r"(?:Class\s*\.\s*forName|classForName)\s*\(\s*"
@@ -1255,7 +1455,13 @@ class SimpleSpecificationExtractor:
                 compact,
             )
             if deserialize_arg and not assignment:
-                add_sink(deserialize_arg.group(1), line_number, VulnerabilityType.UNSAFE_DESERIALIZATION, "deserialization", statement)
+                add_sink(
+                    deserialize_arg.group(1),
+                    line_number,
+                    VulnerabilityType.UNSAFE_DESERIALIZATION,
+                    "deserialization",
+                    statement,
+                )
 
             output_call = re.search(
                 r"\b(?:out|writer|response)\.(?:print|println|write)\s*\((.*)\)\s*;",
@@ -1277,7 +1483,13 @@ class SimpleSpecificationExtractor:
                 compact,
             )
             if redirect_arg:
-                add_sink(redirect_arg.group(1), line_number, VulnerabilityType.OPEN_REDIRECT, "redirect", statement)
+                add_sink(
+                    redirect_arg.group(1),
+                    line_number,
+                    VulnerabilityType.OPEN_REDIRECT,
+                    "redirect",
+                    statement,
+                )
 
             sql_arg = re.search(
                 r"(?:executeQuery|executeUpdate|createQuery|createNativeQuery)\s*"
@@ -1490,6 +1702,71 @@ class SimpleSpecificationExtractor:
                 assignment.group(1),
             ))
         return False
+
+    @staticmethod
+    def _is_non_operation_source_text(text: str, variable_name: str) -> bool:
+        """Reject declarations that cannot introduce attacker-controlled data."""
+        text = text.strip()
+        if not text:
+            return False
+        declaration = re.match(
+            r"^(?:(?:public|protected|private|static|final)\s+)*"
+            r"[\w$<>,?.\[\] ]+\s+([A-Za-z_$][\w$]*)\s*"
+            r"(?:=\s*(.*))?;\s*$",
+            text,
+            re.DOTALL,
+        )
+        if declaration:
+            # A nearby declaration that merely consumes the source variable is
+            # not its origin. Continue looking for the variable's own reaching
+            # definition instead of trusting an LLM-reported use site.
+            if declaration.group(1) != variable_name:
+                return True
+            rhs = (declaration.group(2) or "").strip()
+            if not rhs:
+                return True
+            if re.fullmatch(
+                r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|'
+                r"-?\d+(?:\.\d+)?|true|false|null)",
+                rhs,
+            ):
+                return True
+        assignment = re.match(
+            rf"^{re.escape(variable_name)}\s*=\s*(.*);\s*$",
+            text,
+            re.DOTALL,
+        )
+        if assignment and re.fullmatch(
+            r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|'
+            r"-?\d+(?:\.\d+)?|true|false|null)",
+            assignment.group(1).strip(),
+        ):
+            return True
+        if declaration or assignment:
+            return False
+        # Public/callback parameters can be source boundaries at a signature.
+        if re.match(
+            r"^(?:(?:public|protected|private|static|final|synchronized|"
+            r"abstract|native)\s+)*[A-Za-z_$][\w$<>?.\[\], ]*\s+"
+            r"[A-Za-z_$][\w$]*\s*\([^)]*"
+            rf"(?<![A-Za-z0-9_$]){re.escape(variable_name)}"
+            rf"(?![A-Za-z0-9_$])[^)]*\)\s*(?:throws\s+[^{{]+)?{{?\s*$",
+            text,
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _source_uses_proven_constant_call(
+        source: Source, proven_constant_calls: set[str]
+    ) -> bool:
+        snippet = source.code_snippet or ""
+        return any(
+            re.search(
+                rf"(?<![A-Za-z0-9_$]){re.escape(call)}\s*\(", snippet
+            )
+            for call in proven_constant_calls
+        )
 
     @staticmethod
     def _mentions_identifier(text: str, variable_name: str) -> bool:
@@ -1972,7 +2249,10 @@ class SimpleSpecificationExtractor:
         # "url_redirection" contains the bare substring "url", which the SSRF
         # rule would otherwise greedily claim. "redirect" is the stronger,
         # more specific signal.
-        if any(k in combined for k in ("open_redirect", "open redirect", "redirect", "sendredirect")):
+        if any(
+            k in combined
+            for k in ("open_redirect", "open redirect", "redirect", "sendredirect")
+        ):
             return VulnerabilityType.OPEN_REDIRECT
         if any(k in combined for k in ("ssrf", "url", "http_client", "request_forgery")):
             return VulnerabilityType.SSRF
@@ -2053,7 +2333,10 @@ class SimpleSpecificationExtractor:
 
         # Fallback to regex-based extraction
         classes_list: List[Dict[str, Any]] = []
-        class_pattern = r"(public|private)?\s+class\s+(\w+)(?:\s+extends\s+(\w+))?(?:\s+implements\s+([^{]+))?"
+        class_pattern = (
+            r"(public|private)?\s+class\s+(\w+)(?:\s+extends\s+(\w+))?"
+            r"(?:\s+implements\s+([^{]+))?"
+        )
 
         for match in re.finditer(class_pattern, code):
             class_name = match.group(2)

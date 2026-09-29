@@ -1,11 +1,12 @@
 """Unit tests for pipeline configuration."""
 
 import os
-import pytest
 import tempfile
 from pathlib import Path
 
-from src.core.config import PipelineConfig, load_config_from_env
+import pytest
+
+from src.core.config import PipelineConfig, load_config, load_config_from_env
 
 
 class TestPipelineConfig:
@@ -189,11 +190,12 @@ class TestPipelineConfig:
 class TestLoadConfigFromEnv:
     """Tests for load_config_from_env function."""
 
-    def test_load_config_required_env(self) -> None:
+    def test_load_config_required_env(self, tmp_path: Path) -> None:
         """Test loading config with only required environment variable."""
         # Save original env (including vars that .env file may inject)
         env_vars_to_manage = [
             "OPENAI_API_KEY", "LLM_PROVIDER", "OPENAI_MODEL", "LLM_MODEL",
+            "VTC_CONFIG",
         ]
         original_values = {k: os.environ.get(k) for k in env_vars_to_manage}
 
@@ -203,6 +205,9 @@ class TestLoadConfigFromEnv:
             os.environ["LLM_PROVIDER"] = "openai"
             os.environ["OPENAI_MODEL"] = ""
             os.environ["LLM_MODEL"] = ""
+            empty_config = tmp_path / "defaults.toml"
+            empty_config.write_text("version = 1\n", encoding="utf-8")
+            os.environ["VTC_CONFIG"] = str(empty_config)
 
             config = load_config_from_env()
 
@@ -285,7 +290,7 @@ class TestLoadConfigFromEnv:
                     os.environ.pop(key, None)
 
     def test_load_config_invalid_path_length(self) -> None:
-        """Test that invalid path length uses default."""
+        """Invalid numeric values fail instead of silently changing a run."""
         original_vars = {
             "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
             "MAX_PATH_LENGTH": os.environ.get("MAX_PATH_LENGTH"),
@@ -295,9 +300,8 @@ class TestLoadConfigFromEnv:
             os.environ["OPENAI_API_KEY"] = "test-key"
             os.environ["MAX_PATH_LENGTH"] = "not-a-number"
 
-            config = load_config_from_env()
-
-            assert config.max_path_length == 15  # Default
+            with pytest.raises(ValueError, match="MAX_PATH_LENGTH"):
+                load_config_from_env()
 
         finally:
             for key, value in original_vars.items():
@@ -307,7 +311,7 @@ class TestLoadConfigFromEnv:
                     os.environ.pop(key, None)
 
     def test_load_config_invalid_confidence(self) -> None:
-        """Test that invalid confidence uses default."""
+        """Invalid confidence is reported with its setting name."""
         original_vars = {
             "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
             "MIN_CONFIDENCE": os.environ.get("MIN_CONFIDENCE"),
@@ -317,9 +321,8 @@ class TestLoadConfigFromEnv:
             os.environ["OPENAI_API_KEY"] = "test-key"
             os.environ["MIN_CONFIDENCE"] = "invalid"
 
-            config = load_config_from_env()
-
-            assert config.min_confidence == 0.6  # Default
+            with pytest.raises(ValueError, match="MIN_CONFIDENCE"):
+                load_config_from_env()
 
         finally:
             for key, value in original_vars.items():
@@ -387,7 +390,7 @@ class TestLoadConfigFromEnv:
                     os.environ.pop(key, None)
 
     def test_load_config_invalid_verification_level(self) -> None:
-        """Test that invalid verification_level uses default."""
+        """Invalid enum values fail validation."""
         original_vars = {
             "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
             "VERIFICATION_LEVEL": os.environ.get("VERIFICATION_LEVEL"),
@@ -397,10 +400,8 @@ class TestLoadConfigFromEnv:
             os.environ["OPENAI_API_KEY"] = "test-key"
             os.environ["VERIFICATION_LEVEL"] = "invalid"
 
-            config = load_config_from_env()
-
-            # Should fall back to default 'cfg'
-            assert config.verification_level == "cfg"
+            with pytest.raises(ValueError, match="verification_level"):
+                load_config_from_env()
 
         finally:
             for key, value in original_vars.items():
@@ -432,7 +433,7 @@ class TestLoadConfigFromEnv:
                     os.environ.pop(key, None)
 
     def test_load_config_invalid_symbolic_timeout(self) -> None:
-        """Test that invalid symbolic_timeout uses default."""
+        """Invalid timeout values fail validation."""
         original_vars = {
             "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
             "SYMBOLIC_TIMEOUT": os.environ.get("SYMBOLIC_TIMEOUT"),
@@ -442,10 +443,8 @@ class TestLoadConfigFromEnv:
             os.environ["OPENAI_API_KEY"] = "test-key"
             os.environ["SYMBOLIC_TIMEOUT"] = "invalid"
 
-            config = load_config_from_env()
-
-            # Should fall back to default 60
-            assert config.symbolic_timeout == 60
+            with pytest.raises(ValueError, match="SYMBOLIC_TIMEOUT"):
+                load_config_from_env()
 
         finally:
             for key, value in original_vars.items():
@@ -511,3 +510,83 @@ class TestConfigIntegration:
 
         # Verify validation passed (no exceptions)
         assert config is not None
+
+    def test_toml_profile_and_environment_precedence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_file = tmp_path / "vtc.toml"
+        config_file.write_text(
+            """version = 1
+profile = "thorough"
+
+[analysis]
+backend = "static"
+llm_mode = "targeted"
+
+[performance]
+max_concurrent_llm_requests = 3
+
+[profiles.thorough.analysis]
+llm_mode = "exhaustive"
+
+[profiles.thorough.performance]
+max_concurrent_llm_requests = 7
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LLM_ANALYSIS_MODE", "")
+        monkeypatch.setenv("MAX_CONCURRENT_LLM_REQUESTS", "5")
+
+        config = load_config(config_path=config_file)
+
+        assert config.analysis_backend == "static"
+        assert config.llm_analysis_mode == "exhaustive"
+        assert config.max_concurrent_llm_requests == 5
+        assert config.config_profile == "thorough"
+        assert config.value_sources["llm_analysis_mode"] == "toml:analysis.llm_mode"
+        assert config.value_sources["max_concurrent_llm_requests"] == (
+            "env:MAX_CONCURRENT_LLM_REQUESTS"
+        )
+
+    def test_toml_rejects_unknown_option(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "vtc.toml"
+        config_file.write_text(
+            """version = 1
+[analysis]
+backend = "static"
+typo_mode = "targeted"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="typo_mode"):
+            load_config(config_path=config_file)
+
+    def test_toml_rejects_unknown_option_in_unselected_profile(
+        self, tmp_path: Path
+    ) -> None:
+        config_file = tmp_path / "vtc.toml"
+        config_file.write_text(
+            """version = 1
+[analysis]
+backend = "static"
+
+[profiles.unused.analysis]
+typo_mode = "targeted"
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="Invalid profile 'unused'.*typo_mode"):
+            load_config(config_path=config_file)
+
+    def test_env_example_contains_only_secret_settings(self) -> None:
+        """Keep non-secret configuration in the documented TOML template."""
+        env_example = Path(__file__).parents[2] / ".env.example"
+        assignments = [
+            line.split("=", 1)[0]
+            for raw_line in env_example.read_text(encoding="utf-8").splitlines()
+            if (line := raw_line.strip()) and not line.startswith("#") and "=" in line
+        ]
+
+        assert assignments == ["OPENAI_API_KEY"]

@@ -1,16 +1,14 @@
 """Ollama-specific LLM client implementation for local models."""
 
-import os
 from typing import List
-import asyncio
 
 try:
     import ollama
 except ImportError:
     ollama = None
 
-from src.stage1_llm_inference.base_client import BaseLLMClient
 from src.core.exceptions import LLMError
+from src.stage1_llm_inference.base_client import BaseLLMClient
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -32,6 +30,9 @@ class OllamaClient(BaseLLMClient):
         self,
         model: str = "llama3:latest",
         base_url: str = "http://localhost:11434",
+        min_num_predict: int = 4096,
+        seed: int | None = 42,
+        json_format: bool = True,
     ) -> None:
         """Initialize the Ollama client.
 
@@ -59,6 +60,9 @@ class OllamaClient(BaseLLMClient):
 
         # Store base URL
         self.base_url = base_url
+        self.min_num_predict = min_num_predict
+        self.seed = seed
+        self.json_format = json_format
 
         # Initialize Ollama client
         self.client = ollama.AsyncClient(host=base_url)
@@ -129,7 +133,7 @@ class OllamaClient(BaseLLMClient):
         # Ollama uses 'num_predict' instead of 'max_tokens'.
         # Qwen3/GPT-OSS often pre-pad with reasoning, so cap at >= 4096 even if
         # max_tokens is smaller, otherwise the final JSON gets truncated.
-        effective_predict = max(max_tokens, int(os.getenv("OLLAMA_MIN_NUM_PREDICT", "4096")))
+        effective_predict = max(max_tokens, self.min_num_predict)
         options = {
             "temperature": temperature,
             "num_predict": effective_predict,
@@ -140,23 +144,13 @@ class OllamaClient(BaseLLMClient):
         # catastrophic for bridge-edge cross-file matching (run 1: TP-1 found,
         # run 2-3: lost — same prompt, different ``fullName`` selection). Pin
         # the RNG so the same code + prompt yields the same spec across runs.
-        # Override or disable via OLLAMA_SEED (empty/"none" turns it off).
-        seed_env = os.getenv("OLLAMA_SEED", "42")
-        if seed_env and seed_env.lower() not in ("", "none", "off", "false", "0"):
-            try:
-                options["seed"] = int(seed_env)
-            except ValueError:
-                logger.warning(
-                    f"OLLAMA_SEED='{seed_env}' is not an int, leaving unseeded"
-                )
+        if self.seed is not None:
+            options["seed"] = self.seed
 
         # Some MoE models (e.g. qwen3-coder-next:q8_0) return empty content
         # when grammar-constrained via format="json". Allow disabling via env.
-        use_json_format = os.getenv("OLLAMA_JSON_FORMAT", "true").lower() not in (
-            "false", "0", "no", "off"
-        )
         chat_kwargs = dict(model=self.model, messages=messages, options=options)
-        if use_json_format:
+        if self.json_format:
             chat_kwargs["format"] = "json"
 
         try:

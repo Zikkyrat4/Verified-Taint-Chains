@@ -1,7 +1,7 @@
 """Tests for pinned external benchmark adapters and their scoring contracts."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -29,9 +29,13 @@ from src.evaluation.benchmarks.cwe_bench_java import (
 )
 from src.evaluation.benchmarks.owasp_java import (
     OwaspCase,
+    _store_isolated_finding,
 )
 from src.evaluation.benchmarks.owasp_java import (
     load_cases as load_owasp_cases,
+)
+from src.evaluation.benchmarks.owasp_java import (
+    run as run_owasp,
 )
 from src.evaluation.benchmarks.owasp_java import (
     score_cases as score_owasp_cases,
@@ -74,6 +78,30 @@ def _finding(
     }
 
 
+def _mock_chain(test_name: str, status: str = "verified") -> MagicMock:
+    chain = MagicMock()
+    chain.id = f"chain-{test_name}"
+    chain.vulnerability_type.value = "path_traversal"
+    chain.sink.cwe_id = "CWE-22"
+    chain.source.variable_name = "input"
+    chain.source.location.file_path = f"/checkout/{test_name}.java"
+    chain.source.location.line_number = 10
+    chain.source.location.function_name = "run"
+    chain.sink.variable_name = "path"
+    chain.sink.location.file_path = f"/checkout/{test_name}.java"
+    chain.sink.location.line_number = 20
+    chain.sink.location.function_name = "run"
+    chain.path = []
+    chain.confidence = 0.7
+    chain.verification_status.value = status
+    chain.cfg_verification_status = None
+    chain.symbolic_verification_status = None
+    chain.verification_method = "cfg"
+    chain.verification_details = "test"
+    chain.verification_confidence = 0.7
+    return chain
+
+
 def test_benchmark_rejects_non_verified_pipeline_contract() -> None:
     chain = MagicMock()
     chain.id = "candidate"
@@ -106,6 +134,28 @@ def test_benchmark_requires_verification(mock_load: MagicMock, tmp_path: Path) -
             cache_dir=tmp_path,
             refresh_specs=False,
         )
+
+
+@patch("src.evaluation.benchmarks.common.load_config_from_env")
+def test_benchmark_disables_local_coverage_limits(
+    mock_load: MagicMock, tmp_path: Path
+) -> None:
+    config = MagicMock()
+    config.verification_enabled = True
+    config.max_files = 25
+    config.fast_prefilter = True
+    mock_load.return_value = config
+
+    effective = build_pipeline_config(
+        backend="llm",
+        llm_analysis_mode="exhaustive",
+        cache_dir=tmp_path,
+        refresh_specs=True,
+    )
+
+    assert effective.max_files == 0
+    assert effective.fast_prefilter is False
+    assert effective.cache_read_enabled is False
 
 
 def test_normalize_cwe_accepts_official_variants() -> None:
@@ -192,6 +242,141 @@ def test_owasp_scores_one_prediction_per_case_and_excludes_errors() -> None:
     assert aggregate["fn"] == 0
     assert aggregate["scored_cases"] == 2
     assert aggregate["execution_errors"] == 1
+    assert aggregate["false_positive_rate"] == 1.0
+    assert aggregate["micro_owasp_score"] == 0.0
+    assert aggregate["owasp_score"] == 0.0
+
+
+def test_owasp_macro_rates_are_rounded_only_after_averaging() -> None:
+    cases = [
+        OwaspCase("BenchmarkTest00001", "a", True, "CWE-22", "one.java"),
+        OwaspCase("BenchmarkTest00002", "b", True, "CWE-89", "two.java"),
+        OwaspCase("BenchmarkTest00003", "b", True, "CWE-89", "three.java"),
+        OwaspCase("BenchmarkTest00004", "b", True, "CWE-89", "four.java"),
+    ]
+
+    _, aggregate = score_owasp_cases(
+        cases,
+        {"BenchmarkTest00002": [_finding(cwe="CWE-89")]},
+    )
+
+    assert aggregate["macro_true_positive_rate"] == 0.1667
+    assert aggregate["owasp_score"] == 0.1667
+
+
+def test_owasp_rejects_chain_crossing_independent_testcases() -> None:
+    finding = _finding(file="/checkout/BenchmarkTest00001.java")
+    finding["path"] = [
+        {
+            "variable": "value",
+            "file": "/checkout/BenchmarkTest00002.java",
+            "line": 15,
+            "function": "run",
+        }
+    ]
+
+    with pytest.raises(BenchmarkError, match="case-isolation violation"):
+        _store_isolated_finding(
+            finding,
+            known_names={"BenchmarkTest00001", "BenchmarkTest00002"},
+            findings_by_case={},
+            orphan_findings=[],
+        )
+
+
+@pytest.mark.asyncio
+@patch("src.evaluation.benchmarks.owasp_java.analysis_metadata")
+@patch("src.evaluation.benchmarks.owasp_java.build_pipeline_config")
+@patch("src.evaluation.benchmarks.owasp_java.SimplePipeline")
+async def test_owasp_run_isolates_batches_and_reports_candidate_stage(
+    pipeline_type: MagicMock,
+    build_config: MagicMock,
+    metadata: MagicMock,
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    source_root = checkout / "src/main/java/org/owasp/benchmark/testcode"
+    source_root.mkdir(parents=True)
+    (checkout / "expectedresults-1.2.csv").write_text(
+        "BenchmarkTest00001,pathtraver,true,22\n"
+        "BenchmarkTest00002,pathtraver,false,22\n",
+        encoding="utf-8",
+    )
+    for name in ("BenchmarkTest00001", "BenchmarkTest00002"):
+        (source_root / f"{name}.java").write_text(
+            f"class {name} {{}}\n", encoding="utf-8"
+        )
+    helper = source_root / "Helper.java"
+    helper.write_text("class Helper {}\n", encoding="utf-8")
+
+    config = MagicMock()
+    build_config.return_value = config
+    metadata.return_value = {
+        "backend": "llm",
+        "llm_analysis_mode": "exhaustive",
+    }
+    verified = _mock_chain("BenchmarkTest00001")
+    pipeline = pipeline_type.return_value
+    pipeline.run_project = AsyncMock(
+        return_value={
+            "verified_chains": [verified],
+            "unverifiable_chains": [],
+            "rejected_chains": [],
+            "metrics": {
+                "sources_found": 1,
+                "sinks_found": 1,
+                "sanitizers_found": 0,
+                "chains_found": 1,
+                "chains_verified": 1,
+                "chains_unverifiable": 0,
+                "chains_rejected": 0,
+                "extraction_errors": {},
+                "analysis_errors": [],
+                "analyzed_files_in_project_context": 0,
+                "interfile_bridges_enabled": False,
+                "prompt_redacted_files": 2,
+            },
+        }
+    )
+    pipeline.aclose = AsyncMock()
+
+    report = await run_owasp(
+        checkout,
+        tmp_path / "store",
+        backend="llm",
+        llm_analysis_mode="exhaustive",
+        batch_size=2,
+    )
+
+    call = pipeline.run_project.await_args
+    assert call.kwargs["include_analyzed_files_in_context"] is False
+    assert call.kwargs["allow_interfile_bridges"] is False
+    assert call.kwargs["context_files"] == [str(helper)]
+    redactions = call.kwargs["prompt_redactions"]
+    for case_name in ("BenchmarkTest00001", "BenchmarkTest00002"):
+        case_redactions = redactions[str(source_root / f"{case_name}.java")]
+        assert case_redactions[case_name] == "EvaluationCase"
+        assert case_redactions['"/pathtraver-'] == '"/securitycase-'
+        assert case_redactions['"/cmdi-'] == '"/securitycase-'
+        assert case_redactions['"/sqli-'] == '"/securitycase-'
+        assert case_redactions['"/xss-'] == '"/securitycase-'
+        assert case_redactions['"Problem executing cmdi'] == (
+            '"Problem executing operation'
+        )
+        assert case_redactions['"X-XSS-Protection"'] == (
+            '"X-Security-Protection"'
+        )
+    assert report["schema_version"] == 2
+    assert report["aggregate"]["tp"] == 1
+    assert report["aggregate"]["tn"] == 1
+    assert report["stage2_candidate_aggregate"]["tp"] == 1
+    assert report["run"]["measurement"]["raw_llm_binary_verdict_scored"] is False
+    assert (
+        report["run"]["integrity"]["benchmark_category_markers_exposed_to_llm"]
+        is False
+    )
+    assert report["cases"][0]["stage2_candidate"]["detected"] is True
+    pipeline.aclose.assert_awaited_once()
 
 
 def test_load_cwe_cases_joins_oracles_by_cve(tmp_path: Path) -> None:

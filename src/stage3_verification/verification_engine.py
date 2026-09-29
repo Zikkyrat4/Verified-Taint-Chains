@@ -160,7 +160,11 @@ class VerificationEngine:
 
         # The lightweight CFG parser is conservative and incomplete. Failure
         # to find a route is not proof that the route is impossible.
-        if cfg_status == VerificationStatus.FALSE:
+        if cfg_status == VerificationStatus.FALSE and not (
+            self.config.verification_level == "both"
+            and self.config.symbolic_execution_enabled
+            and self.symbolic_executor
+        ):
             if self.cfg_verifier.limit_exceeded:
                 details = (
                     "Lightweight CFG skipped due to complexity limit: "
@@ -203,8 +207,15 @@ class VerificationEngine:
             if symbolic_status == VerificationStatus.VERIFIED:
                 final_status = VerificationStatus.VERIFIED
                 confidence = 0.95  # High confidence with symbolic execution
-                details = "CFG + symbolic execution both confirm vulnerability"
-                method = "cfg+symbolic"
+                if cfg_status == VerificationStatus.VERIFIED:
+                    details = "CFG + symbolic execution both confirm vulnerability"
+                    method = "cfg+symbolic"
+                else:
+                    details = (
+                        "Symbolic data-flow proof confirms vulnerability; "
+                        "lightweight CFG was inconclusive"
+                    )
+                    method = "symbolic"
 
             elif symbolic_status == VerificationStatus.FALSE:
                 final_status = VerificationStatus.FALSE
@@ -305,6 +316,7 @@ class VerificationEngine:
         method_counts = {
             "sanitizer": sum(1 for r in results if r.method_used == "sanitizer"),
             "cfg": sum(1 for r in results if r.method_used == "cfg"),
+            "symbolic": sum(1 for r in results if r.method_used == "symbolic"),
             "cfg+symbolic": sum(1 for r in results if r.method_used == "cfg+symbolic"),
         }
 
@@ -385,6 +397,7 @@ class VerificationEngine:
         method_counts = {
             "sanitizer": sum(result.method_used == "sanitizer" for result in results),
             "cfg": sum(result.method_used == "cfg" for result in results),
+            "symbolic": sum(result.method_used == "symbolic" for result in results),
             "cfg+symbolic": sum(
                 result.method_used == "cfg+symbolic" for result in results
             ),

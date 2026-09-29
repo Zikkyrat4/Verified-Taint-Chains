@@ -1,26 +1,33 @@
 """Tests for pipeline CLI (src/pipeline/main.py)."""
 
 import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
 from click.testing import CliRunner
 
+from src.core.config import PipelineConfig
+from src.core.models import (
+    CodeLocation,
+    PathNode,
+    Sink,
+    SinkCategory,
+    Source,
+    TaintChain,
+    VerificationStatus,
+    VulnerabilityType,
+)
 from src.pipeline.main import (
-    cli,
     _display_results,
+    _display_sinks,
+    _filter_dangerous_sinks,
+    _find_java_files,
     _save_results,
     _save_results_stage1_snapshot,
-    _find_java_files,
-    _filter_dangerous_sinks,
-    _display_sinks,
     _save_sinks,
     _save_sinks_snapshot,
     _sink_to_dict,
-)
-from src.core.config import PipelineConfig
-from src.core.models import (
-    TaintChain, Source, Sink, PathNode, CodeLocation, VulnerabilityType, VerificationStatus,
-    SinkCategory,
+    cli,
 )
 
 
@@ -124,6 +131,71 @@ class TestCLI:
     def test_analyze_no_file(self, runner):
         result = runner.invoke(cli, ["analyze"])
         assert result.exit_code != 0
+
+    def test_config_init_and_show(self, runner, tmp_path):
+        config_path = tmp_path / "vtc.toml"
+
+        initialized = runner.invoke(
+            cli, ["--config", str(config_path), "config", "init"]
+        )
+        assert initialized.exit_code == 0
+        assert config_path.is_file()
+
+        shown = runner.invoke(
+            cli, ["--config", str(config_path), "config", "show"]
+        )
+        assert shown.exit_code == 0
+        values = json.loads(shown.output)
+        assert values["config_file"] == str(config_path)
+        assert values["profile"] == "balanced"
+        assert values["llm"]["api_key"] in {"<set>", "<unset>"}
+
+    def test_config_profile_override(self, runner, tmp_path, monkeypatch):
+        config_path = tmp_path / "vtc.toml"
+        config_path.write_text(
+            """version = 1
+[analysis]
+backend = "static"
+llm_mode = "targeted"
+
+[profiles.thorough.analysis]
+llm_mode = "exhaustive"
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LLM_ANALYSIS_MODE", "")
+
+        shown = runner.invoke(
+            cli,
+            [
+                "--config", str(config_path),
+                "--profile", "thorough",
+                "config", "show",
+            ],
+        )
+
+        assert shown.exit_code == 0
+        values = json.loads(shown.output)
+        assert values["profile"] == "thorough"
+        assert values["analysis"]["llm_mode"] == "exhaustive"
+
+    def test_config_validate_reports_unknown_key(self, runner, tmp_path):
+        config_path = tmp_path / "vtc.toml"
+        config_path.write_text(
+            """version = 1
+[analysis]
+backend = "static"
+unknown = true
+""",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli, ["--config", str(config_path), "config", "validate"]
+        )
+
+        assert result.exit_code != 0
+        assert "unknown" in result.output.lower()
 
 
 class TestFindJavaFiles:
@@ -709,6 +781,18 @@ class TestCacheCLIFlags:
         return PipelineConfig(
             llm_provider="ollama", min_confidence=0.6, use_llm_graph_builder=False
         )
+
+    def test_graph_builder_status_reports_effective_llm_use(self):
+        from src.pipeline.main import _graph_builder_status
+
+        config = self._config()
+        config.use_llm_graph_builder = True
+        config.analysis_backend = "static"
+        config.llm_graph_enrichment_enabled = True
+        assert _graph_builder_status(config) == "enhanced AST"
+
+        config.analysis_backend = "llm"
+        assert _graph_builder_status(config) == "enhanced AST + LLM enrichment"
 
     def test_no_cache_flag_disables_cache(self, runner, tmp_path):
         """--no-cache → config.cache_enabled becomes False before pipeline init."""

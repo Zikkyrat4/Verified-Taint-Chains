@@ -37,10 +37,15 @@ source venv/bin/activate
 # Установить зависимости
 pip install -e ".[dev]"
 
-# Скопировать и настроить конфигурацию
+# Скопировать конфигурацию и локальные секреты
+cp vtc.example.toml vtc.toml
 cp .env.example .env
-# Отредактировать .env — указать LLM-провайдер и API-ключи
+# Настройки провайдера находятся в vtc.toml; API-ключ — в .env
 ```
+
+Вместо копирования шаблона после установки можно выполнить `vtc config init`.
+Проверить итоговую конфигурацию: `vtc config validate` и
+`vtc config show --sources` (секреты команда не выводит).
 
 ### Требования
 
@@ -127,7 +132,19 @@ vtc benchmark run cwe-bench-java --cwe CWE-22 --limit 10 --seed 42 --backend llm
 
 ## Конфигурация
 
-Настройки загружаются из файла `.env`. Основные параметры:
+Основные настройки хранятся в `vtc.toml`, а секреты — в `.env`/окружении:
+
+```bash
+vtc config init
+vtc config validate
+vtc config show --sources
+vtc --profile thorough analyze src/
+```
+
+Готовый шаблон содержит секции LLM, анализа, графа, верификации,
+параллелизма, кэша и логирования, а также профили `balanced`, `fast` и
+`thorough`: [vtc.example.toml](vtc.example.toml). ENV остается совместимым
+override-слоем; CLI имеет наивысший приоритет. Основные ENV-параметры:
 
 | Переменная | Значение | По умолчанию |
 |-----------|----------|-------------|
@@ -148,7 +165,7 @@ vtc benchmark run cwe-bench-java --cwe CWE-22 --limit 10 --seed 42 --backend llm
 | `LLM_MODEL` | Название модели | `gpt-4-turbo` / `llama3:latest` |
 | `PATHFINDING_ALGORITHM` | `astar` или `bfs` | `astar` |
 | `VERIFICATION_LEVEL` | `cfg`, `symbolic` или `both` | `cfg` |
-| `MIN_CONFIDENCE` | Порог уверенности (0.0–1.0) | `0.5` |
+| `MIN_CONFIDENCE` | Порог уверенности (0.0–1.0) | `0.6` |
 | `MAX_PATH_LENGTH` | Макс. длина пути | `15` |
 | `MAX_CANDIDATE_CHAINS` | Предел сохраняемых кандидатов; переполнение явно помечает неполный анализ | `10000` |
 

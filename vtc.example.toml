@@ -1,0 +1,81 @@
+# VTC configuration. Keep API keys in .env or the process environment.
+version = 1
+profile = "balanced"
+
+[llm]
+provider = "openai"
+model = "gpt-4-turbo"
+max_retries = 2
+max_tokens = 4000
+truncation_max_tokens = 16000
+batch_max_chars = 8000
+
+[openai]
+timeout = 300
+json_mode = true
+# base_url = "http://localhost:8000/v1"
+# thinking = "disabled"
+
+[ollama]
+base_url = "http://localhost:11434"
+min_num_predict = 4096
+seed = 42
+json_format = true
+
+[analysis]
+backend = "llm"
+llm_mode = "targeted"
+min_confidence = 0.6
+max_files = 0
+fast_prefilter = false
+
+[performance]
+max_concurrent_files = 4
+max_concurrent_functions = 2
+max_concurrent_llm_requests = 5
+
+[graph]
+pathfinding_algorithm = "astar"
+max_path_length = 15
+max_candidate_chains = 10000
+use_joern = false
+use_semantic_heuristic = true
+use_codebert = false
+builder = "enhanced"
+llm_enrichment_enabled = false
+llm_enrichment_confidence = 0.7
+
+[verification]
+enabled = true
+level = "cfg"
+symbolic_timeout = 60
+
+[cache]
+enabled = true
+# directory = ".vtc-cache"
+
+[logging]
+level = "INFO"
+# file = "off"
+
+[benchmark]
+directory = ".vtc-benchmarks"
+
+[profiles.fast.analysis]
+llm_mode = "targeted"
+fast_prefilter = true
+
+[profiles.fast.performance]
+max_concurrent_files = 2
+max_concurrent_functions = 1
+max_concurrent_llm_requests = 2
+
+[profiles.thorough.analysis]
+llm_mode = "exhaustive"
+fast_prefilter = false
+
+[profiles.thorough.performance]
+max_concurrent_llm_requests = 5
+
+[profiles.balanced]
+# Uses the base settings above without changes.

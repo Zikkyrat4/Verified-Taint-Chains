@@ -4,8 +4,8 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from src.stage1_llm_inference.base_client import BaseLLMClient
-from src.stage1_llm_inference.openai_client import OpenAIClient
 from src.stage1_llm_inference.ollama_client import OllamaClient
+from src.stage1_llm_inference.openai_client import OpenAIClient
 from src.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -79,6 +79,9 @@ def create_llm_client(config: "PipelineConfig") -> BaseLLMClient:
         client = OllamaClient(
             model=config.llm_model,
             base_url=config.ollama_base_url,
+            min_num_predict=config.ollama_min_num_predict,
+            seed=config.ollama_seed,
+            json_format=config.ollama_json_format,
         )
         client.set_max_concurrent_requests(config.max_concurrent_llm_requests)
         logger.info(

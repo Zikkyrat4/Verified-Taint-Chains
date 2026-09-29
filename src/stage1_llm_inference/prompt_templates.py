@@ -616,6 +616,7 @@ def build_combined_prompt(
     function_info: Optional[Dict[str, Any]] = None,
     class_info: Optional[Dict[str, Any]] = None,
     imports: Optional[List[str]] = None,
+    project_context: str = "",
 ) -> str:
     """Build enhanced combined analysis prompt with AST context.
 
@@ -635,6 +636,18 @@ def build_combined_prompt(
         raise ValueError("code cannot be empty")
 
     context = _build_context_section(function_info, class_info, imports)
+    if project_context:
+        context += (
+            "\n\n## Resolved Project Methods\n"
+            "These implementations are reference-only context for calls made "
+            "by the target code. Use them to determine whether returned values "
+            "are attacker-controlled, constant, or sanitized. Report endpoints "
+            "only from `Code to Analyze`, never from this context. Do not infer "
+            "an untrusted source from an unknown helper name alone.\n"
+            "```java\n"
+            f"{project_context}\n"
+            "```"
+        )
     return ENHANCED_COMBINED_PROMPT.format(context=context, code=code)
 
 

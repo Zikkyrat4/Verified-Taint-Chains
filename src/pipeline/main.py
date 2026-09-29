@@ -9,7 +9,17 @@ from typing import Any, Dict, List, Optional
 
 import click
 
-from src.core.config import load_config_from_env
+from src.core.config import (
+    DEFAULT_CONFIG_TEMPLATE,
+    config_as_dict,
+    load_config,
+    load_config_from_env,
+)
+from src.core.config_loader import (
+    configure_cli_context,
+    explicit_config_path,
+    reset_cli_context,
+)
 from src.core.models import SinkCategory
 from src.evaluation.benchmarks.cli import benchmark
 from src.evaluation.engine import run_evaluation_command
@@ -56,6 +66,21 @@ def _cache_status_line(config) -> str:
     return f"enabled ({where})"
 
 
+def _graph_builder_status(config) -> str:
+    """Describe the effective graph implementation without overstating LLM use."""
+    if config.use_joern:
+        return "Joern PDG"
+    if (
+        config.analysis_backend != "static"
+        and config.use_llm_graph_builder
+        and config.llm_graph_enrichment_enabled
+    ):
+        return "enhanced AST + LLM enrichment"
+    if config.use_llm_graph_builder:
+        return "enhanced AST"
+    return "regex fallback"
+
+
 def _display_cache_summary(pipeline) -> None:
     """Print cache hit/miss/write stats after a run.
 
@@ -72,13 +97,30 @@ def _display_cache_summary(pipeline) -> None:
 
 @click.group()
 @click.version_option(version="0.1.0")
-def cli():
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    envvar="VTC_CONFIG",
+    help="Путь к vtc.toml (по умолчанию ./vtc.toml или ~/.config/vtc/config.toml).",
+)
+@click.option(
+    "--profile",
+    envvar="VTC_PROFILE",
+    help="Профиль из [profiles.<name>] в vtc.toml.",
+)
+@click.pass_context
+def cli(
+    context: click.Context,
+    config_path: Optional[Path],
+    profile: Optional[str],
+) -> None:
     """VTC — инструмент анализа безопасности Java-кода.
 
     \b
     4-ступенчатый пайплайн:
       1. LLM-инференс: извлечение source/sink из кода
-      2. Построение графа: tree-sitter AST + LLM-обогащение
+      2. Построение графа: tree-sitter AST (опц. LLM-обогащение)
       3. Верификация: CFG-проверка достижимости (опц. Z3)
       4. Объяснение: генерация описаний и рекомендаций
 
@@ -96,10 +138,59 @@ def cli():
       vtc analyze src/main/java/ -o report.json -v
       vtc analyze code.java --llm-provider ollama
     """
-    pass
+    tokens = configure_cli_context(config_path, profile)
+    context.call_on_close(lambda: reset_cli_context(tokens))
 
 
 cli.add_command(benchmark)
+
+
+@cli.group("config")
+def config_command() -> None:
+    """Создать, проверить или показать эффективную конфигурацию."""
+
+
+@config_command.command("init")
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Куда записать шаблон (по умолчанию ./vtc.toml или глобальный --config).",
+)
+@click.option("--force", is_flag=True, help="Перезаписать существующий файл.")
+def config_init(output: Optional[Path], force: bool) -> None:
+    """Создать документированный vtc.toml с готовыми профилями."""
+    destination = output or explicit_config_path() or (Path.cwd() / "vtc.toml")
+    destination = destination.expanduser().resolve()
+    if destination.exists() and not force:
+        raise click.ClickException(
+            f"Файл уже существует: {destination}. Используйте --force для перезаписи."
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
+    click.echo(f"Created {destination}")
+
+
+@config_command.command("show")
+@click.option("--sources", is_flag=True, help="Показать источник каждого значения.")
+def config_show(sources: bool) -> None:
+    """Показать итоговые настройки с замаскированными секретами."""
+    try:
+        effective = load_config(require_credentials=False)
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(json.dumps(config_as_dict(effective, include_sources=sources), indent=2))
+
+
+@config_command.command("validate")
+def config_validate() -> None:
+    """Проверить TOML, типы, диапазоны и наличие нужных секретов."""
+    try:
+        effective = load_config()
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    source = effective.config_file or "defaults + environment"
+    profile = effective.config_profile or "none"
+    click.echo(f"Configuration is valid: {source} (profile: {profile})")
 
 
 @cli.command()
@@ -367,6 +458,8 @@ async def _analyze(
         if max_concurrent > 0:
             config.max_concurrent_llm_requests = max_concurrent
 
+        config.validate()
+
         # Resolve cache settings. CLI flags override env. cache_dir default
         # depends on the target source path, so it can only be picked here.
         _apply_cache_settings(config, source_path, no_cache, cache_dir)
@@ -384,11 +477,16 @@ async def _analyze(
         click.echo(f"\n{'='*70}")
         click.echo("CONFIGURATION")
         click.echo(f"{'='*70}")
-        click.echo(f"LLM Provider: {config.llm_provider}")
-        click.echo(f"LLM Model: {config.llm_model}")
+        click.echo(f"Config file: {config.config_file or 'defaults + environment'}")
+        click.echo(f"Profile: {config.config_profile or 'none'}")
+        click.echo(f"Analysis backend: {config.analysis_backend}")
+        uses_llm = config.analysis_backend != "static"
+        click.echo(f"LLM analysis mode: {config.llm_analysis_mode if uses_llm else 'n/a'}")
+        click.echo(f"LLM Provider: {config.llm_provider if uses_llm else 'n/a'}")
+        click.echo(f"LLM Model: {config.llm_model if uses_llm else 'n/a'}")
         click.echo(f"Pathfinding: {config.pathfinding_algorithm}")
         click.echo(f"Verification: {config.verification_level}")
-        click.echo(f"Graph builder: {'LLM-enriched' if config.use_llm_graph_builder else 'regex-only'}")
+        click.echo(f"Graph builder: {_graph_builder_status(config)}")
         click.echo(f"Min confidence: {config.min_confidence}")
         click.echo(f"Cache: {_cache_status_line(config)}")
         click.echo(f"Source: {source_path}")
@@ -575,6 +673,8 @@ async def _sinks(
         if max_concurrent > 0:
             config.max_concurrent_llm_requests = max_concurrent
 
+        config.validate()
+
         _apply_cache_settings(config, source_path, no_cache, cache_dir)
 
         java_files = _find_java_files(source_path, include_tests=include_tests)
@@ -587,8 +687,13 @@ async def _sinks(
         click.echo(f"\n{'='*70}")
         click.echo("CONFIGURATION")
         click.echo(f"{'='*70}")
-        click.echo(f"LLM Provider: {config.llm_provider}")
-        click.echo(f"LLM Model: {config.llm_model}")
+        click.echo(f"Config file: {config.config_file or 'defaults + environment'}")
+        click.echo(f"Profile: {config.config_profile or 'none'}")
+        click.echo(f"Analysis backend: {config.analysis_backend}")
+        uses_llm = config.analysis_backend != "static"
+        click.echo(f"LLM analysis mode: {config.llm_analysis_mode if uses_llm else 'n/a'}")
+        click.echo(f"LLM Provider: {config.llm_provider if uses_llm else 'n/a'}")
+        click.echo(f"LLM Model: {config.llm_model if uses_llm else 'n/a'}")
         click.echo(f"Min confidence: {config.min_confidence}")
         click.echo("Mode: sink inventory (Stage 1 only)")
         click.echo(f"Cache: {_cache_status_line(config)}")

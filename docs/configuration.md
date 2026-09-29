@@ -1,35 +1,96 @@
 # Конфигурация
 
-Настройки загружаются из файла `.env` в корне проекта. Параметры CLI имеют приоритет над `.env`.
+Основные настройки хранятся в типизированном `vtc.toml`. Секреты (например,
+`OPENAI_API_KEY`) остаются в `.env` или в окружении процесса.
+
+```bash
+# Создать полный документированный шаблон ./vtc.toml
+vtc config init
+
+# Проверить TOML, типы, диапазоны и необходимые секреты
+vtc config validate
+
+# Увидеть эффективные значения; API-ключ никогда не печатается
+vtc config show
+vtc config show --sources
+
+# Выбрать другой файл или профиль для любой команды
+vtc --config ./configs/ci.toml --profile thorough analyze src/
+```
+
+Порядок приоритета: встроенные значения → базовые секции `vtc.toml` → выбранный
+профиль → `.env` → переменные окружения процесса → параметры команды. Поэтому
+существующие deployment-конфигурации на ENV продолжат работать.
+
+Файл ищется в следующем порядке: `--config` / `VTC_CONFIG`, `./vtc.toml`, затем
+`~/.config/vtc/config.toml` (или `$XDG_CONFIG_HOME/vtc/config.toml`). Профиль
+задается через `--profile`, `VTC_PROFILE` или верхнеуровневый `profile` в TOML.
+Неизвестные секции и ключи считаются ошибкой, чтобы опечатка не меняла результат
+анализа молча. Готовый пример находится в [`vtc.example.toml`](../vtc.example.toml).
+
+## Профили
+
+Профиль переопределяет только указанные значения:
+
+```toml
+version = 1
+profile = "balanced"
+
+[analysis]
+backend = "llm"
+llm_mode = "targeted"
+
+[performance]
+max_concurrent_llm_requests = 5
+
+[profiles.thorough.analysis]
+llm_mode = "exhaustive"
+
+[profiles.fast.analysis]
+fast_prefilter = true
+
+[profiles.fast.performance]
+max_concurrent_llm_requests = 2
+```
+
+`thorough` подходит для честного полного benchmark-прогона. `fast_prefilter` в
+профиле `fast` агрессивно исключает файлы и поэтому не должен использоваться
+для публикации итоговых метрик.
 
 ## Настройка LLM-провайдера
 
 ### OpenAI
 
-```env
-LLM_PROVIDER=openai
-OPENAI_API_KEY=sk-...
-LLM_MODEL=gpt-4-turbo
+```toml
+[llm]
+provider = "openai"
+model = "gpt-4-turbo"
 ```
+
+Ключ задается отдельно: `OPENAI_API_KEY=sk-...` в `.env` или окружении.
 
 Модель по умолчанию: `gpt-4-turbo`. Можно указать любую модель OpenAI API (`gpt-4o`, `gpt-3.5-turbo` и т.д.).
 
 ### Ollama
 
-```env
-LLM_PROVIDER=ollama
-LLM_MODEL=llama3.2:latest
+```toml
+[llm]
+provider = "ollama"
+model = "llama3.2:latest"
+
+[ollama]
+base_url = "http://localhost:11434"
 ```
 
 API-ключ не требуется. Сервер Ollama должен быть запущен локально. URL сервера по умолчанию `http://localhost:11434`, можно изменить:
 
-```env
-OLLAMA_BASE_URL=http://localhost:11434
-```
-
 Подходящие модели: `llama3.2:latest`, `mistral:latest`, `codellama:latest`, `deepseek-coder:latest`.
 
-## Все параметры
+## Переменные окружения
+
+ENV — совместимый override-слой над одноименными полями TOML. Полная структура
+TOML и значения по умолчанию доступны через `vtc config init`; ниже приведено
+соответствие для существующих окружений.
 
 ### LLM
 
@@ -45,9 +106,12 @@ OLLAMA_BASE_URL=http://localhost:11434
 | `LLM_TRUNCATION_MAX_TOKENS` | Верхний предел ответа для повтора одиночного усеченного batch | целое >= `LLM_MAX_TOKENS` | `16000` |
 | `LLM_BATCH_MAX_CHARS` | Максимальный размер непрерывного batch методов (`0` отключает batching) | целое >= 0 | `8000` |
 | `ANALYSIS_BACKEND` | Генератор source/sink: только LLM / статический baseline / явное объединение | `llm`, `static`, `hybrid` | `llm` |
-| `LLM_ANALYSIS_MODE` | Охват LLM: релевантные методы / все нетривиальные методы | `targeted`, `exhaustive` | `targeted` |
+| `LLM_ANALYSIS_MODE` | Охват LLM: релевантные методы / все обнаруженные методы | `targeted`, `exhaustive` | `targeted` |
 | `LLM_MODEL` | Название модели | строка | `gpt-4-turbo` (OpenAI) / `llama3:latest` (Ollama) |
 | `OLLAMA_BASE_URL` | URL сервера Ollama | URL | `http://localhost:11434` |
+| `OLLAMA_MIN_NUM_PREDICT` | Минимальный output budget Ollama | целое > 0 | `4096` |
+| `OLLAMA_SEED` | Seed; `none` отключает фиксацию | целое, `none` | `42` |
+| `OLLAMA_JSON_FORMAT` | Grammar-constrained JSON в Ollama | `true`, `false` | `true` |
 
 `ANALYSIS_BACKEND=llm` не подмешивает статически найденные endpoints. В
 `static` LLM-клиент не создаётся и `OPENAI_API_KEY` не требуется. Результаты
@@ -110,7 +174,20 @@ error и не превращается в отрицательную prediction.
 
 | Переменная | Описание | Значения | По умолчанию |
 |-----------|----------|----------|-------------|
-| `MIN_CONFIDENCE` | Минимальный порог уверенности | 0.0–1.0 | `0.5` |
+| `MIN_CONFIDENCE` | Минимальный порог уверенности | 0.0–1.0 | `0.6` |
+| `MAX_FILES` | Ограничение файлов; `0` без ограничения | целое >= 0 | `0` |
+| `VTC_FAST_PREFILTER` | Агрессивно исключать файлы без известных паттернов | `true`, `false` | `false` |
+
+`VTC_FAST_PREFILTER=true` предназначен для быстрых диагностических запусков и
+может снижать recall. Для честного benchmark-прогона оставляйте `false`.
+
+### Кэш и benchmark-и
+
+| Переменная | Описание | По умолчанию |
+|-----------|----------|-------------|
+| `VTC_CACHE_ENABLED` | Включить постоянный Stage 1 cache | `true` |
+| `VTC_CACHE_DIR` | Явный каталог cache | `<source>/.vtc-cache` |
+| `VTC_BENCHMARK_DIR` | Каталог внешних benchmark-данных | `.vtc-benchmarks` |
 
 ### Логирование
 
@@ -125,27 +202,13 @@ error и не превращается в отрицательную prediction.
 `$XDG_STATE_HOME/vtc/vtc.log`. Лог-файлы создаются с правами `0600`; сырые
 prompt и ответы LLM в них не записываются.
 
-## Пример .env
+## Пример минимального `.env`
 
 ```env
-# LLM
-LLM_PROVIDER=ollama
-LLM_MODEL=llama3.2:latest
+# Секрет хранится вне vtc.toml
+OPENAI_API_KEY=sk-...
 
-# Поиск путей
-PATHFINDING_ALGORITHM=astar
-USE_SEMANTIC_HEURISTIC=true
-MAX_PATH_LENGTH=15
-
-# Верификация
-VERIFICATION_LEVEL=both
-SYMBOLIC_TIMEOUT=60
-
-# Анализ
-MIN_CONFIDENCE=0.5
-
-# Логирование
-LOG_LEVEL=INFO
-# LOG_FILE=~/.local/state/vtc/vtc.log
-# LOG_FILE=off  # отключить постоянный файловый лог
+# Необязательные overrides для конкретного хоста
+# OPENAI_BASE_URL=http://localhost:8000/v1
+# MAX_CONCURRENT_LLM_REQUESTS=5
 ```

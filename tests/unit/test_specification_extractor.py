@@ -1,12 +1,13 @@
 """Unit tests for specification extractor."""
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-from src.stage1_llm_inference.specification_extractor import SimpleSpecificationExtractor
-from src.stage1_llm_inference.llm_client import SimpleLLMClient
+import pytest
+
 from src.core.exceptions import LLMError, ParsingError, TruncatedLLMResponseError
-from src.core.models import CodeLocation, Sink, SinkCategory, Source, VulnerabilityType
+from src.core.models import CodeLocation, Sink, SinkCategory, VulnerabilityType
+from src.stage1_llm_inference.llm_client import SimpleLLMClient
+from src.stage1_llm_inference.specification_extractor import SimpleSpecificationExtractor
 
 
 class TestSimpleSpecificationExtractorInit:
@@ -72,8 +73,23 @@ class TestExtractMethod:
 
         # Mock LLM combined response (single call per function)
         combined_response = {
-            "sources": [{"line": 2, "variable": "input", "type": "user_input", "confidence": 0.9}],
-            "sinks": [{"line": 3, "variable": "input", "type": "sql_query", "vulnerability_type": "sql_injection", "confidence": 0.95}],
+            "sources": [
+                {
+                    "line": 2,
+                    "variable": "input",
+                    "type": "user_input",
+                    "confidence": 0.9,
+                }
+            ],
+            "sinks": [
+                {
+                    "line": 3,
+                    "variable": "input",
+                    "type": "sql_query",
+                    "vulnerability_type": "sql_injection",
+                    "confidence": 0.95,
+                }
+            ],
         }
 
         with patch.object(client, "chat_with_json_prompt", new_callable=AsyncMock) as mock_chat:
@@ -85,6 +101,71 @@ class TestExtractMethod:
         assert len(spec.sinks) == 1
         assert spec.sources[0].variable_name == "input"
         assert spec.sinks[0].variable_name == "input"
+
+    @pytest.mark.asyncio
+    async def test_llm_prompt_removes_comments_and_redacts_case_id(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client)
+        code = '''public void BenchmarkTest00001() {
+            // This branch is safe according to the benchmark oracle.
+            String url = "https://example.test/a//b";
+            execute(url); /* vulnerable label */
+        }'''
+
+        with patch.object(
+            client, "chat_with_json_prompt", new_callable=AsyncMock
+        ) as mock_chat:
+            mock_chat.return_value = {"sources": [], "sinks": []}
+            await extractor.extract(
+                code,
+                "BenchmarkTest00001.java",
+                prompt_redactions={"BenchmarkTest00001": "EvaluationCase"},
+            )
+
+        prompt = mock_chat.await_args.args[0]
+        assert "according to the benchmark oracle" not in prompt
+        assert "vulnerable label" not in prompt
+        assert "BenchmarkTest00001" not in prompt
+        assert "EvaluationCase" in prompt
+        assert '"https://example.test/a//b"' in prompt
+
+    @pytest.mark.asyncio
+    async def test_llm_prompt_redacts_owasp_category_markers(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=8000)
+        code = '''@WebServlet(value = "/pathtraver-00/BenchmarkTest00001")
+        public class BenchmarkTest00001 {
+            void run() {
+                response.setHeader("X-XSS-Protection", "0");
+                System.out.println("Problem executing cmdi - TestCase");
+            }
+        }'''
+        redactions = {
+            "BenchmarkTest00001": "EvaluationCase",
+            '"/pathtraver-': '"/securitycase-',
+            '"/cmdi-': '"/securitycase-',
+            '"/sqli-': '"/securitycase-',
+            '"/xss-': '"/securitycase-',
+            '"Problem executing cmdi': '"Problem executing operation',
+            '"X-XSS-Protection"': '"X-Security-Protection"',
+        }
+
+        with patch.object(
+            client, "chat_with_json_prompt", new_callable=AsyncMock
+        ) as mock_chat:
+            mock_chat.return_value = {"sources": [], "sinks": []}
+            await extractor.extract(
+                code,
+                "BenchmarkTest00001.java",
+                prompt_redactions=redactions,
+            )
+
+        prompt = mock_chat.await_args.args[0]
+        assert "BenchmarkTest00001" not in prompt
+        assert "pathtraver" not in prompt.lower()
+        assert "cmdi" not in prompt.lower()
+        assert "xss" not in prompt.lower()
+        assert "/securitycase-00/EvaluationCase" in prompt
 
 
 class TestSplitIntoFunctions:
@@ -583,6 +664,157 @@ class TestLineResolution:
         assert "getParameter" in spec.sources[0].code_snippet
 
     @pytest.mark.asyncio
+    async def test_moves_xss_sink_to_multiline_format_operation(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(llm_client=client)
+        code = """public class C {
+  public void handle(HttpServletRequest request, HttpServletResponse response) {
+    String param = "";
+    param = request.getHeader("Referer");
+    response.getWriter().format(
+        java.util.Locale.US, param, new Object[] {"x"});
+  }
+}
+"""
+        with patch.object(client, "chat_with_json_prompt", new_callable=AsyncMock) as call:
+            call.return_value = {
+                "sources": [{
+                    "line": 3,
+                    "variable": "param",
+                    "type": "header",
+                    "confidence": 0.9,
+                }],
+                "sinks": [{
+                    "line": 4,
+                    "variable": "param",
+                    "type": "response_format",
+                    "vulnerability_type": "xss",
+                    "confidence": 0.9,
+                }],
+                "sanitizers": [],
+            }
+
+            spec = await extractor.extract(code, "C.java")
+
+        assert spec.sources[0].location.line_number == 4
+        assert spec.sinks[0].location.line_number == 5
+        assert ".format(" in spec.sinks[0].code_snippet
+
+    @pytest.mark.asyncio
+    async def test_rejects_source_from_proven_constant_project_call(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(llm_client=client)
+        code = """class C {
+  void run(SafeHelper helper) {
+    String param = helper.value();
+    Runtime.getRuntime().exec(param);
+  }
+}
+"""
+        with patch.object(client, "chat_with_json_prompt", new_callable=AsyncMock) as call:
+            call.return_value = {
+                "sources": [{
+                    "line": 3,
+                    "variable": "param",
+                    "type": "request_wrapper",
+                    "confidence": 0.95,
+                }],
+                "sinks": [{
+                    "line": 4,
+                    "variable": "param",
+                    "type": "command",
+                    "vulnerability_type": "command_injection",
+                    "confidence": 0.95,
+                }],
+                "sanitizers": [],
+            }
+
+            spec = await extractor.extract(
+                code,
+                "C.java",
+                proven_constant_calls={"helper.value"},
+            )
+
+        assert spec.sources == []
+        assert len(spec.sinks) == 1
+
+    @pytest.mark.asyncio
+    async def test_constant_source_filter_uses_definition_not_later_use(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(llm_client=client)
+        code = """class C {
+  void run(SafeHelper helper, Connection connection) {
+    String param = helper.value();
+    String sql = "{call " + param + "}";
+    connection.prepareCall(sql);
+  }
+}
+"""
+        with patch.object(client, "chat_with_json_prompt", new_callable=AsyncMock) as call:
+            call.return_value = {
+                "sources": [{
+                    # Models sometimes report the first use rather than the definition.
+                    "line": 4,
+                    "variable": "param",
+                    "type": "request_wrapper",
+                    "confidence": 0.95,
+                }],
+                "sinks": [{
+                    "line": 5,
+                    "variable": "sql",
+                    "type": "sql_query",
+                    "vulnerability_type": "sql_injection",
+                    "confidence": 0.95,
+                }],
+                "sanitizers": [],
+            }
+
+            spec = await extractor.extract(
+                code,
+                "C.java",
+                proven_constant_calls={"helper.value"},
+            )
+
+        assert spec.sources == []
+        assert len(spec.sinks) == 1
+
+    @pytest.mark.asyncio
+    async def test_moves_path_sink_to_fully_qualified_constructor(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(llm_client=client)
+        code = """class C {
+  void run(HttpServletRequest request) {
+    String param = request.getParameter("path");
+    java.io.File fileTarget =
+        new java.io.File(new java.io.File("/tmp"), param);
+    fileTarget.exists();
+  }
+}
+"""
+        with patch.object(client, "chat_with_json_prompt", new_callable=AsyncMock) as call:
+            call.return_value = {
+                "sources": [{
+                    "line": 3,
+                    "variable": "param",
+                    "type": "request_parameter",
+                    "confidence": 0.95,
+                }],
+                "sinks": [{
+                    "line": 4,
+                    "variable": "fileTarget",
+                    "type": "file_path_construction",
+                    "vulnerability_type": "path_traversal",
+                    "confidence": 0.95,
+                }],
+                "sanitizers": [],
+            }
+
+            spec = await extractor.extract(code, "C.java")
+
+        assert spec.sinks[0].location.line_number == 4
+        assert "new java.io.File" in spec.sinks[0].code_snippet
+
+    @pytest.mark.asyncio
     async def test_full_file_fallback_when_far_off(self) -> None:
         """LLM line outside ±5 window — fallback finds the var anywhere."""
         client = SimpleLLMClient(api_key="test-key")
@@ -786,7 +1018,7 @@ class TestHasPotentialSinks:
 class TestExtractCacheIntegration:
     """Cache and prefilter integration with extract()."""
 
-    def _make_extractor(self, spec_cache=None):
+    def _make_extractor(self, spec_cache=None, analysis_mode="exhaustive"):
         client = SimpleLLMClient(api_key="test-key")
         # Use a real LLM-shaped mock so we can assert it was (or wasn't) called.
         client.chat_with_json_prompt = AsyncMock(return_value={"sources": [], "sinks": []})
@@ -794,12 +1026,13 @@ class TestExtractCacheIntegration:
             client,
             spec_cache=spec_cache,
             llm_provider="openai",
+            analysis_mode=analysis_mode,
         )
 
     @pytest.mark.asyncio
     async def test_cache_hit_skips_llm_call(self, tmp_path):
-        from src.stage1_llm_inference.spec_cache import SpecCache
         from src.core.models import Specification
+        from src.stage1_llm_inference.spec_cache import SpecCache
 
         cache = SpecCache(cache_dir=tmp_path)
         # Pre-populate with a known spec for content "X".
@@ -813,7 +1046,8 @@ class TestExtractCacheIntegration:
             llm_model="gpt-4-turbo",
             min_confidence=0.5,
             extractor_options=(
-                "analysis_backend=llm;analysis_mode=exhaustive;batch_max_chars=0"
+                "analysis_backend=llm;analysis_mode=exhaustive;"
+                "fast_prefilter=False;batch_max_chars=0;"
             ),
         )
 
@@ -834,7 +1068,7 @@ class TestExtractCacheIntegration:
         from src.stage1_llm_inference.spec_cache import SpecCache
 
         cache = SpecCache(cache_dir=tmp_path)
-        ext = self._make_extractor(spec_cache=cache)
+        ext = self._make_extractor(spec_cache=cache, analysis_mode="targeted")
         if ext.ast_parser.parser is None:
             pytest.skip("tree-sitter unavailable")
 
@@ -853,7 +1087,7 @@ class TestExtractCacheIntegration:
     @pytest.mark.asyncio
     async def test_no_cache_no_provider_still_works(self):
         """Without a cache, extract proceeds normally."""
-        ext = self._make_extractor(spec_cache=None)
+        ext = self._make_extractor(spec_cache=None, analysis_mode="targeted")
         if ext.ast_parser.parser is None:
             pytest.skip("tree-sitter unavailable")
 
@@ -1278,6 +1512,32 @@ class TestLLMBatching:
 
 
 class TestLLMAnalysisModes:
+    @pytest.mark.asyncio
+    async def test_exhaustive_analyzes_source_only_trivial_method(self):
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(
+            return_value={
+                "sources": [
+                    {
+                        "line": 2,
+                        "variable": "value",
+                        "type": "method_parameter",
+                        "confidence": 0.9,
+                    }
+                ],
+                "sinks": [],
+            }
+        )
+        extractor = SimpleSpecificationExtractor(client, analysis_mode="exhaustive")
+
+        spec = await extractor.extract(
+            "class T {\n String echo(String value) { return value; }\n}",
+            "T.java",
+        )
+
+        client.chat_with_json_prompt.assert_awaited_once()
+        assert [source.variable_name for source in spec.sources] == ["value"]
+
     @pytest.mark.asyncio
     async def test_targeted_skips_unrelated_nontrivial_method(self):
         client = SimpleLLMClient(api_key="test-key")

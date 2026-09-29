@@ -32,6 +32,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 from src.core.config import load_config_from_env  # noqa: E402
 from src.pipeline.orchestrator import SimplePipeline  # noqa: E402
+from src.stage1_llm_inference.spec_cache import (  # noqa: E402
+    EXTRACTOR_VERSION,
+    PROMPT_TEMPLATE_VERSION,
+)
 
 REAL_WORLD_DIR = ROOT / "tests" / "fixtures" / "real_world"
 EVALUATION_DIR = ROOT / "evaluation"
@@ -201,10 +205,23 @@ class EvaluationReport:
 def _analysis_metadata(config: Any) -> Dict[str, Any]:
     """Capture every material analysis knob without exposing credentials."""
     uses_llm = config.analysis_backend != "static"
+    graph_builder = (
+        "joern_pdg_with_fallback"
+        if config.use_joern
+        else "enhanced_ast"
+        if config.use_llm_graph_builder
+        else "regex"
+    )
+    graph_llm_calls_enabled = bool(
+        uses_llm
+        and config.use_llm_graph_builder
+        and config.llm_graph_enrichment_enabled
+    )
     effective_thinking = config.openai_thinking
     if uses_llm and effective_thinking is None and config.llm_model.lower().startswith("glm-"):
         effective_thinking = "disabled"
     return {
+        "config_profile": config.config_profile,
         "backend": config.analysis_backend,
         "llm_analysis_mode": config.llm_analysis_mode if uses_llm else "n/a",
         "llm_provider": config.llm_provider if uses_llm else "n/a",
@@ -218,7 +235,12 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
         "symbolic_execution_enabled": config.symbolic_execution_enabled,
         "use_joern": config.use_joern,
         "use_semantic_heuristic": config.use_semantic_heuristic,
+        "use_codebert": config.use_codebert,
         "use_astar": config.use_astar,
+        "graph_builder": graph_builder,
+        "graph_llm_calls_enabled": graph_llm_calls_enabled,
+        # Compatibility field: this selects the enhanced AST implementation;
+        # it does not imply an LLM request unless enrichment is enabled.
         "use_llm_graph_builder": config.use_llm_graph_builder,
         "llm_graph_enrichment_enabled": config.llm_graph_enrichment_enabled,
         "llm_graph_enrichment_confidence": config.llm_graph_enrichment_confidence,
@@ -227,6 +249,7 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
         "max_concurrent_functions": config.max_concurrent_functions,
         "max_concurrent_llm_requests": config.max_concurrent_llm_requests,
         "max_files": config.max_files,
+        "fast_prefilter": config.fast_prefilter,
         "cache_enabled": config.cache_enabled,
         "cache_read_enabled": config.cache_read_enabled,
         "openai_timeout": config.openai_timeout if uses_llm else "n/a",
@@ -237,6 +260,36 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
         ),
         "openai_json_mode": config.openai_json_mode if uses_llm else "n/a",
         "openai_thinking": effective_thinking if uses_llm else "n/a",
+        "llm_temperature": 0.0 if uses_llm else "n/a",
+        "llm_seed": (
+            config.ollama_seed
+            if uses_llm and config.llm_provider == "ollama"
+            else None
+            if uses_llm
+            else "n/a"
+        ),
+        "llm_seed_control_available": bool(
+            uses_llm
+            and config.llm_provider == "ollama"
+            and config.ollama_seed is not None
+        ),
+        "stage1_extractor_version": EXTRACTOR_VERSION,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+        "ollama_min_num_predict": (
+            config.ollama_min_num_predict
+            if uses_llm and config.llm_provider == "ollama"
+            else "n/a"
+        ),
+        "ollama_seed": (
+            config.ollama_seed
+            if uses_llm and config.llm_provider == "ollama"
+            else "n/a"
+        ),
+        "ollama_json_format": (
+            config.ollama_json_format
+            if uses_llm and config.llm_provider == "ollama"
+            else "n/a"
+        ),
         "verification_result_policy": "verified_only",
         "evaluation_policy": {
             "all_labelled_true_positives": True,

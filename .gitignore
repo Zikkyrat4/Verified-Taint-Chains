@@ -91,6 +91,9 @@ results.json
 results*.json
 check_installation.py
 
+# Machine-local active configuration (commit vtc.example.toml instead)
+/vtc.toml
+
 # Ad-hoc evaluation outputs at repo root (use evaluation/ subdir for tracked artifacts)
 /evaluation_*.json
 /evaluation_*.md

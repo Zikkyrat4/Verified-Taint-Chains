@@ -1,21 +1,22 @@
 """Integration tests for verification components."""
 
 import os
-import pytest
-import networkx as nx
-from unittest.mock import patch
+from pathlib import Path
 
-from src.stage3_verification.simple_verifier import SimpleCFGVerifier
+import networkx as nx
+import pytest
+
+from src.core.config import load_config_from_env
 from src.core.models import (
-    TaintChain,
-    Source,
-    Sink,
-    PathNode,
     CodeLocation,
+    PathNode,
+    Sink,
+    Source,
+    TaintChain,
     VerificationStatus,
     VulnerabilityType,
 )
-from src.core.config import PipelineConfig, load_config_from_env
+from src.stage3_verification.simple_verifier import SimpleCFGVerifier
 
 
 class TestVerifyExistingPath:
@@ -586,14 +587,14 @@ class TestConfigFromEnv:
                 else:
                     os.environ.pop(key, None)
 
-    def test_config_with_defaults(self) -> None:
+    def test_config_with_defaults(self, tmp_path: Path) -> None:
         """Test that config uses defaults when env vars not set."""
         env_keys = [
             "OPENAI_API_KEY", "OPENAI_MODEL", "LLM_MODEL", "LLM_PROVIDER",
             "MAX_PATH_LENGTH", "MIN_CONFIDENCE", "VERIFICATION_LEVEL",
             "PATHFINDING_ALGORITHM", "USE_JOERN", "USE_ASTAR",
             "USE_SEMANTIC_HEURISTIC", "OLLAMA_BASE_URL", "SYMBOLIC_TIMEOUT",
-            "VERIFICATION_ENABLED", "SYMBOLIC_EXECUTION_ENABLED",
+            "VERIFICATION_ENABLED", "SYMBOLIC_EXECUTION_ENABLED", "VTC_CONFIG",
         ]
         original_env = {k: os.environ.get(k) for k in env_keys}
 
@@ -616,6 +617,9 @@ class TestConfigFromEnv:
             os.environ["SYMBOLIC_TIMEOUT"] = ""
             os.environ["VERIFICATION_ENABLED"] = ""
             os.environ["SYMBOLIC_EXECUTION_ENABLED"] = ""
+            empty_config = tmp_path / "defaults.toml"
+            empty_config.write_text("version = 1\n", encoding="utf-8")
+            os.environ["VTC_CONFIG"] = str(empty_config)
 
             # Load configuration
             config = load_config_from_env()
@@ -639,8 +643,8 @@ class TestConfigFromEnv:
                 else:
                     os.environ.pop(key, None)
 
-    def test_config_invalid_values_use_defaults(self) -> None:
-        """Test that invalid config values fall back to defaults."""
+    def test_config_invalid_values_are_rejected(self) -> None:
+        """Invalid values fail loudly instead of silently changing a run."""
         env_keys = [
             "OPENAI_API_KEY", "LLM_PROVIDER", "LLM_MODEL", "OPENAI_MODEL",
             "MAX_PATH_LENGTH", "MIN_CONFIDENCE", "VERIFICATION_LEVEL",
@@ -666,17 +670,8 @@ class TestConfigFromEnv:
             os.environ["VERIFICATION_ENABLED"] = ""
             os.environ["SYMBOLIC_EXECUTION_ENABLED"] = ""
 
-            # Load configuration (should not raise)
-            config = load_config_from_env()
-
-            # Verify defaults used for invalid values
-            assert config.llm_api_key == "test-key"
-            assert config.max_path_length == 15  # Default (invalid value)
-            assert config.min_confidence == 0.6  # Default (invalid value)
-
-            print(f"Invalid values handled gracefully")
-            print(f"  Max Path Length: invalid -> {config.max_path_length} (default)")
-            print(f"  Min Confidence: invalid -> {config.min_confidence} (default)")
+            with pytest.raises(ValueError, match="MIN_CONFIDENCE"):
+                load_config_from_env()
 
         finally:
             for key, value in original_env.items():

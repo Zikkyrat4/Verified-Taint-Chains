@@ -229,7 +229,8 @@ class TestCLIHelpCommand:
 
         assert result.exit_code == 0
         assert "OPENAI_API_KEY" in result.output
-        assert "MAX_PATH_LENGTH" in result.output
+        assert "vtc config init" in result.output
+        assert "MAX_PATH_LENGTH" not in result.output
         assert ".env" in result.output
 
     def test_help_env_contains_example(self) -> None:

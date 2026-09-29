@@ -21,6 +21,7 @@ from src.core.models import (
 )
 from src.pipeline.result import PipelineResult
 from src.stage1_llm_inference.client_factory import create_llm_client
+from src.stage1_llm_inference.project_context import ProjectContextIndex
 from src.stage1_llm_inference.spec_cache import SpecCache, default_cache_dir
 from src.stage1_llm_inference.specification_extractor import SimpleSpecificationExtractor
 from src.stage2_path_discovery.astar_search import (
@@ -103,6 +104,8 @@ class SimplePipeline:
             truncation_max_tokens=config.llm_truncation_max_tokens,
             analysis_backend=config.analysis_backend,
             analysis_mode=config.llm_analysis_mode,
+            fast_prefilter=config.fast_prefilter,
+            cache_identity=config.stage1_cache_identity(),
             cache_read_enabled=config.cache_read_enabled,
         )
 
@@ -486,6 +489,10 @@ class SimplePipeline:
         java_files: List[str],
         show_progress: bool = False,
         on_stage1_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
+        context_files: Optional[List[str]] = None,
+        prompt_redactions: Optional[Dict[str, Dict[str, str]]] = None,
+        include_analyzed_files_in_context: bool = True,
+        allow_interfile_bridges: bool = True,
     ) -> Dict[str, Any]:
         """Execute pipeline in project mode with per-file graph scoping.
 
@@ -502,6 +509,19 @@ class SimplePipeline:
                 files_skipped, file_list, sources, sinks, sanitizers}``. Used by
                 the CLI to write an incremental JSON snapshot so a Stage 2-4
                 crash leaves the LLM-extracted inventory durable on disk.
+            context_files: Optional project files used only to resolve methods
+                referenced by analyzed code. They are never extracted, added
+                to the graph, or reported as findings.
+            prompt_redactions: Per-file exact text replacements applied only
+                to LLM prompts to hide public benchmark identifiers. Analysis
+                and graph construction continue to use the original source.
+            include_analyzed_files_in_context: Include other analyzed files in
+                project-local LLM call context. Independent benchmark cases set
+                this to False so cases in one concurrency batch cannot inform
+                each other's prompts.
+            allow_interfile_bridges: Allow Stage 2 to connect calls across
+                analyzed files. Independent benchmark cases disable this while
+                normal project analysis keeps cross-file taint propagation.
 
         Returns:
             Dictionary containing unified results with metrics.
@@ -516,7 +536,26 @@ class SimplePipeline:
             )
             java_files = java_files[: self.config.max_files]
 
-        logger.info(f"Starting project-mode analysis on {len(java_files)} files")
+        context_files = sorted(set(context_files or []) - set(java_files))
+        prompt_redactions = prompt_redactions or {}
+        logger.info(
+            f"Starting project-mode analysis on {len(java_files)} files"
+            + (
+                f" with {len(context_files)} context-only files"
+                if context_files else ""
+            )
+        )
+
+        context_index = None
+        indexed_context_files = sorted(
+            set(context_files)
+            | (set(java_files) if include_analyzed_files_in_context else set())
+        )
+        if indexed_context_files and self.config.analysis_backend in ("llm", "hybrid"):
+            # Project analysis and benchmark analysis use the same call-context
+            # semantics. The current source is excluded during resolution, so
+            # only real cross-file implementations reach its prompt.
+            context_index = ProjectContextIndex.from_files(indexed_context_files)
 
         if java_files:
             common_path = os.path.commonpath(java_files)
@@ -529,13 +568,10 @@ class SimplePipeline:
             # exclusion. Analyzing only keyword-matching files blinds the
             # detector to 0-day patterns in files using unfamiliar APIs, so
             # every file is analyzed (security-matching ones first). The old
-            # exclude-irrelevant behavior is opt-in via VTC_FAST_PREFILTER
+            # exclude-irrelevant behavior is opt-in via fast_prefilter
             # (debug/CI only).
             relevant, irrelevant = self._partition_file_paths(java_files)
-            fast_prefilter = os.getenv(
-                "VTC_FAST_PREFILTER", "false"
-            ).lower() in ("true", "1", "yes", "on")
-            if fast_prefilter:
+            if self.config.fast_prefilter:
                 logger.info(
                     f"[fast] Excluding {len(irrelevant)} non-matching files "
                     f"from Stage 1"
@@ -595,10 +631,29 @@ class SimplePipeline:
                     )
                     code = self._read_source_file(java_file)
                     if code.strip():
+                        kwargs: Dict[str, Any] = {}
+                        if context_index is not None:
+                            context = context_index.context_for(
+                                code, source_path=java_file
+                            )
+                            if context:
+                                kwargs["project_context"] = context
+                            if self.config.analysis_backend == "hybrid":
+                                constant_calls = (
+                                    context_index.proven_constant_calls_for(
+                                        code, source_path=java_file
+                                    )
+                                )
+                                if constant_calls:
+                                    kwargs["proven_constant_calls"] = constant_calls
+                        redactions = prompt_redactions.get(java_file)
+                        if redactions:
+                            kwargs["prompt_redactions"] = redactions
                         spec = await self.spec_extractor.extract(
                             source_code=code,
                             file_path=java_file,
                             model=self.config.llm_model,
+                            **kwargs,
                         )
                     else:
                         logger.info(f"Skipping empty source file: {java_file}")
@@ -661,10 +716,27 @@ class SimplePipeline:
                 )
                 code = self._read_source_file(java_file)
                 try:
+                    kwargs = {}
+                    if context_index is not None:
+                        context = context_index.context_for(
+                            code, source_path=java_file
+                        )
+                        if context:
+                            kwargs["project_context"] = context
+                        if self.config.analysis_backend == "hybrid":
+                            constant_calls = context_index.proven_constant_calls_for(
+                                code, source_path=java_file
+                            )
+                            if constant_calls:
+                                kwargs["proven_constant_calls"] = constant_calls
+                    redactions = prompt_redactions.get(java_file)
+                    if redactions:
+                        kwargs["prompt_redactions"] = redactions
                     retry_spec = await self.spec_extractor.extract(
                         source_code=code,
                         file_path=java_file,
                         model=self.config.llm_model,
+                        **kwargs,
                     )
                 except Exception as retry_error:
                     logger.warning(
@@ -771,7 +843,7 @@ class SimplePipeline:
             result = await self._run_stages_project(
                 file_code_map, file_sources, file_sinks,
                 all_sources, all_sinks, all_sanitizers,
-                allow_interfile_bridges=True,
+                allow_interfile_bridges=allow_interfile_bridges,
             )
             result["file"] = f"project ({len(java_files)} files)"
             result["files_analyzed"] = len(java_files)
@@ -794,7 +866,17 @@ class SimplePipeline:
                 len(java_files) - graph_file_count
             )
             result["metrics"]["interfile_bridges_enabled"] = (
-                True
+                allow_interfile_bridges
+            )
+            result["metrics"]["context_only_files"] = len(context_files)
+            result["metrics"]["analyzed_files_in_project_context"] = (
+                len(java_files) if include_analyzed_files_in_context else 0
+            )
+            result["metrics"]["project_context_files_indexed"] = len(
+                indexed_context_files
+            )
+            result["metrics"]["prompt_redacted_files"] = sum(
+                path in prompt_redactions for path in java_files
             )
             analysis_errors: List[str] = []
             if large_project_mode and not graph_selection_complete:
@@ -869,12 +951,9 @@ class SimplePipeline:
 
         try:
             # Partition for ORDERING only (security-matching files first); every
-            # file is analyzed unless VTC_FAST_PREFILTER opts into the old skip.
+            # file is analyzed unless fast_prefilter opts into the old skip.
             relevant, irrelevant = self._partition_file_paths(java_files)
-            fast_prefilter = os.getenv(
-                "VTC_FAST_PREFILTER", "false"
-            ).lower() in ("true", "1", "yes", "on")
-            if fast_prefilter:
+            if self.config.fast_prefilter:
                 logger.info(
                     f"[fast] Excluding {len(irrelevant)} non-matching files "
                     f"from Stage 1"
@@ -1326,7 +1405,9 @@ class SimplePipeline:
         # Find all chains using selected algorithm
         if self.config.pathfinding_algorithm == "astar":
             if self.config.use_semantic_heuristic:
-                self.semantic_heuristic = SemanticHeuristic()
+                self.semantic_heuristic = SemanticHeuristic(
+                    enabled=self.config.use_codebert
+                )
                 self.path_finder = AStarPathFinder(
                     graph,
                     semantic_heuristic=self.semantic_heuristic,
@@ -1855,7 +1936,9 @@ class SimplePipeline:
         if self.config.pathfinding_algorithm == "astar":
             logger.debug("Using A* with semantic heuristic for path discovery")
             if self.config.use_semantic_heuristic:
-                self.semantic_heuristic = SemanticHeuristic()
+                self.semantic_heuristic = SemanticHeuristic(
+                    enabled=self.config.use_codebert
+                )
                 self.path_finder = AStarPathFinder(
                     graph,
                     semantic_heuristic=self.semantic_heuristic,

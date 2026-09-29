@@ -55,6 +55,11 @@ vtc benchmark run cwe-bench-java --cwe CWE-22 --limit 10 --seed 42 --backend llm
 `--max-concurrent-llm-requests` независимо от числа одновременно
 обрабатываемых файлов и function batches.
 
+External benchmark принудительно устанавливает `max_files=0` и
+`fast_prefilter=false`: ни локальный профиль, ни ENV не могут молча исключить
+часть выбранных файлов. Режим отбора методов всё равно задаётся явно через
+`--llm-analysis-mode` и записывается в отчёт.
+
 Default filename полного прогона состоит из backend и LLM mode. Для любого
 явного subset добавляется стабильный hash selection, поэтому частичный прогон
 не перезапишет полный. `--phase-label` или явные `--save`/`--report-md` задают
@@ -64,6 +69,82 @@ Default filename полного прогона состоит из backend и LL
 поддерживаемые. Это фиксированный capability set из кода, а не список примеров,
 которые текущая версия успешно находит. `--all-cwes` включает все upstream CWE
 и обязательно записывается в отчет.
+
+## Протокол проверки LLM-режима
+
+`backend=llm` означает, что source/sink создаёт только LLM. Построение графа и
+verification остаются детерминированными этапами VTC, поэтому итоговые метрики
+измеряют LLM-режим всего анализатора, а не изолированную модель-классификатор.
+LLM получает ограниченный call-context реально вызываемых project-local методов
+(до двух уровней), как и при обычном `vtc analyze-project`. Комментарии из
+целевого кода и подключаемых helper-методов удаляются только из LLM-промпта с
+сохранением номеров строк. Это исключает подсказки `safe`/`vulnerable` из
+публичного корпуса, не меняя код для AST и verification. Детерминированная
+валидация схемы и привязка endpoint к реальной строке не создают source/sink и
+явно записываются в `run.context.deterministic_validation`. Отбрасывание source
+по статически доказанному constant-return project call применяется только в
+`backend=hybrid`; в чистом `backend=llm` оно отключено.
+
+OWASP JSON явно описывает измерение в `run.measurement`. Primary metric
+`verified_chain_same_cwe` оценивает полный LLM-backed analyzer. Диагностика
+`stage2_candidate_aggregate` показывает результат LLM-derived endpoints и графа
+до verifier. Это всё ещё не raw binary verdict модели: LLM в архитектуре VTC
+возвращает endpoints, а не ответ vulnerable/safe, и OWASP не предоставляет
+endpoint-level oracle для прямого precision/recall Stage 1.
+
+Сначала выполняется холодный smoke на фиксированной выборке:
+
+```bash
+vtc config validate
+vtc benchmark validate
+
+vtc benchmark run owasp-java \
+  --backend llm --llm-analysis-mode exhaustive \
+  --limit 50 --seed 20260925 --refresh-specs \
+  --max-concurrent-llm-requests 5 \
+  --phase-label glm-5.3-flash-exhaustive-smoke-cold
+```
+
+После smoke запускаются полные поддерживаемые наборы без `--limit`:
+
+```bash
+vtc benchmark run owasp-java \
+  --backend llm --llm-analysis-mode exhaustive --refresh-specs \
+  --max-concurrent-llm-requests 5 \
+  --phase-label glm-5.3-flash-exhaustive-cold
+
+vtc benchmark prepare cwe-bench-java
+vtc benchmark run cwe-bench-java \
+  --backend llm --llm-analysis-mode exhaustive --refresh-specs \
+  --max-concurrent-llm-requests 5 \
+  --phase-label glm-5.3-flash-exhaustive-cold
+```
+
+`exhaustive` показывает максимальный охват LLM: анализируются все обнаруженные
+методы, включая тривиальные и source-only boundaries. Отдельный прогон с
+`--llm-analysis-mode targeted` измеряет быстрый
+production-режим с предварительным отбором методов; его результаты нельзя
+объединять с `exhaustive`.
+
+Перед публикацией в JSON проверяются следующие поля:
+
+```bash
+jq '{analysis: (.run.analysis | {
+  backend, llm_analysis_mode, llm_provider, llm_model,
+  fast_prefilter, cache_read_enabled, use_joern,
+  verification_enabled, verification_result_policy
+}), integrity: .run.integrity, aggregate: .aggregate}' \
+  evaluation/benchmarks/owasp-java/glm-5.3-flash-exhaustive-cold.json
+```
+
+Для холодного честного прогона ожидаются `backend="llm"`,
+`llm_analysis_mode="exhaustive"`, `fast_prefilter=false`,
+`cache_read_enabled=false`, `verification_enabled=true`,
+`verification_result_policy="verified_only"` и
+`oracle_exposed_to_pipeline=false`. Execution errors не считаются FN: их надо
+публиковать отдельно и по возможности повторять (`--retry-errors` для
+CWE-Bench). Один smoke следует повторить несколько раз с новой `phase-label`,
+чтобы оценить разброс недетерминированной модели.
 
 ## Scoring
 
@@ -83,12 +164,31 @@ Oracle `expectedresults-1.2.csv` содержит положительную и�
 и CWE для каждого testcase. VTC формирует одну бинарную prediction на testcase:
 наличие хотя бы одной verified chain того же CWE. Несколько одинаковых цепочек
 не увеличивают TP или FP. Поэтому корректно рассчитываются TP, FP, TN, FN,
-precision, recall, specificity и F1.
+precision, recall, specificity и F1. Дополнительно публикуется официальный
+OWASP score: для каждого CWE `TPR - FPR`, общий score — невзвешенное среднее
+по CWE. Micro score остаётся диагностическим и не подменяет официальный.
+
+Идентификатор `BenchmarkTestNNNNN` заменяется только в LLM prompt на нейтральный
+`EvaluationCase`; исходный файл для AST/графа не меняется. Это не устраняет риск
+запоминания публичного корпуса моделью, но не даёт ей прямой ключ к testcase.
+Комментарии testcase также не передаются модели, поскольку официальный корпус
+содержит текстовые подсказки о безопасных и небезопасных ветках.
+Искусственные маркеры категории из test harness (`/pathtraver-*`, `/cmdi-*`,
+`/sqli-*`, `/xss-*`, диагностические строки `cmdi` и заголовок
+`X-XSS-Protection`) в LLM prompt также заменяются нейтральными значениями. Это
+не меняет исходники или граф и не позволяет узнать ожидаемый CWE из имени
+маршрута вместо анализа потока данных.
+Все Java helper-файлы, не являющиеся официальными testcases, доступны как
+context-only: они нужны для корректного межфайлового анализа, но не извлекаются
+как отдельные findings и не оцениваются.
 
 Testcases анализируются project-mode пакетами, чтобы Stage 1 использовал
-параллелизм OpenAI/Ollama. Граф VTC остается scoped по файлам, поэтому один
-testcase не может создать цепь в другом. Incomplete extraction и ошибки batch-а
-исключаются из матрицы ошибок и отдельно уменьшают execution coverage.
+параллелизм OpenAI/Ollama. Пакет является только механизмом конкурентного
+исполнения: testcase не включаются в LLM context друг друга, а межфайловые graph
+bridges между ними отключены. Адаптер дополнительно проверяет source, sink и все
+path nodes каждой цепочки и аварийно завершает запуск при пересечении двух
+testcase. Incomplete extraction и ошибки batch-а исключаются из матрицы ошибок
+и отдельно уменьшают execution coverage.
 
 Project-mode использует ограниченные по размеру пакеты Stage 1 и Stage 2. Для
 проектов крупнее 20 000 Java-файлов LLM по-прежнему анализирует каждый выбранный

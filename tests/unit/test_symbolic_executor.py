@@ -255,6 +255,74 @@ class TestSymbolicExecutor:
 
         assert constraint is not None
 
+    def test_multiline_transformation_models_complete_path(self):
+        try:
+            import z3  # noqa: F401
+        except ImportError:
+            pytest.skip("Z3 not available")
+
+        source = Source(
+            location=CodeLocation(file_path="Example.java", line_number=2),
+            variable_name="param",
+            type="user_input",
+            confidence=0.9,
+            code_snippet='String param = request.getParameter("path");',
+        )
+        sink = Sink(
+            location=CodeLocation(file_path="Example.java", line_number=8),
+            variable_name="fileTarget",
+            type="file_path_construction",
+            confidence=0.9,
+            code_snippet="java.io.File fileTarget = new java.io.File(root, bar);",
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+        )
+        chain = TaintChain(
+            id="multiline-transform",
+            source=source,
+            sink=sink,
+            path=[
+                PathNode(
+                    variable_name="param",
+                    location=source.location,
+                    node_type="source",
+                    code_snippet=source.code_snippet,
+                ),
+                PathNode(
+                    variable_name="bar",
+                    location=CodeLocation(
+                        file_path="Example.java", line_number=4
+                    ),
+                    node_type="intermediate",
+                    code_snippet="String bar = \"\";",
+                ),
+                PathNode(
+                    variable_name="fileTarget",
+                    location=sink.location,
+                    node_type="sink",
+                    code_snippet=sink.code_snippet,
+                ),
+            ],
+            length=3,
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+            confidence=0.9,
+        )
+        code = """class Example {
+  void run(Request request) {
+    String param = request.getParameter("path");
+    String bar =
+        new String(
+            Base64.decodeBase64(
+                Base64.encodeBase64(param.getBytes())));
+    java.io.File fileTarget =
+        new java.io.File(root, bar);
+  }
+}
+"""
+
+        executor = SymbolicExecutor()
+
+        assert executor.execute_path(chain, code) == VerificationStatus.VERIFIED
+
     def test_constant_ternary_rejects_unreachable_tainted_branch(self):
         try:
             import z3  # noqa: F401

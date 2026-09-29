@@ -3,8 +3,8 @@
 from src.evaluation.engine import (
     EvaluationReport,
     FileEvaluation,
-    _analysis_metadata,
     _aggregate,
+    _analysis_metadata,
     _chain_matches_fp_pattern,
     _classify_chains,
     _render_md,
@@ -250,6 +250,15 @@ def test_analysis_metadata_records_material_configuration() -> None:
 
     assert metadata["min_confidence"] == 0.7
     assert metadata["use_joern"] is True
+    assert metadata["fast_prefilter"] is False
+    assert metadata["use_codebert"] is False
     assert metadata["cache_read_enabled"] is False
+    assert metadata["graph_builder"] == "joern_pdg_with_fallback"
+    assert metadata["graph_llm_calls_enabled"] is False
+    assert metadata["llm_temperature"] == 0.0
+    assert metadata["llm_seed"] is None
+    assert metadata["llm_seed_control_available"] is False
+    assert metadata["stage1_extractor_version"]
+    assert metadata["prompt_template_version"]
     assert metadata["evaluation_policy"]["line_tolerance"] == 5
     assert metadata["evaluation_policy"]["unmatched_findings_count_as_fp"] is True

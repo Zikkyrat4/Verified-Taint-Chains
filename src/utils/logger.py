@@ -13,6 +13,8 @@ from typing import Any, Optional, Union
 from dotenv import load_dotenv
 from loguru import logger
 
+from src.core.config_loader import environment_or_file_setting
+
 _PACKAGE = "src"
 _DEFAULT_LEVEL = "INFO"
 _DISABLED_FILE_VALUES = frozenset({"", "-", "none", "off", "false", "disabled"})
@@ -97,7 +99,15 @@ def _secure_opener(path: str, flags: int) -> int:
 
 
 def _resolve_level(level: Optional[str]) -> tuple[str, Optional[str]]:
-    requested = (level or os.getenv("LOG_LEVEL") or _DEFAULT_LEVEL).upper()
+    try:
+        configured = environment_or_file_setting(
+            "LOG_LEVEL", "logging", "level", _DEFAULT_LEVEL
+        )
+    except ValueError:
+        # The main config loader reports the actionable TOML error. Logging
+        # must still initialize so that error can be rendered normally.
+        configured = _DEFAULT_LEVEL
+    requested = (level or str(configured)).upper()
     try:
         logger.level(requested)
     except (TypeError, ValueError):
@@ -108,10 +118,16 @@ def _resolve_level(level: Optional[str]) -> tuple[str, Optional[str]]:
 def _resolve_log_file(log_file: Optional[Union[str, Path]]) -> Optional[Path]:
     if log_file is not None:
         value = str(log_file).strip()
-    elif "LOG_FILE" in os.environ:
-        value = os.environ["LOG_FILE"].strip()
     else:
-        return default_log_file()
+        try:
+            configured = environment_or_file_setting(
+                "LOG_FILE", "logging", "file", allow_empty=True
+            )
+        except ValueError:
+            configured = None
+        if configured is None:
+            return default_log_file()
+        value = str(configured).strip()
 
     if value.lower() in _DISABLED_FILE_VALUES:
         return None

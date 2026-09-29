@@ -51,8 +51,8 @@ class TestMainCLI:
         result = runner.invoke(cli, ["help-env"])
         assert result.exit_code == 0
         assert "OPENAI_API_KEY" in result.output
-        assert "OPENAI_MODEL" in result.output
-        assert "MAX_PATH_LENGTH" in result.output
+        assert "vtc config init" in result.output
+        assert "MAX_PATH_LENGTH" not in result.output
 
     def test_analyze_missing_file(self, runner):
         result = runner.invoke(cli, ["analyze", "--file", "nonexistent.java"])

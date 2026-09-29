@@ -557,6 +557,101 @@ class TestRunProject:
         assert result["files_analyzed"] == 2
 
     @pytest.mark.asyncio
+    async def test_run_project_indexes_analyzed_files_for_llm_context(
+        self, test_config, tmp_path
+    ):
+        helper = tmp_path / "Helper.java"
+        target = tmp_path / "Target.java"
+        helper.write_text(
+            'class Helper { String value() { return "fixed"; } }'
+        )
+        target.write_text(
+            "class Target { void run() { Helper helper = new Helper(); "
+            "String value = helper.value(); use(value); } }"
+        )
+        empty_spec = Specification(
+            sources=[], sinks=[], llm_model=test_config.llm_model
+        )
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor.extract = AsyncMock(return_value=empty_spec)
+
+        result = await pipeline.run_project([str(helper), str(target)])
+
+        target_call = next(
+            call
+            for call in pipeline.spec_extractor.extract.await_args_list
+            if call.kwargs["file_path"] == str(target)
+        )
+        assert "Helper.value" in target_call.kwargs["project_context"]
+        assert "proven_constant_calls" not in target_call.kwargs
+        assert result["metrics"]["project_context_files_indexed"] == 2
+        assert result["metrics"]["analyzed_files_in_project_context"] == 2
+
+    @pytest.mark.asyncio
+    async def test_run_project_hybrid_applies_constant_call_filter(
+        self, test_config, tmp_path
+    ):
+        test_config.analysis_backend = "hybrid"
+        helper = tmp_path / "Helper.java"
+        target = tmp_path / "Target.java"
+        helper.write_text('class Helper { String value() { return "fixed"; } }')
+        target.write_text(
+            "class Target { void run() { Helper helper = new Helper(); "
+            "String value = helper.value(); use(value); } }"
+        )
+        empty_spec = Specification(
+            sources=[], sinks=[], llm_model=test_config.llm_model
+        )
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor.extract = AsyncMock(return_value=empty_spec)
+
+        await pipeline.run_project([str(helper), str(target)])
+
+        target_call = next(
+            call
+            for call in pipeline.spec_extractor.extract.await_args_list
+            if call.kwargs["file_path"] == str(target)
+        )
+        assert target_call.kwargs["proven_constant_calls"] == {"helper.value"}
+
+    @pytest.mark.asyncio
+    async def test_run_project_can_isolate_independent_analysis_files(
+        self, test_config, tmp_path
+    ):
+        helper = tmp_path / "Helper.java"
+        case_a = tmp_path / "CaseA.java"
+        case_b = tmp_path / "CaseB.java"
+        helper.write_text('class Helper { String value() { return "fixed"; } }')
+        case_a.write_text(
+            "class CaseA { void run() { Helper helper = new Helper(); "
+            "String value = helper.value(); use(value); } }"
+        )
+        case_b.write_text("class CaseB { String unrelated() { return input(); } }")
+        empty_spec = Specification(
+            sources=[], sinks=[], llm_model=test_config.llm_model
+        )
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor.extract = AsyncMock(return_value=empty_spec)
+
+        result = await pipeline.run_project(
+            [str(case_a), str(case_b)],
+            context_files=[str(helper)],
+            include_analyzed_files_in_context=False,
+            allow_interfile_bridges=False,
+        )
+
+        case_a_call = next(
+            call
+            for call in pipeline.spec_extractor.extract.await_args_list
+            if call.kwargs["file_path"] == str(case_a)
+        )
+        assert "Helper.value" in case_a_call.kwargs["project_context"]
+        assert "CaseB" not in case_a_call.kwargs["project_context"]
+        assert result["metrics"]["project_context_files_indexed"] == 1
+        assert result["metrics"]["analyzed_files_in_project_context"] == 0
+        assert result["metrics"]["interfile_bridges_enabled"] is False
+
+    @pytest.mark.asyncio
     async def test_run_project_skips_empty_file_without_extractor_call(
         self, test_config, tmp_path
     ):
@@ -661,8 +756,8 @@ class TestRunProject:
     async def test_run_project_fast_prefilter_excludes_irrelevant(
         self, test_config, tmp_path, monkeypatch
     ):
-        """VTC_FAST_PREFILTER=true restores the old exclude-irrelevant path."""
-        monkeypatch.setenv("VTC_FAST_PREFILTER", "true")
+        """The typed fast_prefilter setting restores exclusion mode."""
+        test_config.fast_prefilter = True
         relevant = tmp_path / "Controller.java"
         irrelevant = tmp_path / "Model.java"
         relevant.write_text('String q = request.getParameter("q"); stmt.executeQuery(q);')

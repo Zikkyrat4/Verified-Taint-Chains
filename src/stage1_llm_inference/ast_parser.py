@@ -296,6 +296,8 @@ class JavaASTParser:
                 self._extract_local_var_flows(node, source_code, flows)
             elif node_type == "assignment_expression":
                 self._extract_assignment_flows(node, source_code, flows)
+            elif node_type == "method_invocation":
+                self._extract_method_invocation_flows(node, source_code, flows)
             elif node_type == "return_statement":
                 self._extract_return_flows(node, source_code, flows)
             elif node_type == "throw_statement":

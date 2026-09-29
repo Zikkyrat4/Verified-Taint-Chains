@@ -1,7 +1,6 @@
 """A* pathfinding with semantic heuristics using CodeBERT embeddings."""
 
 import heapq
-import os
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -37,7 +36,12 @@ class SemanticHeuristic:
     _model_cache: Dict[str, object] = {}
     _failed_models: Set[str] = set()
 
-    def __init__(self, model_name: str = "microsoft/codebert-base") -> None:
+    def __init__(
+        self,
+        model_name: str = "microsoft/codebert-base",
+        *,
+        enabled: bool = False,
+    ) -> None:
         """Initialize semantic heuristic with CodeBERT model.
 
         Args:
@@ -53,9 +57,7 @@ class SemanticHeuristic:
             self.model = None
             return
 
-        if os.getenv("VTC_USE_CODEBERT", "false").lower() not in (
-            "true", "1", "yes", "on"
-        ):
+        if not enabled:
             self.model = None
             logger.debug(
                 "CodeBERT disabled; using deterministic lightweight heuristic"

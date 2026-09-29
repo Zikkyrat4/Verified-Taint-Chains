@@ -37,7 +37,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger()
 SPEC = BENCHMARKS["cwe-bench-java"]
-CHECKPOINT_SCHEMA_VERSION = 5
+CHECKPOINT_SCHEMA_VERSION = 6
 
 
 def _optional_int(value: str | None) -> int:

@@ -73,9 +73,9 @@ def _run_analysis(file: str, output: str, verbose: bool, logger) -> None:
         if verbose:
             logger.info("Verbose mode enabled (DEBUG logging)")
 
-        # Load configuration from environment
+        # Load TOML configuration with environment overrides.
         try:
-            logger.debug("Loading configuration from environment...")
+            logger.debug("Loading effective configuration...")
             config = load_config_from_env()
             logger.debug(f"Configuration loaded: model={config.llm_model}")
         except ValueError as e:
@@ -234,8 +234,9 @@ def config() -> None:
         click.echo("─" * 50)
 
         click.echo("\n💾 Configuration Source:")
-        click.echo("  Configuration loaded from environment variables")
-        click.echo("  Expected .env file location: .env in current directory")
+        click.echo("  Base settings: vtc.toml (when present)")
+        click.echo("  Secrets and overrides: .env or process environment")
+        click.echo("  Detailed view: vtc config show --sources")
 
         logger.info("Configuration displayed")
 
@@ -247,57 +248,18 @@ def config() -> None:
 
 @cli.command()
 def help_env() -> None:
-    """Display environment variable configuration options."""
-    click.echo("\n📝 Environment Variables Configuration:")
+    """Display secret and environment override guidance."""
+    click.echo("\n📝 Environment Configuration:")
     click.echo("─" * 70)
-
-    env_vars = [
-        (
-            "OPENAI_API_KEY",
-            "OpenAI API key (required)",
-            "Your OpenAI API key for LLM inference",
-        ),
-        (
-            "OPENAI_MODEL",
-            "LLM model name",
-            "Default: gpt-4-turbo",
-        ),
-        (
-            "MAX_PATH_LENGTH",
-            "Maximum taint chain path length",
-            "Default: 15",
-        ),
-        (
-            "MIN_CONFIDENCE",
-            "Minimum confidence threshold (0.0-1.0)",
-            "Default: 0.5",
-        ),
-        (
-            "VERIFICATION_ENABLED",
-            "Enable chain verification (true/false)",
-            "Default: true",
-        ),
-        (
-            "SYMBOLIC_EXECUTION_ENABLED",
-            "Enable symbolic execution (true/false)",
-            "Default: false",
-        ),
-    ]
-
-    for var_name, description, default_info in env_vars:
-        click.echo(f"\n  {var_name}")
-        click.echo(f"    Description: {description}")
-        click.echo(f"    {default_info}")
-
-    click.echo("\n─" * 70)
+    click.echo("\n  Keep non-secret settings in vtc.toml.")
+    click.echo("  Keep OPENAI_API_KEY in .env or the process environment.")
+    click.echo("  Existing environment variables remain supported as overrides.")
+    click.echo("\n  Run `vtc config init` to create the full settings template.")
+    click.echo("  Run `vtc config show --sources` to inspect effective values.")
+    click.echo("\n" + "─" * 70)
     click.echo("\n📄 Example .env file:")
     click.echo("""
 OPENAI_API_KEY=sk-your-api-key-here
-OPENAI_MODEL=gpt-4-turbo
-MAX_PATH_LENGTH=15
-MIN_CONFIDENCE=0.5
-VERIFICATION_ENABLED=true
-SYMBOLIC_EXECUTION_ENABLED=false
 """)
 
 
