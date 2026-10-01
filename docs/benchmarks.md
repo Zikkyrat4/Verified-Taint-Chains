@@ -213,10 +213,11 @@ K пар в порядке обхода. Metrics получает `candidate_sel
 
 Все cases являются известными CVE, но upstream не размечает каждую возможную
 уязвимость в полном real-world проекте. Поэтому primary metric — CVE recall:
-verified chain ожидаемого CWE должна пересечь официальный fix method/scope.
-Matcher сначала сравнивает file + method name, так как upstream line ranges
-относятся к fixed revision. Если chain location не содержит method name,
-используется явно отмеченный fallback по fixed line range с допуском 10 строк.
+verified chain ожидаемого CWE должна пересечь официальный fix method.
+Matcher сравнивает `file + class + method`, как официальный evaluator. Upstream
+line ranges относятся к fixed revision, поэтому для vulnerable revision они не
+используются как fallback. Fix rows без полной class/method identity исключаются
+из знаменателя и явно учитываются как unscorable, а не превращаются в TP или FN.
 Для curated subset дополнительно считается точное попадание в ручную пару
 source/sink с допуском 5 строк.
 

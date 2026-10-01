@@ -55,7 +55,8 @@ def _finding(
     file: str = "/checkout/src/main/java/acme/Target.java",
     source_line: int = 10,
     sink_line: int = 20,
-    function: str = "",
+    function: str = "read",
+    class_name: str = "Target",
 ) -> dict:
     return {
         "id": finding_id,
@@ -66,12 +67,14 @@ def _finding(
             "file": file,
             "line": source_line,
             "function": function,
+            "class": class_name,
         },
         "sink": {
             "variable": "path",
             "file": file,
             "line": sink_line,
             "function": function,
+            "class": class_name,
         },
         "path": [],
         "confidence": 0.9,
@@ -87,10 +90,12 @@ def _mock_chain(test_name: str, status: str = "verified") -> MagicMock:
     chain.source.location.file_path = f"/checkout/{test_name}.java"
     chain.source.location.line_number = 10
     chain.source.location.function_name = "run"
+    chain.source.location.class_name = test_name
     chain.sink.variable_name = "path"
     chain.sink.location.file_path = f"/checkout/{test_name}.java"
     chain.sink.location.line_number = 20
     chain.sink.location.function_name = "run"
+    chain.sink.location.class_name = test_name
     chain.path = []
     chain.confidence = 0.7
     chain.verification_status.value = status
@@ -111,10 +116,12 @@ def test_benchmark_rejects_non_verified_pipeline_contract() -> None:
     chain.source.location.file_path = "Target.java"
     chain.source.location.line_number = 10
     chain.source.location.function_name = "run"
+    chain.source.location.class_name = "Target"
     chain.sink.variable_name = "path"
     chain.sink.location.file_path = "Target.java"
     chain.sink.location.line_number = 20
     chain.sink.location.function_name = "run"
+    chain.sink.location.class_name = "Target"
     chain.path = []
     chain.confidence = 0.7
     chain.verification_status.value = "unverifiable"
@@ -370,6 +377,9 @@ async def test_owasp_run_isolates_batches_and_reports_candidate_stage(
     assert report["aggregate"]["tp"] == 1
     assert report["aggregate"]["tn"] == 1
     assert report["stage2_candidate_aggregate"]["tp"] == 1
+    assert report["cases"][0]["findings"][0]["source"]["class"] == (
+        "BenchmarkTest00001"
+    )
     assert report["run"]["measurement"]["raw_llm_binary_verdict_scored"] is False
     assert (
         report["run"]["integrity"]["benchmark_category_markers_exposed_to_llm"]
@@ -407,6 +417,7 @@ def test_load_cwe_cases_joins_oracles_by_cve(tmp_path: Path) -> None:
 
     assert len(cases) == 1
     assert cases[0].cwe == "CWE-22"
+    assert cases[0].fix_targets[0].class_name == "Target"
     assert cases[0].fix_targets[0].method == "read"
     assert cases[0].annotations[0].sink_line == 20
 
@@ -422,7 +433,14 @@ def test_cwe_scoring_requires_target_localization_and_does_not_invent_fp() -> No
         vulnerable_revision="buggy",
         fixed_revisions=("fixed",),
         fix_targets=(
-            FixTarget("src/main/java/acme/Target.java", "read", 8, 25, "fixed"),
+            FixTarget(
+                "src/main/java/acme/Target.java",
+                "read",
+                8,
+                25,
+                "fixed",
+                class_name="Target",
+            ),
         ),
         annotations=(
             EndpointAnnotation(
@@ -459,7 +477,14 @@ def test_cwe_report_keeps_oracle_scope_candidate_verification_reason() -> None:
         vulnerable_revision="buggy",
         fixed_revisions=("fixed",),
         fix_targets=(
-            FixTarget("src/main/java/acme/Target.java", "read", 8, 25, "fixed"),
+            FixTarget(
+                "src/main/java/acme/Target.java",
+                "read",
+                8,
+                25,
+                "fixed",
+                class_name="Target",
+            ),
         ),
     )
     candidate = _finding(function="read")
@@ -494,7 +519,14 @@ def test_cwe_partial_extraction_keeps_hits_and_does_not_count_misses_as_fn() -> 
         vulnerable_revision="buggy",
         fixed_revisions=("fixed",),
         fix_targets=(
-            FixTarget("src/main/java/acme/Target.java", "read", 8, 25, "fixed"),
+            FixTarget(
+                "src/main/java/acme/Target.java",
+                "read",
+                8,
+                25,
+                "fixed",
+                class_name="Target",
+            ),
         ),
     )
     extraction_errors = {"src/main/java/acme/Other.java": ["provider timeout"]}
@@ -539,7 +571,14 @@ def test_cwe_method_name_survives_fixed_revision_line_shift() -> None:
         vulnerable_revision="buggy",
         fixed_revisions=("fixed",),
         fix_targets=(
-            FixTarget("src/main/java/acme/Target.java", "read", 500, 550, "fixed"),
+            FixTarget(
+                "src/main/java/acme/Target.java",
+                "read",
+                500,
+                550,
+                "fixed",
+                class_name="Target",
+            ),
         ),
     )
 
@@ -550,6 +589,73 @@ def test_cwe_method_name_survives_fixed_revision_line_shift() -> None:
 
     assert row["status"] == "tp"
     assert row["fix_target_hits"] == [True]
+
+
+def test_cwe_method_scoring_requires_the_official_class() -> None:
+    case = CweBenchCase(
+        case_id=1,
+        project_slug="case",
+        cve="CVE-2099-0001",
+        cwe="CWE-22",
+        cwe_name="Path Traversal",
+        repository="https://github.com/acme/app",
+        vulnerable_revision="buggy",
+        fixed_revisions=("fixed",),
+        fix_targets=(
+            FixTarget(
+                "src/main/java/acme/Target.java",
+                "read",
+                8,
+                25,
+                "fixed",
+                class_name="ExpectedHandler",
+            ),
+        ),
+    )
+
+    wrong_class = score_cwe_case(
+        case,
+        [_finding(function="read", class_name="OtherHandler")],
+    )
+    qualified_class = score_cwe_case(
+        case,
+        [_finding(function="read", class_name="acme.ExpectedHandler")],
+    )
+
+    assert wrong_class["status"] == "fn"
+    assert qualified_class["status"] == "tp"
+
+
+def test_cwe_incomplete_fix_target_is_unscored_instead_of_file_level_tp() -> None:
+    case = CweBenchCase(
+        case_id=1,
+        project_slug="case",
+        cve="CVE-2099-0001",
+        cwe="CWE-22",
+        cwe_name="Path Traversal",
+        repository="https://github.com/acme/app",
+        vulnerable_revision="buggy",
+        fixed_revisions=("fixed",),
+        fix_targets=(
+            FixTarget(
+                "src/main/java/acme/Target.java",
+                "",
+                0,
+                0,
+                "fixed",
+                class_name="Target",
+            ),
+        ),
+    )
+
+    row = score_cwe_case(case, [_finding()])
+    aggregate = aggregate_rows([row])
+
+    assert row["status"] == "unscored_oracle_missing"
+    assert row["detected"] is None
+    assert len(row["unscorable_fix_targets"]) == 1
+    assert aggregate["scored_cves"] == 0
+    assert aggregate["unscorable_fix_targets"] == 1
 
 
 def test_cwe_missing_or_non_java_oracle_source_is_not_counted_as_fn() -> None:
@@ -563,8 +669,22 @@ def test_cwe_missing_or_non_java_oracle_source_is_not_counted_as_fn() -> None:
         vulnerable_revision="buggy",
         fixed_revisions=("fixed",),
         fix_targets=(
-            FixTarget("src/main/groovy/acme/Runner.groovy", "run", 8, 25, "fixed"),
-            FixTarget("src/main/java/newpkg/Runner.java", "run", 8, 25, "fixed"),
+            FixTarget(
+                "src/main/groovy/acme/Runner.groovy",
+                "run",
+                8,
+                25,
+                "fixed",
+                class_name="Runner",
+            ),
+            FixTarget(
+                "src/main/java/newpkg/Runner.java",
+                "run",
+                8,
+                25,
+                "fixed",
+                class_name="Runner",
+            ),
         ),
     )
 
@@ -590,7 +710,14 @@ def test_cwe_test_only_oracle_is_unscored_when_tests_are_excluded() -> None:
         vulnerable_revision="buggy",
         fixed_revisions=("fixed",),
         fix_targets=(
-            FixTarget("src/test/java/acme/TargetTest.java", "testRead", 8, 25, "fixed"),
+            FixTarget(
+                "src/test/java/acme/TargetTest.java",
+                "testRead",
+                8,
+                25,
+                "fixed",
+                class_name="TargetTest",
+            ),
         ),
     )
 
@@ -614,8 +741,22 @@ def test_cwe_mixed_oracle_metrics_ignore_excluded_test_targets() -> None:
         vulnerable_revision="buggy",
         fixed_revisions=("fixed",),
         fix_targets=(
-            FixTarget("src/main/java/acme/Target.java", "read", 8, 25, "fixed"),
-            FixTarget("src/test/java/acme/TargetTest.java", "testRead", 8, 25, "fixed"),
+            FixTarget(
+                "src/main/java/acme/Target.java",
+                "read",
+                8,
+                25,
+                "fixed",
+                class_name="Target",
+            ),
+            FixTarget(
+                "src/test/java/acme/TargetTest.java",
+                "testRead",
+                8,
+                25,
+                "fixed",
+                class_name="TargetTest",
+            ),
         ),
     )
 

@@ -101,11 +101,14 @@ def chain_to_record(chain: Any) -> dict[str, Any]:
 
     def location_record(node: Any) -> dict[str, Any]:
         location = getattr(node, "location", None)
+        function_name = getattr(location, "function_name", "") if location else ""
+        class_name = getattr(location, "class_name", "") if location else ""
         return {
             "variable": getattr(node, "variable_name", ""),
             "file": getattr(location, "file_path", "") if location else "",
             "line": getattr(location, "line_number", 0) if location else 0,
-            "function": getattr(location, "function_name", "") if location else "",
+            "function": function_name or "",
+            "class": class_name or "",
         }
 
     return {

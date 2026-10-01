@@ -137,6 +137,13 @@ def validate_cwe_data(checkout: Path) -> ValidationResult:
     if invalid_ranges:
         errors.append(f"invalid fix target line ranges: {len(invalid_ranges)}")
 
+    unscorable_fix_targets = [
+        (case.case_id, target.file)
+        for case in cases
+        for target in case.fix_targets
+        if not target.has_method_identity
+    ]
+
     missing_revision = sum(not case.preparable for case in cases)
     missing_oracle = sum(not case.scorable for case in cases)
     test_only_oracle = sum(
@@ -185,6 +192,11 @@ def validate_cwe_data(checkout: Path) -> ValidationResult:
         warnings.append(f"cases without localization oracle: {missing_oracle}")
     if test_only_oracle:
         warnings.append(f"cases with test-only localization oracle: {test_only_oracle}")
+    if unscorable_fix_targets:
+        warnings.append(
+            "fix rows ignored because class/method identity is incomplete: "
+            f"{len(unscorable_fix_targets)}"
+        )
     if orphan_fix_rows:
         orphan_fix_cves = {
             (row.get("cve_id") or "").strip() for row in orphan_fix_rows
@@ -215,6 +227,11 @@ def validate_cwe_data(checkout: Path) -> ValidationResult:
             "preparable_cases": sum(case.preparable for case in cases),
             "cases_with_oracle": sum(case.scorable for case in cases),
             "fix_scope_rows_loaded": sum(len(case.fix_targets) for case in cases),
+            "usable_fix_scope_rows": sum(
+                target.has_method_identity
+                for case in cases
+                for target in case.fix_targets
+            ),
             "source_sink_pairs_loaded": sum(len(case.annotations) for case in cases),
             "runnable_cases_without_tests": sum(
                 case.preparable and case.scorable_in_scope(False) for case in cases

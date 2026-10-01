@@ -37,7 +37,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger()
 SPEC = BENCHMARKS["cwe-bench-java"]
-CHECKPOINT_SCHEMA_VERSION = 6
+CHECKPOINT_SCHEMA_VERSION = 7
 
 
 def _optional_int(value: str | None) -> int:
@@ -59,6 +59,12 @@ class FixTarget:
     end_line: int
     commit: str
     signature: str = ""
+    class_name: str = ""
+
+    @property
+    def has_method_identity(self) -> bool:
+        """Whether this target can participate in official method scoring."""
+        return bool(self.file and self.class_name and self.method)
 
 
 @dataclass(frozen=True)
@@ -85,7 +91,10 @@ class CweBenchCase:
 
     @property
     def scorable(self) -> bool:
-        return bool(self.fix_targets or self.annotations)
+        return bool(
+            any(target.has_method_identity for target in self.fix_targets)
+            or self.annotations
+        )
 
     @property
     def preparable(self) -> bool:
@@ -95,7 +104,18 @@ class CweBenchCase:
         return tuple(
             target
             for target in self.fix_targets
-            if _oracle_path_in_scope(target.file, include_tests)
+            if target.has_method_identity
+            and _oracle_path_in_scope(target.file, include_tests)
+        )
+
+    def unscorable_fix_targets_in_scope(
+        self, include_tests: bool
+    ) -> tuple[FixTarget, ...]:
+        return tuple(
+            target
+            for target in self.fix_targets
+            if not target.has_method_identity
+            and _oracle_path_in_scope(target.file, include_tests)
         )
 
     def annotations_in_scope(
@@ -138,6 +158,7 @@ def load_cases(checkout: Path) -> list[CweBenchCase]:
             targets_by_cve[cve].append(
                 FixTarget(
                     file=file_path,
+                    class_name=(row.get("class") or "").strip(),
                     method=(row.get("method") or "").strip(),
                     start_line=start,
                     end_line=end,
@@ -331,21 +352,27 @@ def _touches_file(finding: Mapping[str, Any], expected_file: str) -> bool:
     return any(_file_matches(str(node.get("file", "")), expected_file) for node in _finding_nodes(finding))
 
 
+def _class_matches(reported: str, expected: str) -> bool:
+    """Compare qualified, binary, and simple Java class names."""
+    reported_simple = reported.strip().replace("$", ".").rsplit(".", 1)[-1]
+    expected_simple = expected.strip().replace("$", ".").rsplit(".", 1)[-1]
+    return bool(reported_simple and expected_simple and reported_simple == expected_simple)
+
+
 def _touches_scope(
-    finding: Mapping[str, Any], target: FixTarget, tolerance: int = 10
+    finding: Mapping[str, Any], target: FixTarget
 ) -> bool:
+    if not target.has_method_identity:
+        return False
     for node in _finding_nodes(finding):
         if not _file_matches(str(node.get("file", "")), target.file):
             continue
         function_name = str(node.get("function", "") or "").strip()
-        if target.method and function_name:
-            if function_name == target.method:
-                return True
-            continue
-        line = int(node.get("line", 0) or 0)
-        if not target.start_line or not target.end_line:
-            return True
-        if line and target.start_line - tolerance <= line <= target.end_line + tolerance:
+        class_name = str(node.get("class", "") or "").strip()
+        if (
+            function_name == target.method
+            and _class_matches(class_name, target.class_name)
+        ):
             return True
     return False
 
@@ -384,7 +411,12 @@ def score_case(
         if finding.get("cwe") == case.cwe
     ]
     fix_targets = case.fix_targets_in_scope(include_tests)
+    unscorable_fix_targets = case.unscorable_fix_targets_in_scope(include_tests)
     annotations = case.annotations_in_scope(include_tests)
+    excluded_fix_targets = (
+        len(case.fix_targets) - len(fix_targets) - len(unscorable_fix_targets)
+    )
+    excluded_annotations = len(case.annotations) - len(annotations)
     oracle_source_checked = source_files is not None
     unavailable_fix_targets = 0
     unavailable_annotations = 0
@@ -507,11 +539,14 @@ def score_case(
         "target_file_localized": file_localized,
         "files_analyzed": files_analyzed,
         "fix_targets": [asdict(target) for target in fix_targets],
-        "excluded_fix_targets": len(case.fix_targets) - len(fix_targets),
+        "excluded_fix_targets": excluded_fix_targets,
+        "unscorable_fix_targets": [
+            asdict(target) for target in unscorable_fix_targets
+        ],
         "unavailable_fix_targets": unavailable_fix_targets,
         "fix_target_hits": target_hits,
         "annotations": [asdict(annotation) for annotation in annotations],
-        "excluded_annotations": len(case.annotations) - len(annotations),
+        "excluded_annotations": excluded_annotations,
         "unavailable_annotations": unavailable_annotations,
         "annotation_hits": annotation_hits,
         "findings": list(findings),
@@ -582,6 +617,9 @@ def aggregate_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             round(annotation_hits / annotation_total, 4) if annotation_total else None
         ),
         "unscored_findings": sum(int(row["unscored_finding_count"]) for row in rows),
+        "unscorable_fix_targets": sum(
+            len(row.get("unscorable_fix_targets", ())) for row in rows
+        ),
         "precision": None,
         "precision_reason": (
             "Undefined: CWE-Bench labels target CVE locations, not every vulnerability "
@@ -790,7 +828,8 @@ async def run(
     analysis["evaluation_policy"] = {
         "scoring_unit": "target_cve_at_official_fix_scope",
         "target_cwe_required": True,
-        "official_fix_scope_required": True,
+        "official_fix_class_and_method_required": True,
+        "fixed_revision_line_fallback": False,
         "curated_endpoint_pairs_secondary": True,
         "unmatched_findings_count_as_fp": False,
         "precision_defined": False,
@@ -915,7 +954,7 @@ async def run(
 
     aggregate = aggregate_rows(rows)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": {
             "id": SPEC.benchmark_id,
             "title": SPEC.title,
@@ -956,6 +995,16 @@ async def run(
             "available_cwes": sorted({case.cwe for case in all_cases}),
             "declared_supported_cwes": sorted(DECLARED_SUPPORTED_CWES),
             "upstream_cases_with_localization_oracle": sum(case.scorable for case in all_cases),
+            "upstream_usable_fix_targets": sum(
+                target.has_method_identity
+                for case in all_cases
+                for target in case.fix_targets
+            ),
+            "upstream_unscorable_fix_targets": sum(
+                not target.has_method_identity
+                for case in all_cases
+                for target in case.fix_targets
+            ),
             "upstream_cases_with_vulnerable_revision": sum(
                 case.preparable for case in all_cases
             ),
@@ -983,8 +1032,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"- Backend: `{run_info['analysis']['backend']}`",
         f"- LLM mode: `{run_info['analysis']['llm_analysis_mode']}`",
         f"- CVEs scored: {aggregate['scored_cves']} / {aggregate['selected_cases']}",
-        "- Primary unit: target CWE finding localized to an official fix method/scope",
+        "- Primary unit: target CWE finding localized to an official fix class and method",
         "- Precision: undefined because the dataset does not label every finding in each project",
+        f"- Incomplete fix targets ignored: {aggregate['unscorable_fix_targets']}",
         "",
         "## Aggregate",
         "",
