@@ -12,7 +12,8 @@ Strategy:
 
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from time import monotonic
 from typing import Dict, List, Optional
 
 from src.core.config import PipelineConfig
@@ -276,7 +277,11 @@ class VerificationEngine:
     def verify_all_chains(
         self,
         chains: List[TaintChain],
-        source_code: str
+        source_code: str,
+        *,
+        progress_offset: int = 0,
+        progress_total: int | None = None,
+        progress_started_at: float | None = None,
     ) -> Dict:
         """Verify multiple taint chains.
 
@@ -293,12 +298,26 @@ class VerificationEngine:
         false: List[TaintChain] = []
         unverifiable: List[TaintChain] = []
         results: List[VerificationResult] = []
+        result_cache: dict[tuple[object, ...], VerificationResult] = {}
+        cache_hits = 0
 
         # Build CFG once for all chains
         self.cfg_verifier.build_cfg(source_code)
+        if self.symbolic_executor:
+            self.symbolic_executor.prepare_source(source_code)
 
-        for chain in chains:
-            result = self.verify_chain(chain, source_code)
+        total_for_progress = progress_total or len(chains)
+        started_at = progress_started_at or monotonic()
+        for index, chain in enumerate(chains, start=1):
+            signature = self._verification_signature(chain)
+            cached = result_cache.get(signature)
+            if cached is None:
+                result = self.verify_chain(chain, source_code)
+                result_cache[signature] = result
+            else:
+                result = replace(cached)
+                self._attach_result(chain, result)
+                cache_hits += 1
             results.append(result)
 
             if result.status == VerificationStatus.VERIFIED:
@@ -307,6 +326,18 @@ class VerificationEngine:
                 false.append(chain)
             else:
                 unverifiable.append(chain)
+
+            completed = progress_offset + index
+            if completed % 1000 == 0 or completed == total_for_progress:
+                elapsed = max(monotonic() - started_at, 1e-9)
+                rate = completed / elapsed
+                remaining = total_for_progress - completed
+                eta = remaining / rate if rate > 0 else 0.0
+                logger.info(
+                    f"Stage 3 [{completed}/{total_for_progress}]: "
+                    f"{rate:.1f} chains/s, ETA ~{eta:.0f}s, "
+                    f"equivalent-result cache hits={cache_hits}"
+                )
 
         # Compute statistics
         total = len(chains)
@@ -336,7 +367,40 @@ class VerificationEngine:
             "avg_confidence": avg_confidence,
             "method_counts": method_counts,
             "results": results,
+            "verification_cache_hits": cache_hits,
         }
+
+    @staticmethod
+    def _verification_signature(chain: TaintChain) -> tuple[object, ...]:
+        """Return the exact inputs that can affect verification semantics."""
+
+        def node_signature(node: object) -> tuple[object, ...]:
+            location = getattr(node, "location", None)
+            return (
+                getattr(node, "variable_name", ""),
+                getattr(node, "code_snippet", ""),
+                getattr(location, "file_path", ""),
+                getattr(location, "line_number", 0),
+                getattr(location, "function_name", None),
+                getattr(location, "class_name", None),
+            )
+
+        sanitizers = tuple(
+            (
+                sanitizer.effectiveness,
+                sanitizer.confidence,
+                sanitizer.type,
+                sanitizer.variable_name,
+                node_signature(sanitizer),
+            )
+            for sanitizer in chain.sanitizers_on_path
+        )
+        return (
+            node_signature(chain.source),
+            node_signature(chain.sink),
+            tuple(node_signature(node) for node in chain.path),
+            sanitizers,
+        )
 
     def verify_all_chains_scoped(
         self,
@@ -386,11 +450,26 @@ class VerificationEngine:
             "unverifiable": [],
             "results": [],
         }
-        for paths, grouped_chains in groups.items():
+        started_at = monotonic()
+        processed = 0
+        cache_hits = 0
+        for group_index, (paths, grouped_chains) in enumerate(groups.items(), start=1):
+            logger.info(
+                f"Stage 3 group [{group_index}/{len(groups)}]: "
+                f"{len(grouped_chains)} chains across {len(paths)} file(s)"
+            )
             source_code = "\n".join(file_code_map[path] for path in paths)
-            group_result = self.verify_all_chains(grouped_chains, source_code)
+            group_result = self.verify_all_chains(
+                grouped_chains,
+                source_code,
+                progress_offset=processed,
+                progress_total=len(chains),
+                progress_started_at=started_at,
+            )
             for key in combined:
                 combined[key].extend(group_result[key])
+            processed += len(grouped_chains)
+            cache_hits += group_result["verification_cache_hits"]
 
         results = combined["results"]
         total = len(chains)
@@ -415,6 +494,7 @@ class VerificationEngine:
                 sum(result.confidence for result in results) / total if total else 0.0
             ),
             "method_counts": method_counts,
+            "verification_cache_hits": cache_hits,
         }
 
     def get_statistics(self) -> Dict:

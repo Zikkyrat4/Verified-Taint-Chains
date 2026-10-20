@@ -61,6 +61,54 @@ class TestExtractMethod:
             await extractor.extract("   \n\t  ")
 
     @pytest.mark.asyncio
+    async def test_extract_comment_only_java_as_complete_empty_spec(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock()
+        extractor = SimpleSpecificationExtractor(client)
+
+        spec = await extractor.extract(
+            "/* License header. */\n// Template consumed by the build.\n",
+            "spotless.license.java",
+        )
+
+        assert spec.extraction_complete is True
+        assert spec.extraction_errors == []
+        assert spec.sources == []
+        assert spec.sinks == []
+        assert spec.sanitizers == []
+        client.chat_with_json_prompt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_commented_out_method_batches_have_bounded_recovery(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(return_value={
+            "sources": [], "sinks": [], "sanitizers": [],
+        })
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=80)
+        code = """public class DisabledListener {
+    private final String name = "listener";
+//    public void notifyEvent(Event event) {
+//        String value = event.getValue();
+//        Runtime.getRuntime().exec(value);
+//    }
+//    public void processEvent(Event event) {
+//        response.getWriter().write(event.getValue());
+//    }
+}
+"""
+
+        assert extractor._split_into_functions(code)
+        spec = await extractor.extract(code, "DisabledListener.java")
+
+        assert spec.extraction_complete is True
+        assert spec.extraction_errors == []
+        assert spec.sources == []
+        assert spec.sinks == []
+        # Empty synthetic batches are skipped. The existing one-shot method
+        # coverage review remains allowed, but cannot re-enter batch splitting.
+        assert client.chat_with_json_prompt.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_extract_simple_code(self) -> None:
         """Test extraction from simple Java code."""
         client = SimpleLLMClient(api_key="test-key")
@@ -1018,7 +1066,9 @@ class TestHasPotentialSinks:
 class TestExtractCacheIntegration:
     """Cache and prefilter integration with extract()."""
 
-    def _make_extractor(self, spec_cache=None, analysis_mode="exhaustive"):
+    def _make_extractor(
+        self, spec_cache=None, analysis_mode="exhaustive", **kwargs
+    ):
         client = SimpleLLMClient(api_key="test-key")
         # Use a real LLM-shaped mock so we can assert it was (or wasn't) called.
         client.chat_with_json_prompt = AsyncMock(return_value={"sources": [], "sinks": []})
@@ -1027,6 +1077,7 @@ class TestExtractCacheIntegration:
             spec_cache=spec_cache,
             llm_provider="openai",
             analysis_mode=analysis_mode,
+            **kwargs,
         )
 
     @pytest.mark.asyncio
@@ -1062,6 +1113,119 @@ class TestExtractCacheIntegration:
         # LLM must NOT have been called — replay from cache.
         ext.llm_client.chat_with_json_prompt.assert_not_called()
         assert cache.stats.hits == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_rebinds_locations_to_current_file(self, tmp_path):
+        from src.core.models import Sanitizer, Source, Specification
+        from src.stage1_llm_inference.spec_cache import SpecCache
+
+        code = 'public class X { void m(String value) { run(value); } }'
+        location = CodeLocation(file_path="Old.java", line_number=1)
+        cached_spec = Specification(
+            sources=[
+                Source(
+                    location=location.model_copy(),
+                    variable_name="value",
+                    type="user_input",
+                    confidence=0.9,
+                    code_snippet="value",
+                )
+            ],
+            sinks=[
+                Sink(
+                    location=location.model_copy(),
+                    variable_name="value",
+                    type="command_exec",
+                    confidence=0.9,
+                    code_snippet="run(value)",
+                    vulnerability_type=VulnerabilityType.COMMAND_INJECTION,
+                )
+            ],
+            sanitizers=[
+                Sanitizer(
+                    location=location.model_copy(),
+                    type="validation",
+                    confidence=0.9,
+                    code_snippet="validate(value)",
+                )
+            ],
+            llm_model="gpt-4-turbo",
+        )
+        cache = SpecCache(cache_dir=tmp_path)
+        cache.put(
+            code,
+            cached_spec,
+            llm_provider="openai",
+            llm_model="gpt-4-turbo",
+            min_confidence=0.5,
+            extractor_options=(
+                "analysis_backend=llm;analysis_mode=exhaustive;"
+                "fast_prefilter=False;batch_max_chars=0;"
+            ),
+        )
+        ext = self._make_extractor(spec_cache=cache)
+
+        spec = await ext.extract(code, file_path="New.java", model="gpt-4-turbo")
+
+        assert {
+            endpoint.location.file_path
+            for endpoint in [*spec.sources, *spec.sinks, *spec.sanitizers]
+        } == {"New.java"}
+        ext.llm_client.chat_with_json_prompt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_discards_endpoints_outside_current_file(self, tmp_path):
+        from src.core.models import Source, Specification
+        from src.stage1_llm_inference.spec_cache import SpecCache
+
+        code = "class X {\n  String value;\n}\n"
+        cached_spec = Specification(
+            sources=[
+                Source(
+                    location=CodeLocation(file_path="Old.java", line_number=99),
+                    variable_name="value",
+                    type="user_input",
+                    confidence=0.9,
+                    code_snippet="value",
+                )
+            ],
+            sinks=[],
+            llm_model="gpt-4-turbo",
+        )
+        cache = SpecCache(cache_dir=tmp_path)
+        cache.put(
+            code,
+            cached_spec,
+            llm_provider="openai",
+            llm_model="gpt-4-turbo",
+            min_confidence=0.5,
+            extractor_options=(
+                "analysis_backend=llm;analysis_mode=exhaustive;"
+                "fast_prefilter=False;batch_max_chars=0;"
+            ),
+        )
+
+        ext = self._make_extractor(spec_cache=cache)
+        spec = await ext.extract(code, file_path="New.java", model="gpt-4-turbo")
+
+        assert spec.sources == []
+        ext.llm_client.chat_with_json_prompt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cache_only_miss_never_calls_llm(self, tmp_path):
+        from src.stage1_llm_inference.spec_cache import SpecCache
+
+        ext = self._make_extractor(
+            spec_cache=SpecCache(cache_dir=tmp_path), cache_only=True
+        )
+
+        with pytest.raises(LLMError, match="cache-only miss"):
+            await ext.extract(
+                "class Missing { void run() {} }",
+                file_path="Missing.java",
+                model="gpt-4-turbo",
+            )
+        ext.llm_client.chat_with_json_prompt.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_prefilter_skips_llm_call_for_declarative_file(self, tmp_path):
@@ -1318,6 +1482,17 @@ class TestLLMBatching:
         )
         assert parts[0][2] == 1
         assert parts[1][2] < parts[0][2] + parts[0][1].count("\n")
+
+    def test_empty_failed_batch_is_never_rescheduled(self):
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=8000)
+        entry = ("__batch_2", "", 96, None)
+
+        parts = extractor._split_failed_llm_batch(
+            "class Example {}\n", [], entry, max_chars=8000
+        )
+
+        assert parts == [entry]
 
     @pytest.mark.asyncio
     async def test_failed_batches_are_split_recursively_to_methods(self):
@@ -1668,6 +1843,59 @@ class TestParseLLMSanitizers:
         extractor = SimpleSpecificationExtractor(client)
 
         assert extractor._parse_llm_sanitizers({}, "Test.java") == []
+
+    def test_invalid_optional_sanitizer_is_ignored(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        extractor = SimpleSpecificationExtractor(client)
+        response = {
+            "sanitizers": [{
+                "line": 0,
+                "variable": "value",
+                "type": "validation",
+            }]
+        }
+
+        assert extractor._parse_llm_sanitizers(response, "Test.java") == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_optional_sanitizer_does_not_discard_endpoints(self) -> None:
+        client = SimpleLLMClient(api_key="test-key")
+        client.chat_with_json_prompt = AsyncMock(return_value={
+            "sources": [{
+                "line": 3,
+                "variable": "value",
+                "type": "user_input",
+                "confidence": 0.9,
+            }],
+            "sinks": [{
+                "line": 4,
+                "variable": "value",
+                "type": "command_execution",
+                "vulnerability_type": "command_injection",
+                "confidence": 0.9,
+            }],
+            "sanitizers": [{
+                "line": "unknown",
+                "variable": "value",
+                "type": "validation",
+            }],
+        })
+        extractor = SimpleSpecificationExtractor(client, batch_max_chars=10_000)
+        code = """class Runner {
+    void run(HttpServletRequest request) {
+        String value = request.getParameter("cmd");
+        Runtime.getRuntime().exec(value);
+    }
+}
+"""
+
+        spec = await extractor.extract(code, "Runner.java")
+
+        assert spec.extraction_complete is True
+        assert len(spec.sources) == 1
+        assert len(spec.sinks) == 1
+        assert spec.sanitizers == []
+        client.chat_with_json_prompt.assert_awaited_once()
 
 
 class TestSinkAttributedSources:

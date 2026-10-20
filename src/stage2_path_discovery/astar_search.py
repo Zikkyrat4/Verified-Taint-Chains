@@ -2,6 +2,7 @@
 
 import heapq
 from collections import deque
+from time import monotonic
 from typing import Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -11,6 +12,7 @@ from src.core.models import PathNode, Sanitizer, Sink, Source, TaintChain
 from src.stage2_path_discovery.simple_path_finder import (
     _display_node_name,
     _intermediate_path_node,
+    bounded_endpoint_reachability,
     candidate_pair_priority,
     stable_chain_id,
 )
@@ -374,8 +376,9 @@ class AStarPathFinder:
                 graph node ID (e.g. ``"File.java:varName"``).  When *None*
                 (default) the plain ``variable_name`` is used — fully
                 backward-compatible with the old single-file behaviour.
-            max_chains: Maximum retained candidates. The finder records
-                ``limit_exceeded`` when additional reachable pairs exist.
+            max_chains: Optional maximum retained candidates. ``0`` checks
+                every graph-reachable pair. Positive values enable an explicit
+                confidence-ranked safety limit.
 
         Returns:
             List of TaintChain objects representing found vulnerabilities.
@@ -394,46 +397,70 @@ class AStarPathFinder:
         logger.info(f"Finding optimal paths for {len(sources)} sources and {len(sinks)} sinks")
 
         # Pre-compute reachable sink names for each source (BFS bounded by max_length)
-        sink_graph_ids = {_node_id(s) for s in sinks}
-        source_reachable: Dict[str, Set[str]] = {}
-        for source in sources:
-            src_id = _node_id(source)
-            if src_id not in self.graph:
-                continue
-            reachable: Set[str] = set()
-            queue = deque([(src_id, 0)])
-            visited: Set[str] = set()
-            while queue:
-                node, depth = queue.popleft()
-                if node in visited or depth > max_length:
-                    continue
-                visited.add(node)
-                if node in sink_graph_ids:
-                    reachable.add(node)
-                for neighbor in self.graph.neighbors(node):
-                    if neighbor not in visited:
-                        queue.append((neighbor, depth + 1))
-            source_reachable[src_id] = reachable
+        sinks_by_graph_id: Dict[str, List[Sink]] = {}
+        for sink in sinks:
+            sink_id = _node_id(sink)
+            if sink_id in self.graph:
+                sinks_by_graph_id.setdefault(sink_id, []).append(sink)
+        sink_graph_ids = set(sinks_by_graph_id)
+        source_graph_ids = {
+            source_id
+            for source in sources
+            if (source_id := _node_id(source)) in self.graph
+        }
+        source_reachable = bounded_endpoint_reachability(
+            self.graph,
+            source_graph_ids,
+            sink_graph_ids,
+            max_length,
+        )
+        if sources:
+            logger.info(
+                f"Stage 2 reachability complete: {len(sources)} sources, "
+                f"{sum(map(len, source_reachable.values()))} reachable sink nodes"
+            )
 
-        skipped = 0
-        candidate_pairs: List[Tuple[Tuple[object, ...], Source, Sink]] = []
+        candidate_pairs: List[Tuple[Source, Sink]] = []
         for source in sources:
             src_id = _node_id(source)
             reachable = source_reachable.get(src_id, set())
-            for sink in sinks:
-                sink_id = _node_id(sink)
-                if sink_id not in reachable:
-                    skipped += 1
-                    continue
-                candidate_pairs.append(
-                    (candidate_pair_priority(source, sink), source, sink)
-                )
+            for sink_id in sorted(reachable):
+                for sink in sinks_by_graph_id.get(sink_id, []):
+                    candidate_pairs.append((source, sink))
 
-        candidate_pairs.sort(key=lambda item: item[0], reverse=True)
         self.candidate_pairs_ranked = len(candidate_pairs)
         self.reachable_pairs_seen = len(candidate_pairs)
+        if max_chains and len(candidate_pairs) > max_chains:
+            candidate_pairs.sort(
+                key=lambda item: candidate_pair_priority(item[0], item[1]),
+                reverse=True,
+            )
+            self.ranked_out_count = len(candidate_pairs) - max_chains
+            self.limit_exceeded = True
+            logger.warning(
+                "Global top-k candidate selection retained "
+                f"{max_chains} of {len(candidate_pairs)} ranked "
+                "graph-reachable endpoint pairs"
+            )
+            candidate_pairs = candidate_pairs[:max_chains]
 
-        for pair_index, (_, source, sink) in enumerate(candidate_pairs):
+        path_started_at = monotonic()
+        last_path_key: tuple[object, ...] | None = None
+        last_path_nodes: Optional[List[str]] = None
+
+        def log_path_progress(completed: int) -> None:
+            elapsed = max(monotonic() - path_started_at, 1e-9)
+            rate = completed / elapsed
+            remaining = len(candidate_pairs) - completed
+            eta = remaining / rate if rate > 0 else 0.0
+            logger.info(
+                f"Stage 2 paths [{completed}/{len(candidate_pairs)}]: "
+                f"{rate:.1f} pairs/s, ETA ~{eta:.0f}s, chains={len(chains)}"
+            )
+
+        for pair_index, (source, sink) in enumerate(candidate_pairs, start=1):
+            if pair_index > 1 and (pair_index - 1) % 10_000 == 0:
+                log_path_progress(pair_index - 1)
             src_id = _node_id(source)
             sink_id = _node_id(sink)
             # Same-file, cross-method flows are accepted only when the
@@ -464,19 +491,28 @@ class AStarPathFinder:
             ):
                 pair_function = src_func
             if cross_method:
-                path_nodes = self._find_scoped_field_path(
+                path_key = (
+                    "field",
                     src_id,
                     sink_id,
-                    {src_func, sink_func},
+                    tuple(sorted((src_func, sink_func))),
                     max_length,
                 )
             else:
-                path_nodes = self.find_path(
-                    src_id,
-                    sink_id,
-                    max_length,
-                    function_name=pair_function,
+                path_key = ("astar", src_id, sink_id, pair_function, max_length)
+
+            if path_key == last_path_key:
+                path_nodes = last_path_nodes
+            elif cross_method:
+                path_nodes = self._find_scoped_field_path(
+                    src_id, sink_id, {src_func, sink_func}, max_length
                 )
+            else:
+                path_nodes = self.find_path(
+                    src_id, sink_id, max_length, function_name=pair_function
+                )
+            last_path_key = path_key
+            last_path_nodes = path_nodes
 
             if path_nodes:
                 cross_file = bool(
@@ -537,19 +573,15 @@ class AStarPathFinder:
                 )
                 chains.append(chain)
                 logger.debug(f"Found optimal chain: {src_id} -> {sink_id}")
-                if max_chains and len(chains) >= max_chains:
-                    self.ranked_out_count = len(candidate_pairs) - pair_index - 1
-                    self.limit_exceeded = self.ranked_out_count > 0
-                    if self.limit_exceeded:
-                        logger.warning(
-                            "Global top-k candidate selection retained "
-                            f"{max_chains} of {len(candidate_pairs)} ranked "
-                            "graph-reachable endpoint pairs"
-                        )
-                    break
 
+        if candidate_pairs:
+            log_path_progress(len(candidate_pairs))
+
+        skipped = len(sources) * len(sinks) - self.candidate_pairs_ranked
         if skipped:
-            logger.debug(f"Skipped {skipped} unreachable source-sink pairs via pre-filter")
+            logger.debug(
+                f"Skipped {skipped} unreachable source-sink pairs via pre-filter"
+            )
         logger.info(f"A* found {len(chains)} optimal taint chains")
         return chains
 

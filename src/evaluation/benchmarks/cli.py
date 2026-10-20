@@ -203,6 +203,11 @@ def prepare(
 )
 @click.option("--include-tests", is_flag=True, help="Include test sources in real projects.")
 @click.option("--refresh-specs", is_flag=True, help="Ignore cached Stage 1 results.")
+@click.option(
+    "--cache-only",
+    is_flag=True,
+    help="Require Stage 1 cache hits; never send an LLM request.",
+)
 @click.option("--fail-fast", is_flag=True, help="Stop on the first analysis error.")
 @click.option(
     "--retry-errors",
@@ -236,6 +241,7 @@ def run(
     batch_size: int,
     include_tests: bool,
     refresh_specs: bool,
+    cache_only: bool,
     fail_fast: bool,
     retry_errors: bool,
     max_concurrent_files: int | None,
@@ -269,6 +275,7 @@ def run(
                 batch_size=batch_size,
                 include_tests=include_tests,
                 refresh_specs=refresh_specs,
+                cache_only=cache_only,
                 fail_fast=fail_fast,
                 retry_errors=retry_errors,
                 max_concurrent_files=max_concurrent_files,

@@ -157,6 +157,15 @@ class SymbolicExecutor:
         else:
             self.backend = backend
 
+        self._prepared_source_code: Optional[str] = None
+        self._prepared_source_lines: List[str] = []
+        self._prepared_source_entries: List[str] = []
+        self._prepared_identifier_positions: Dict[str, set[int]] = {}
+        self._prepared_integer_constants: Dict[str, int] = {}
+        self._statement_cache: Dict[
+            tuple[str, str, tuple[str, ...]], Optional[str]
+        ] = {}
+
         logger.debug(
             f"Initialized SymbolicExecutor with backend: {self.backend.value}"
         )
@@ -166,6 +175,31 @@ class SymbolicExecutor:
                 "No symbolic execution backend available. "
                 "Install z3-solver for symbolic execution support."
             )
+
+    def prepare_source(self, source_code: str) -> None:
+        """Parse reusable source context once for a verification group."""
+        if source_code is self._prepared_source_code:
+            return
+
+        lines = source_code.splitlines()
+        statements = re.findall(r"[^;{}]*;", source_code, re.DOTALL)
+        entries = [*statements, *lines]
+        identifier_positions: Dict[str, set[int]] = {}
+        for position, entry in enumerate(entries):
+            cleaned = re.sub(r'"(?:\\.|[^"\\])*"', "", entry)
+            cleaned = re.sub(r"'(?:\\.|[^'\\])*'", "", cleaned)
+            cleaned = re.sub(
+                r"//.*?$|/\*.*?\*/", "", cleaned, flags=re.MULTILINE | re.DOTALL
+            )
+            for identifier in set(re.findall(r"[A-Za-z_$][\w$]*", cleaned)):
+                identifier_positions.setdefault(identifier, set()).add(position)
+
+        self._prepared_source_code = source_code
+        self._prepared_source_lines = lines
+        self._prepared_source_entries = entries
+        self._prepared_identifier_positions = identifier_positions
+        self._prepared_integer_constants = self._collect_integer_constants(source_code)
+        self._statement_cache = {}
 
     def execute_path(
         self,
@@ -288,7 +322,8 @@ class SymbolicExecutor:
             PathConstraints object with Z3 constraints.
         """
         constraints = PathConstraints()
-        constraints.integer_constants = self._collect_integer_constants(source_code)
+        self.prepare_source(source_code)
+        constraints.integer_constants = self._prepared_integer_constants
 
         # Add source variable as symbolic
         constraints.add_variable(
@@ -356,9 +391,8 @@ class SymbolicExecutor:
         logger.debug(f"Built path constraints: {constraints}")
         return constraints
 
-    @classmethod
     def _same_variable_preservation(
-        cls,
+        self,
         source_node: Any,
         sink_node: Any,
         variable: str,
@@ -372,14 +406,15 @@ class SymbolicExecutor:
         if start <= 0 or end <= start:
             return None
 
-        lines = source_code.splitlines()
+        self.prepare_source(source_code)
+        lines = self._prepared_source_lines
         escaped = re.escape(variable)
         assignment = re.compile(
             rf"(?<![A-Za-z0-9_$]){escaped}\s*=\s*(.+?);"
         )
         for line in lines[start:end]:
             match = assignment.search(line)
-            if match and not cls._mentions_identifier(match.group(1), variable):
+            if match and not self._mentions_identifier(match.group(1), variable):
                 return False
         return True
 
@@ -405,10 +440,13 @@ class SymbolicExecutor:
         # several physical lines. Prefer complete semicolon-terminated
         # statements, then retain the line scan for signatures/returns without
         # a terminator.
-        statements = re.findall(r"[^;{}]*;", source_code, re.DOTALL)
-        lines = [*(snippets or []), *statements, *source_code.split('\n')]
+        self.prepare_source(source_code)
+        snippet_tuple = tuple(snippets or [])
+        cache_key = (var1, var2, snippet_tuple)
+        if cache_key in self._statement_cache:
+            return self._statement_cache[cache_key]
 
-        for line in lines:
+        for line in snippet_tuple:
             if not line:
                 continue
             # Assignment/call/return evidence must mention the exact Java
@@ -420,8 +458,31 @@ class SymbolicExecutor:
                 rf"\breturn\b[^;]*\b{re.escape(var1)}\b", line
             )
             if (has_source and has_target) or return_flow:
-                return line.strip()
+                result = line.strip()
+                self._statement_cache[cache_key] = result
+                return result
 
+        source_positions = self._prepared_identifier_positions.get(var1, set())
+        if var2 == "return_value":
+            # Preserve the legacy raw return-expression match, including its
+            # conservative handling of identifiers inside unusual literals.
+            candidate_positions = range(len(self._prepared_source_entries))
+        else:
+            candidate_positions = source_positions & self._prepared_identifier_positions.get(
+                var2, set()
+            )
+
+        for position in sorted(candidate_positions):
+            line = self._prepared_source_entries[position]
+            return_flow = var2 == "return_value" and re.search(
+                rf"\breturn\b[^;]*\b{re.escape(var1)}\b", line
+            )
+            if var2 != "return_value" or return_flow:
+                result = line.strip()
+                self._statement_cache[cache_key] = result
+                return result
+
+        self._statement_cache[cache_key] = None
         return None
 
     def _extract_constraint_from_statement(

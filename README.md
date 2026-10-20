@@ -128,7 +128,9 @@ vtc benchmark run cwe-bench-java --cwe CWE-22 --limit 10 --seed 42 --backend llm
 только заявленные VTC классы CWE; `--all-cwes` явно расширяет область. Внешние
 репозитории хранятся в `.vtc-benchmarks/`, а JSON/Markdown-отчеты — в
 `evaluation/benchmarks/`. Архитектура, scoring и ограничения сравнимости
-описаны в [`docs/benchmarks.md`](docs/benchmarks.md).
+описаны в [`docs/benchmarks.md`](docs/benchmarks.md). Проверенный снимок
+финальных запусков, метрики и SHA-256 артефактов сохранены в
+[`docs/benchmark-results.md`](docs/benchmark-results.md).
 
 ## Конфигурация
 
@@ -220,6 +222,7 @@ mypy src
 - [Конфигурация](docs/configuration.md) — все параметры настройки
 - [Использование](docs/usage.md) — CLI, формат вывода, примеры
 - [Тестирование](docs/testing.md) — запуск тестов, фикстуры
+- [Результаты benchmark](docs/benchmark-results.md) — зафиксированные запуски, метрики и hashes
 
 ## Лицензия
 

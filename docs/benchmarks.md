@@ -1,5 +1,9 @@
 # External benchmarks
 
+Проверенный снимок последних полных запусков, включая точную конфигурацию,
+метрики и SHA-256 локальных артефактов, находится в
+[`benchmark-results.md`](benchmark-results.md).
+
 `vtc benchmark` запускает публичные наборы через тот же `SimplePipeline`, что и
 обычный анализ. Локальная команда `vtc evaluate` остается быстрым regression
 suite проекта; ее результаты нельзя агрегировать с внешними benchmark-ами.
@@ -49,7 +53,13 @@ vtc benchmark run cwe-bench-java --cwe CWE-22 --limit 10 --seed 42 --backend llm
 явном `--limit` и детерминирован `--seed`. Без лимита выполняется весь выбранный
 набор. `--refresh-specs` запрещает чтение Stage 1 cache; запись кэша остается
 включенной для последующего воспроизводимого повтора.
-`--retry-errors` повторно запускает только CWE-Bench cases со статусом `error`
+`--cache-only` выполняет повторный Stage 2/3/4 расчёт только из уже сохранённых
+Stage 1 ответов и гарантирует отсутствие новых LLM-запросов. Любой cache miss
+становится ошибкой; с `--fail-fast` прогон немедленно останавливается, а не
+подменяет пропуск FN. В этом режиме LLM-клиент не создаётся, а graph enrichment
+должен быть выключен. Опции `--cache-only` и `--refresh-specs` несовместимы.
+`--retry-errors` повторно запускает CWE-Bench cases со статусом `error` или
+`analysis_complete=false`
 в совместимом checkpoint; сохраненные `tp`, `fn` и unscored-строки не меняются.
 Глобальная нагрузка на LLM ограничивается через
 `--max-concurrent-llm-requests` независимо от числа одновременно
@@ -191,23 +201,34 @@ testcase. Incomplete extraction и ошибки batch-а исключаются 
 и отдельно уменьшают execution coverage.
 
 Project-mode использует ограниченные по размеру пакеты Stage 1 и Stage 2. Для
-проектов крупнее 20 000 Java-файлов LLM по-прежнему анализирует каждый выбранный
+проектов крупнее 2 000 Java-файлов LLM по-прежнему анализирует каждый выбранный
 файл. После Stage 1 строится компактный глобальный индекс определений и вызовов,
 а NetworkX-граф получает endpoint-файлы и connector-файлы на поддерживаемых
-направленных путях source-to-sink. Межфайловые bridges разрешаются только для
-глобально уникального владельца метода. Если индекс или retained slice не
-помещается в safety limit, сохраненные находки не теряются, но отрицательный
-результат остается execution error, а не FN.
+направленных путях source-to-sink. Перед поиском путей граф дополнительно
+сужается до пересечения bounded forward closure sources и bounded reverse
+closure sinks; любой путь в пределах `MAX_PATH_LENGTH` полностью содержится в
+этом пересечении. Межфайловые bridges разрешаются только для глобально
+уникального владельца метода. Обычный анализ может ограничить retained slice
+через `MAX_ENDPOINT_GRAPH_FILES` и при превышении завершится fail-closed
+execution error, а не FN. Внешние benchmark принудительно ставят этот параметр
+в `0` и строят полный точный call-slice: локальный профиль не может скрыто
+ограничить coverage.
 
 Усеченный Stage 1 ответ рекурсивно дробится до отдельных методов. Крупный
 одиночный метод дополнительно делится на перекрывающиеся source-фрагменты с
 сохранением абсолютных line offsets; небольшой неделимый ответ получает budget
-до `LLM_TRUNCATION_MAX_TOKENS`. `MAX_CANDIDATE_CHAINS` применяется как
-детерминированный глобальный top-k по confidence source/sink, а не как первые
-K пар в порядке обхода. Metrics получает `candidate_selection_limited=true`,
-`candidate_pairs_ranked` и `candidate_pairs_ranked_out`. Это ограниченная
-политика выбора, а не execution error; неполными по-прежнему считаются только
+до `LLM_TRUNCATION_MAX_TOKENS`. В benchmark-конфигурации `MAX_CANDIDATE_CHAINS=0`:
+Stage 2 проверяет все графово достижимые source/sink пары без confidence
+top-k. Положительное значение сознательно включает safety limit и отражает
+отсечение в `candidate_selection_limited`, `candidate_pairs_ranked` и
+`candidate_pairs_ranked_out`. Неполными по-прежнему считаются только
 ошибки extraction, graph slice и endpoint retention.
+
+Полный Stage 2 пишет progress и ETA каждые 10 000 пар. Stage 3 строит
+индексы CFG и разбирает source context один раз на файловую группу.
+Кэш verification применяется только к цепочкам с полностью одинаковыми
+endpoint, path, location, snippet и sanitizer inputs; выходные цепочки не
+сливаются и метрики не меняются.
 
 ### CWE-Bench-Java
 
@@ -250,4 +271,34 @@ JSON фиксирует upstream SHA, backend (`llm`, `static`, `hybrid`), мо�
 
 Checkpoint имеет версионированную схему. Изменение контракта verified-only
 инвалидирует старый checkpoint автоматически, поэтому результаты до и после
-изменения нельзя смешать или продолжить одним файлом.
+изменения нельзя смешать или продолжить одним файлом. Fingerprint также
+содержит SHA-256 всех Python-модулей `src`, поэтому checkpoint не объединяет
+cases, рассчитанные разными версиями реализации.
+
+## Мониторинг длительного запуска
+
+Для benchmark, запущенного как `vtc-benchmark.service`, состояние и ресурсы
+показывает сам systemd:
+
+```bash
+systemctl show vtc-benchmark.service \
+  -p ActiveState -p SubState -p MainPID -p MemoryCurrent
+```
+
+Последние записи и live-журнал доступны через `journalctl`:
+
+```bash
+journalctl -u vtc-benchmark.service -n 50 -o cat --no-pager
+journalctl -u vtc-benchmark.service -f -o cat
+```
+
+Чтобы оставить только прогресс, предупреждения и ошибки:
+
+```bash
+journalctl -u vtc-benchmark.service -f -o cat \
+  | rg --line-buffered 'CWE-Bench case|OWASP batch|Stage [1-4]|Summary:|WARNING|ERROR'
+```
+
+Checkpoint сохраняется в `evaluation/benchmarks/<suite>/` и удаляется после
+полностью успешного завершения. При execution/extraction/analysis errors он
+остается доступен для `--retry-errors`.

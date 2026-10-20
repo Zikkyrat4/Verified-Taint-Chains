@@ -1,5 +1,6 @@
 """Tests for pipeline orchestrator."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import networkx as nx
@@ -73,6 +74,22 @@ class TestSimplePipeline:
         mock_create_llm.assert_not_called()
         assert pipeline.llm_client is None
         assert pipeline.spec_extractor.analysis_backend == "static"
+
+    @patch("src.pipeline.orchestrator.create_llm_client")
+    def test_cache_only_does_not_create_llm_client(self, mock_create_llm, tmp_path):
+        config = PipelineConfig(
+            llm_api_key="unused",
+            analysis_backend="llm",
+            cache_only=True,
+            cache_dir=str(tmp_path),
+            llm_graph_enrichment_enabled=False,
+        )
+
+        pipeline = SimplePipeline(config)
+
+        mock_create_llm.assert_not_called()
+        assert pipeline.llm_client is None
+        assert pipeline.spec_extractor.cache_only is True
 
     def test_init_no_config(self):
         with pytest.raises(ValueError, match="config is required"):
@@ -427,6 +444,151 @@ class TestRunProject:
         assert set(selected) == {str(controller), str(service), str(repository)}
         assert str(unrelated) not in selected
 
+    def test_large_project_call_slice_drops_disconnected_endpoint_files(
+        self, test_config, tmp_path
+    ):
+        connected = tmp_path / "Connected.java"
+        source_only = tmp_path / "SourceOnly.java"
+        sink_only = tmp_path / "SinkOnly.java"
+        connected.write_text(
+            "class Connected { void run(String input) { db.run(input); } }"
+        )
+        source_only.write_text(
+            "class SourceOnly { void read(String input) { store(input); } }"
+        )
+        sink_only.write_text(
+            "class SinkOnly { void write(String value) { db.run(value); } }"
+        )
+
+        def make_source(path, function):
+            return Source(
+                location=CodeLocation(
+                    file_path=str(path), line_number=1, function_name=function
+                ),
+                variable_name="input",
+                type="user_input",
+                confidence=0.9,
+                code_snippet=path.read_text(),
+            )
+
+        def make_sink(path, function):
+            return Sink(
+                location=CodeLocation(
+                    file_path=str(path), line_number=1, function_name=function
+                ),
+                variable_name="value",
+                type="sql",
+                confidence=0.9,
+                code_snippet=path.read_text(),
+                vulnerability_type=VulnerabilityType.SQL_INJECTION,
+            )
+
+        connected_source = make_source(connected, "run")
+        disconnected_source = make_source(source_only, "read")
+        connected_sink = make_sink(connected, "run")
+        disconnected_sink = make_sink(sink_only, "write")
+        files = [str(connected), str(source_only), str(sink_only)]
+        endpoint_code = {path: Path(path).read_text() for path in files}
+        pipeline = SimplePipeline(test_config)
+
+        selected, complete = pipeline._select_taint_reachable_files(
+            files,
+            endpoint_code,
+            {
+                str(connected): [connected_source],
+                str(source_only): [disconnected_source],
+                str(sink_only): [],
+            },
+            {
+                str(connected): [connected_sink],
+                str(source_only): [],
+                str(sink_only): [disconnected_sink],
+            },
+        )
+
+        assert complete is True
+        assert set(selected) == {str(connected)}
+
+    def test_large_project_call_slice_requires_both_endpoint_sides(
+        self, test_config, tmp_path
+    ):
+        source_file = tmp_path / "Source.java"
+        source_file.write_text("class Source { void run(String input) {} }")
+        source = Source(
+            location=CodeLocation(
+                file_path=str(source_file), line_number=1, function_name="run"
+            ),
+            variable_name="input",
+            type="user_input",
+            confidence=0.9,
+            code_snippet=source_file.read_text(),
+        )
+        pipeline = SimplePipeline(test_config)
+
+        selected, complete = pipeline._select_taint_reachable_files(
+            [str(source_file)],
+            {str(source_file): source_file.read_text()},
+            {str(source_file): [source]},
+            {str(source_file): []},
+        )
+
+        assert complete is True
+        assert selected == {}
+
+    @pytest.mark.asyncio
+    async def test_large_project_graph_reuses_call_index_ast(
+        self, test_config, tmp_path
+    ):
+        source_file = tmp_path / "Source.java"
+        sink_file = tmp_path / "Sink.java"
+        source_file.write_text(
+            "class Source { void read(String input) { write(input); } }"
+        )
+        sink_file.write_text(
+            "class Sink { void write(String value) { db.run(value); } }"
+        )
+        source = Source(
+            location=CodeLocation(
+                file_path=str(source_file), line_number=1, function_name="read"
+            ),
+            variable_name="input",
+            type="user_input",
+            confidence=0.9,
+            code_snippet=source_file.read_text(),
+        )
+        sink = Sink(
+            location=CodeLocation(
+                file_path=str(sink_file), line_number=1, function_name="write"
+            ),
+            variable_name="value",
+            type="sql",
+            confidence=0.9,
+            code_snippet=sink_file.read_text(),
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+        files = [str(source_file), str(sink_file)]
+        file_sources = {str(source_file): [source], str(sink_file): []}
+        file_sinks = {str(source_file): [], str(sink_file): [sink]}
+        endpoint_code = {path: Path(path).read_text() for path in files}
+        pipeline = SimplePipeline(test_config)
+        parser_spy = MagicMock(wraps=pipeline.spec_extractor.ast_parser)
+        pipeline.spec_extractor.ast_parser = parser_spy
+
+        selected, complete = pipeline._select_taint_reachable_files(
+            files, endpoint_code, file_sources, file_sinks
+        )
+        function_parses = parser_spy.extract_functions.call_count
+        call_parses = parser_spy.extract_method_calls.call_count
+        await pipeline._build_scoped_graph(
+            selected, file_sources, file_sinks
+        )
+
+        assert complete is True
+        assert function_parses == len(files)
+        assert call_parses == len(files)
+        assert parser_spy.extract_functions.call_count == function_parses
+        assert parser_spy.extract_method_calls.call_count == call_parses
+
     @pytest.mark.asyncio
     async def test_unverifiable_chain_is_not_reported_as_verified(
         self, test_config
@@ -717,22 +879,34 @@ class TestRunProject:
             confidence=0.9,
             code_snippet='request.getParameter("q")',
         )
+        sink = Sink(
+            location=CodeLocation(file_path=str(source_file), line_number=1),
+            variable_name="q",
+            type="File Access",
+            confidence=0.9,
+            code_snippet="new File(q)",
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+        )
         endpoint_spec = Specification(
             sources=[source],
-            sinks=[],
+            sinks=[sink],
             llm_model=test_config.llm_model,
         )
-        empty_spec = Specification(
-            sources=[],
-            sinks=[],
+        other_source = source.model_copy(deep=True)
+        other_source.location.file_path = str(other_file)
+        other_sink = sink.model_copy(deep=True)
+        other_sink.location.file_path = str(other_file)
+        other_spec = Specification(
+            sources=[other_source],
+            sinks=[other_sink],
             llm_model=test_config.llm_model,
         )
         mock_extractor = MagicMock()
         mock_extractor.extract = AsyncMock(
-            side_effect=[endpoint_spec, empty_spec]
+            side_effect=[endpoint_spec, other_spec]
         )
         monkeypatch.setattr(SimplePipeline, "FULL_PROJECT_GRAPH_FILE_LIMIT", 1)
-        monkeypatch.setattr(SimplePipeline, "MAX_ENDPOINT_GRAPH_FILES", 0)
+        test_config.max_endpoint_graph_files = 1
         snapshots = []
 
         pipeline = SimplePipeline(test_config)
@@ -744,13 +918,73 @@ class TestRunProject:
         )
 
         assert len(snapshots) == 1
-        assert snapshots[0]["sources"] == [source]
+        assert snapshots[0]["sources"] == [source, other_source]
         assert snapshots[0]["stage1_complete"] is True
         assert snapshots[0]["resource_limit_reached"] is True
         assert result["metrics"]["analysis_complete"] is False
         assert "Stage 2 endpoint-file retention limit was reached" in result[
             "metrics"
         ]["analysis_errors"]
+
+    @pytest.mark.asyncio
+    async def test_large_project_applies_limit_after_exact_call_slice(
+        self, test_config, tmp_path, monkeypatch
+    ):
+        connected_file = tmp_path / "Connected.java"
+        disconnected_file = tmp_path / "Disconnected.java"
+        connected_file.write_text(
+            'class Connected { void run(String q) { new File(q); } }'
+        )
+        disconnected_file.write_text(
+            'class Disconnected { String q = request.getParameter("q"); }'
+        )
+        connected_source = Source(
+            location=CodeLocation(file_path=str(connected_file), line_number=1),
+            variable_name="q",
+            type="User Input",
+            confidence=0.9,
+            code_snippet="String q",
+        )
+        connected_sink = Sink(
+            location=CodeLocation(file_path=str(connected_file), line_number=1),
+            variable_name="q",
+            type="File Access",
+            confidence=0.9,
+            code_snippet="new File(q)",
+            vulnerability_type=VulnerabilityType.PATH_TRAVERSAL,
+        )
+        disconnected_source = connected_source.model_copy(deep=True)
+        disconnected_source.location.file_path = str(disconnected_file)
+        mock_extractor = MagicMock()
+        mock_extractor.extract = AsyncMock(
+            side_effect=[
+                Specification(
+                    sources=[connected_source],
+                    sinks=[connected_sink],
+                    llm_model=test_config.llm_model,
+                ),
+                Specification(
+                    sources=[disconnected_source],
+                    sinks=[],
+                    llm_model=test_config.llm_model,
+                ),
+            ]
+        )
+        monkeypatch.setattr(SimplePipeline, "FULL_PROJECT_GRAPH_FILE_LIMIT", 1)
+        test_config.max_endpoint_graph_files = 1
+        snapshots = []
+        pipeline = SimplePipeline(test_config)
+        pipeline.spec_extractor = mock_extractor
+
+        result = await pipeline.run_project(
+            [str(connected_file), str(disconnected_file)],
+            on_stage1_complete=snapshots.append,
+        )
+
+        assert snapshots[0]["resource_limit_reached"] is False
+        assert result["metrics"]["analysis_complete"] is True
+        assert result["metrics"]["graph_candidate_files"] == 1
+        assert result["metrics"]["analysis_errors"] == []
 
     @pytest.mark.asyncio
     async def test_run_project_fast_prefilter_excludes_irrelevant(

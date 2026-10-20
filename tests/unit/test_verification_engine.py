@@ -248,6 +248,43 @@ class TestVerificationEngine:
         assert results["total"] == 0
         assert results["avg_confidence"] == 0.0
 
+    def test_verify_all_chains_reuses_exact_equivalent_result(
+        self, cfg_config, sample_chain
+    ):
+        duplicate = sample_chain.model_copy(deep=True)
+        duplicate.id = "duplicate-chain"
+        engine = VerificationEngine(cfg_config)
+
+        with patch.object(
+            engine, "verify_chain", wraps=engine.verify_chain
+        ) as verify:
+            results = engine.verify_all_chains(
+                [sample_chain, duplicate], SAMPLE_CODE
+            )
+
+        assert verify.call_count == 1
+        assert results["total"] == 2
+        assert results["verification_cache_hits"] == 1
+        assert duplicate.verification_status == sample_chain.verification_status
+
+    def test_verification_cache_keeps_distinct_paths_separate(
+        self, cfg_config, sample_chain
+    ):
+        distinct = sample_chain.model_copy(deep=True)
+        distinct.id = "distinct-chain"
+        distinct.path[-1].code_snippet = "executeDifferent(query);"
+        engine = VerificationEngine(cfg_config)
+
+        with patch.object(
+            engine, "verify_chain", wraps=engine.verify_chain
+        ) as verify:
+            results = engine.verify_all_chains(
+                [sample_chain, distinct], SAMPLE_CODE
+            )
+
+        assert verify.call_count == 2
+        assert results["verification_cache_hits"] == 0
+
     def test_verify_all_chains_scoped_uses_only_referenced_file(
         self, cfg_config, sample_chain
     ):

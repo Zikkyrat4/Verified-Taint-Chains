@@ -1,7 +1,7 @@
 """Control Flow Graph-based verification with proper CFG building."""
 
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, FrozenSet, List, Optional, Set
 
 import networkx as nx
 
@@ -103,6 +103,9 @@ class CFGVerifier:
         self.next_block_id = 0
         self.limit_exceeded = False
         self.limit_reason = ""
+        self._definition_blocks: Dict[str, List[int]] = {}
+        self._use_blocks: Dict[str, List[int]] = {}
+        self._reachable_blocks: Dict[int, FrozenSet[int]] = {}
 
         logger.debug(
             "Initialized CFGVerifier with "
@@ -117,6 +120,9 @@ class CFGVerifier:
         self.next_block_id = 0
         self.limit_exceeded = False
         self.limit_reason = ""
+        self._definition_blocks = {}
+        self._use_blocks = {}
+        self._reachable_blocks = {}
         return self.cfg
 
     def _skip_cfg(self, reason: str) -> nx.DiGraph:
@@ -168,12 +174,26 @@ class CFGVerifier:
         except CFGComplexityLimit as error:
             return self._skip_cfg(str(error))
 
+        self._index_variables()
+
         logger.debug(
             f"Built CFG: {self.cfg.number_of_nodes()} blocks, "
             f"{self.cfg.number_of_edges()} edges"
         )
 
         return self.cfg
+
+    def _index_variables(self) -> None:
+        """Index variable occurrences once for repeated chain verification."""
+        definition_blocks: Dict[str, List[int]] = {}
+        use_blocks: Dict[str, List[int]] = {}
+        for block_id, block in self.blocks.items():
+            for variable in block.definitions:
+                definition_blocks.setdefault(variable, []).append(block_id)
+            for variable in block.uses:
+                use_blocks.setdefault(variable, []).append(block_id)
+        self._definition_blocks = definition_blocks
+        self._use_blocks = use_blocks
 
     def _parse_statements(
         self,
@@ -441,12 +461,12 @@ class CFGVerifier:
             return False
 
         # Find blocks containing source and sink
-        source_blocks = self._find_blocks_with_variable(source_var, 'definition')
-        sink_blocks = self._find_blocks_with_variable(sink_var, 'use')
+        source_blocks = self._definition_blocks.get(source_var, [])
+        sink_blocks = self._use_blocks.get(sink_var, [])
 
         if not source_blocks:
             # Method parameters are used but not explicitly defined via assignment
-            source_blocks = self._find_blocks_with_variable(source_var, 'use')
+            source_blocks = self._use_blocks.get(source_var, [])
 
         if not source_blocks:
             logger.debug(f"Source variable '{source_var}' not defined in any block")
@@ -456,15 +476,21 @@ class CFGVerifier:
             logger.debug(f"Sink variable '{sink_var}' not used in any block")
             return False
 
-        # Check if any source block can reach any sink block
+        sink_block_set = set(sink_blocks)
         for src_block in source_blocks:
-            for sink_block in sink_blocks:
-                if self._is_reachable_with_loops(src_block, sink_block):
-                    logger.debug(
-                        f"CFG reachability: {source_var} (block {src_block}) -> "
-                        f"{sink_var} (block {sink_block}): TRUE"
-                    )
-                    return True
+            reachable = self._reachable_blocks.get(src_block)
+            if reachable is None:
+                # The old bounded BFS marked every block visited on first
+                # encounter, so its result is exactly ordinary graph
+                # reachability. Cache that closure for all later chains.
+                reachable = frozenset({src_block, *nx.descendants(self.cfg, src_block)})
+                self._reachable_blocks[src_block] = reachable
+            if not reachable.isdisjoint(sink_block_set):
+                logger.debug(
+                    f"CFG reachability: {source_var} (block {src_block}) -> "
+                    f"{sink_var}: TRUE"
+                )
+                return True
 
         logger.debug(f"CFG reachability: {source_var} -> {sink_var}: FALSE")
         return False

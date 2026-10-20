@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+from time import monotonic
 from typing import Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -58,6 +59,114 @@ def candidate_pair_priority(source: Source, sink: Sink) -> Tuple[object, ...]:
         sink.confidence,
         stable_identity,
     )
+
+
+def bounded_taint_slice_nodes(
+    graph: nx.DiGraph,
+    source_ids: Set[str],
+    sink_ids: Set[str],
+    max_length: int,
+) -> Set[str]:
+    """Return a safe node superset for bounded source-to-sink paths."""
+    if not source_ids or not sink_ids:
+        return set()
+
+    def reachable(seeds: Set[str], *, reverse: bool) -> Set[str]:
+        visited = set(seeds)
+        frontier = set(seeds)
+        for _depth in range(max_length):
+            next_frontier: Set[str] = set()
+            for node in frontier:
+                adjacent = (
+                    graph.predecessors(node)
+                    if reverse
+                    else graph.successors(node)
+                )
+                for neighbor in adjacent:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        next_frontier.add(neighbor)
+            if not next_frontier:
+                break
+            frontier = next_frontier
+        return visited
+
+    forward = reachable(source_ids, reverse=False)
+    backward = reachable(sink_ids, reverse=True)
+    return forward & backward
+
+
+def bounded_endpoint_reachability(
+    graph: nx.DiGraph,
+    source_ids: Set[str],
+    sink_ids: Set[str],
+    max_length: int,
+) -> Dict[str, Set[str]]:
+    """Map source IDs to sinks with bounded reverse bitset propagation.
+
+    Sink bits move over predecessor edges for at most ``max_length`` rounds.
+    Processing weak components independently keeps masks local and prevents a
+    high-numbered sink in another component from inflating every Python int.
+    Complexity is bounded by graph propagation rather than endpoint products
+    or one graph traversal per source/sink.
+    """
+    if not source_ids or not sink_ids:
+        return {}
+
+    reachable: Dict[str, Set[str]] = {}
+    endpoint_components = 0
+    for component_index, component in enumerate(
+        nx.weakly_connected_components(graph), 1
+    ):
+        component_sources = source_ids & component
+        component_sinks = sink_ids & component
+        if not component_sources or not component_sinks:
+            continue
+        endpoint_components += 1
+
+        ordered_sinks = sorted(component_sinks)
+        sink_index = {sink_id: index for index, sink_id in enumerate(ordered_sinks)}
+        reached: Dict[str, int] = {
+            sink_id: 1 << index for sink_id, index in sink_index.items()
+        }
+        frontier = dict(reached)
+
+        for _depth in range(max_length):
+            next_frontier: Dict[str, int] = {}
+            for node, bits in frontier.items():
+                for predecessor in graph.predecessors(node):
+                    known = reached.get(predecessor, 0) | next_frontier.get(
+                        predecessor, 0
+                    )
+                    new_bits = bits & ~known
+                    if new_bits:
+                        next_frontier[predecessor] = (
+                            next_frontier.get(predecessor, 0) | new_bits
+                        )
+            if not next_frontier:
+                break
+            for node, bits in next_frontier.items():
+                reached[node] = reached.get(node, 0) | bits
+            frontier = next_frontier
+
+        for source_id in component_sources:
+            mask = reached.get(source_id, 0)
+            if not mask:
+                continue
+            found_sinks: Set[str] = set()
+            while mask:
+                bit = mask & -mask
+                found_sinks.add(ordered_sinks[bit.bit_length() - 1])
+                mask ^= bit
+            reachable[source_id] = found_sinks
+
+        if endpoint_components % 100 == 0:
+            logger.info(
+                f"Stage 2 reachability: {endpoint_components} endpoint "
+                f"components processed ({component_index} total components)"
+            )
+
+    return reachable
 
 
 def _display_node_name(graph: nx.DiGraph, node_name: str) -> str:
@@ -451,8 +560,9 @@ class SimpleBFSPathFinder:
                 graph node ID (e.g. ``"File.java:varName"``).  When *None*
                 (default) the plain ``variable_name`` is used — fully
                 backward-compatible with the old single-file behaviour.
-            max_chains: Maximum retained candidates. The finder records
-                ``limit_exceeded`` when additional reachable pairs exist.
+            max_chains: Optional maximum retained candidates. ``0`` checks
+                every graph-reachable pair. Positive values enable an explicit
+                confidence-ranked safety limit.
 
         Returns:
             List of TaintChain objects representing found vulnerabilities.
@@ -471,66 +581,102 @@ class SimpleBFSPathFinder:
         logger.info(f"Finding paths between {len(sources)} sources and {len(sinks)} sinks")
 
         # Pre-compute reachable sink names for each source (BFS bounded by max_length)
-        sink_graph_ids = {_node_id(s) for s in sinks}
-        source_reachable: Dict[str, Set[str]] = {}
-        for source in sources:
-            src_id = _node_id(source)
-            if src_id not in self.graph:
-                continue
-            reachable: Set[str] = set()
-            queue = [(src_id, 0)]
-            visited: Set[str] = set()
-            while queue:
-                node, depth = queue.pop(0)
-                if node in visited or depth > max_length:
-                    continue
-                visited.add(node)
-                if node in sink_graph_ids:
-                    reachable.add(node)
-                for neighbor in self.graph.neighbors(node):
-                    if neighbor not in visited:
-                        queue.append((neighbor, depth + 1))
-            source_reachable[src_id] = reachable
+        sinks_by_graph_id: Dict[str, List[Sink]] = {}
+        for sink in sinks:
+            sink_id = _node_id(sink)
+            if sink_id in self.graph:
+                sinks_by_graph_id.setdefault(sink_id, []).append(sink)
+        sink_graph_ids = set(sinks_by_graph_id)
+        source_graph_ids = {
+            source_id
+            for source in sources
+            if (source_id := _node_id(source)) in self.graph
+        }
+        source_reachable = bounded_endpoint_reachability(
+            self.graph,
+            source_graph_ids,
+            sink_graph_ids,
+            max_length,
+        )
+        if sources:
+            logger.info(
+                f"Stage 2 reachability complete: {len(sources)} sources, "
+                f"{sum(map(len, source_reachable.values()))} reachable sink nodes"
+            )
 
-        skipped = 0
-        candidate_pairs: List[Tuple[Tuple[object, ...], Source, Sink]] = []
+        candidate_pairs: List[Tuple[Source, Sink]] = []
         for source in sources:
             src_id = _node_id(source)
             reachable = source_reachable.get(src_id, set())
-            for sink in sinks:
-                sink_id = _node_id(sink)
-                if sink_id not in reachable:
-                    skipped += 1
-                    continue
-                # Skip cross-method pairs: if both have function_name set
-                # and they differ, these variables are in different scopes.
-                # Only apply within the same file — cross-file pairs are allowed.
-                src_func = getattr(source.location, "function_name", None)
-                sink_func = getattr(sink.location, "function_name", None)
-                src_file = getattr(source.location, "file_path", "")
-                sink_file = getattr(sink.location, "file_path", "")
-                if (src_func and sink_func and src_func != sink_func
-                        and src_file and sink_file and src_file == sink_file):
-                    logger.debug(
-                        f"Skipping cross-method pair: {source.variable_name} "
-                        f"({src_func}) -> {sink.variable_name} ({sink_func})"
-                    )
-                    continue
+            for sink_id in sorted(reachable):
+                for sink in sinks_by_graph_id.get(sink_id, []):
+                    # Skip cross-method pairs: if both have function_name set
+                    # and they differ, these variables are in different scopes.
+                    # Only apply within the same file; cross-file pairs are allowed.
+                    src_func = getattr(source.location, "function_name", None)
+                    sink_func = getattr(sink.location, "function_name", None)
+                    src_file = getattr(source.location, "file_path", "")
+                    sink_file = getattr(sink.location, "file_path", "")
+                    if (
+                        src_func
+                        and sink_func
+                        and src_func != sink_func
+                        and src_file
+                        and sink_file
+                        and src_file == sink_file
+                    ):
+                        logger.debug(
+                            f"Skipping cross-method pair: {source.variable_name} "
+                            f"({src_func}) -> {sink.variable_name} ({sink_func})"
+                        )
+                        continue
 
-                candidate_pairs.append(
-                    (candidate_pair_priority(source, sink), source, sink)
-                )
+                    candidate_pairs.append((source, sink))
 
-        candidate_pairs.sort(key=lambda item: item[0], reverse=True)
         self.candidate_pairs_ranked = len(candidate_pairs)
         self.reachable_pairs_seen = len(candidate_pairs)
+        if max_chains and len(candidate_pairs) > max_chains:
+            candidate_pairs.sort(
+                key=lambda item: candidate_pair_priority(item[0], item[1]),
+                reverse=True,
+            )
+            self.ranked_out_count = len(candidate_pairs) - max_chains
+            self.limit_exceeded = True
+            logger.warning(
+                "Global top-k candidate selection retained "
+                f"{max_chains} of {len(candidate_pairs)} ranked "
+                "graph-reachable endpoint pairs"
+            )
+            candidate_pairs = candidate_pairs[:max_chains]
 
-        for pair_index, (_, source, sink) in enumerate(candidate_pairs):
+        path_started_at = monotonic()
+        last_path_key: tuple[str, str, int] | None = None
+        last_path_nodes: Optional[List[str]] = None
+
+        def log_path_progress(completed: int) -> None:
+            elapsed = max(monotonic() - path_started_at, 1e-9)
+            rate = completed / elapsed
+            remaining = len(candidate_pairs) - completed
+            eta = remaining / rate if rate > 0 else 0.0
+            logger.info(
+                f"Stage 2 paths [{completed}/{len(candidate_pairs)}]: "
+                f"{rate:.1f} pairs/s, ETA ~{eta:.0f}s, chains={len(chains)}"
+            )
+
+        for pair_index, (source, sink) in enumerate(candidate_pairs, start=1):
+            if pair_index > 1 and (pair_index - 1) % 10_000 == 0:
+                log_path_progress(pair_index - 1)
             src_id = _node_id(source)
             sink_id = _node_id(sink)
             logger.debug(f"Checking path: {src_id} -> {sink_id}")
 
-            path_nodes = self.find_path(src_id, sink_id, max_length)
+            path_key = (src_id, sink_id, max_length)
+            if path_key == last_path_key:
+                path_nodes = last_path_nodes
+            else:
+                path_nodes = self.find_path(src_id, sink_id, max_length)
+            last_path_key = path_key
+            last_path_nodes = path_nodes
 
             if path_nodes:
                 # Filter self-loops: a single-node path means
@@ -549,19 +695,15 @@ class SimpleBFSPathFinder:
                 )
                 chains.append(chain)
                 logger.debug(f"Found chain: {src_id} -> {sink_id}")
-                if max_chains and len(chains) >= max_chains:
-                    self.ranked_out_count = len(candidate_pairs) - pair_index - 1
-                    self.limit_exceeded = self.ranked_out_count > 0
-                    if self.limit_exceeded:
-                        logger.warning(
-                            "Global top-k candidate selection retained "
-                            f"{max_chains} of {len(candidate_pairs)} ranked "
-                            "graph-reachable endpoint pairs"
-                        )
-                    break
 
+        if candidate_pairs:
+            log_path_progress(len(candidate_pairs))
+
+        skipped = len(sources) * len(sinks) - self.candidate_pairs_ranked
         if skipped:
-            logger.debug(f"Skipped {skipped} unreachable source-sink pairs via pre-filter")
+            logger.debug(
+                f"Skipped {skipped} unreachable source-sink pairs via pre-filter"
+            )
         logger.info(f"Found {len(chains)} taint chains total")
         return chains
 

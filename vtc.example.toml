@@ -37,7 +37,8 @@ max_concurrent_llm_requests = 5
 [graph]
 pathfinding_algorithm = "astar"
 max_path_length = 15
-max_candidate_chains = 10000
+max_candidate_chains = 0
+max_endpoint_graph_files = 10000
 use_joern = false
 use_semantic_heuristic = true
 use_codebert = false

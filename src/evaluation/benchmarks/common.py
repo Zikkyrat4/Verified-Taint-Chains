@@ -19,6 +19,7 @@ TYPE_TO_CWE = {
     "path_traversal": "CWE-22",
     "xxe": "CWE-611",
     "ssrf": "CWE-918",
+    "deserialization": "CWE-502",
     "unsafe_deserialization": "CWE-502",
     "code_injection": "CWE-94",
     "open_redirect": "CWE-601",
@@ -48,6 +49,7 @@ def build_pipeline_config(
     llm_analysis_mode: str,
     cache_dir: Path,
     refresh_specs: bool,
+    cache_only: bool = False,
     max_concurrent_files: int | None = None,
     max_concurrent_functions: int | None = None,
     max_concurrent_llm_requests: int | None = None,
@@ -63,12 +65,25 @@ def build_pipeline_config(
             "unverified candidates are not benchmark findings"
         )
     config.max_files = 0
+    # Benchmark completeness takes precedence over the interactive analyzer's
+    # fail-closed memory guard. A resource failure remains an explicit error;
+    # silently dropping reachable endpoint files would bias recall.
+    config.max_endpoint_graph_files = 0
     # External benchmark results must cover every selected source file. The
     # targeted/exhaustive method policy remains explicit, but the debug-only
     # file prefilter must never be inherited from a local profile.
     config.fast_prefilter = False
     config.cache_dir = str(cache_dir)
+    if refresh_specs and cache_only:
+        raise BenchmarkError("--refresh-specs and --cache-only are mutually exclusive")
+    if cache_only and backend == "static":
+        raise BenchmarkError("--cache-only applies only to llm and hybrid backends")
+    if cache_only and config.llm_graph_enrichment_enabled:
+        raise BenchmarkError(
+            "--cache-only requires LLM_GRAPH_ENRICHMENT_ENABLED=false"
+        )
     config.cache_read_enabled = not refresh_specs
+    config.cache_only = cache_only
     if max_concurrent_files is not None:
         config.max_concurrent_files = max_concurrent_files
     if max_concurrent_functions is not None:

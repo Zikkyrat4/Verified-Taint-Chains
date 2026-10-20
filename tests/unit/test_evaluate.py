@@ -235,9 +235,10 @@ def test_report_serializes_analysis_backend() -> None:
     assert "Model: `test-model`" in markdown
 
 
-def test_analysis_metadata_records_material_configuration() -> None:
+def test_analysis_metadata_records_material_configuration(monkeypatch) -> None:
     from src.core.config import PipelineConfig
 
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
     config = PipelineConfig(
         llm_api_key="test-key",
         analysis_backend="llm",
@@ -253,6 +254,9 @@ def test_analysis_metadata_records_material_configuration() -> None:
     assert metadata["fast_prefilter"] is False
     assert metadata["use_codebert"] is False
     assert metadata["cache_read_enabled"] is False
+    assert metadata["cache_only"] is False
+    assert len(metadata["implementation_digest"]) == 64
+    assert metadata["python_hash_seed"] == "0"
     assert metadata["graph_builder"] == "joern_pdg_with_fallback"
     assert metadata["graph_llm_calls_enabled"] is False
     assert metadata["llm_temperature"] == 0.0

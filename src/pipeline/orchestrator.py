@@ -34,6 +34,7 @@ from src.stage2_path_discovery.llm_graph_builder import LLMGraphBuilder
 from src.stage2_path_discovery.simple_path_finder import (
     SimpleBFSPathFinder,
     SimpleGraphBuilder,
+    bounded_taint_slice_nodes,
 )
 from src.stage3_verification.simple_verifier import SimpleCFGVerifier
 from src.stage3_verification.verification_engine import VerificationEngine
@@ -56,10 +57,12 @@ class SimplePipeline:
 
     # A full project graph keeps source text, AST-derived metadata and NetworkX
     # objects for every file. Above this size, retain graph state only for files
-    # where Stage 1 found an endpoint. These are resource limits, not benchmark
-    # hints: they are independent of labels, CWE ids and expected locations.
-    FULL_PROJECT_GRAPH_FILE_LIMIT = 20_000
-    MAX_ENDPOINT_GRAPH_FILES = 10_000
+    # on supported source-to-sink call slices. These are resource limits, not
+    # benchmark hints: they are independent of labels, CWE ids and locations.
+    # NetworkX and the per-file AST metadata become expensive well before
+    # 20k files. Stage 1 still analyzes every file; this threshold only switches
+    # Stage 2 to the provably reachable call slice.
+    FULL_PROJECT_GRAPH_FILE_LIMIT = 2_000
     STAGE1_BATCH_MULTIPLIER = 4
     GRAPH_BATCH_MULTIPLIER = 2
 
@@ -77,10 +80,12 @@ class SimplePipeline:
 
         self.config = config
 
-        # The static backend is a standalone baseline and must not initialize,
-        # authenticate, or accidentally call an LLM provider.
+        # Static and cache-only execution must not initialize, authenticate,
+        # or accidentally call an LLM provider.
         self.llm_client = (
-            None if config.analysis_backend == "static" else create_llm_client(config)
+            None
+            if config.analysis_backend == "static" or config.cache_only
+            else create_llm_client(config)
         )
 
         # Optional persistent cache for Stage 1 specifications. Resolved here
@@ -107,6 +112,7 @@ class SimplePipeline:
             fast_prefilter=config.fast_prefilter,
             cache_identity=config.stage1_cache_identity(),
             cache_read_enabled=config.cache_read_enabled,
+            cache_only=config.cache_only,
         )
 
         # Stage 2-3 components initialized in run()
@@ -117,6 +123,12 @@ class SimplePipeline:
         self.verification_engine: Optional[VerificationEngine] = None
         self._encoding_warning_paths: set[str] = set()
         self._global_method_owner: Optional[Dict[str, str]] = None
+        self._stage2_functions_by_file: Optional[
+            Dict[str, List[Dict[str, Any]]]
+        ] = None
+        self._stage2_calls_by_file: Optional[
+            Dict[str, List[Dict[str, Any]]]
+        ] = None
 
         # Stage 4 components
         self.explainer = ExplanationGenerator(llm_client=self.llm_client)
@@ -158,6 +170,8 @@ class SimplePipeline:
         self.verifier = None
         self.verification_engine = None
         self._global_method_owner = None
+        self._stage2_functions_by_file = None
+        self._stage2_calls_by_file = None
 
     async def run(
         self,
@@ -368,31 +382,41 @@ class SimplePipeline:
         method index therefore lets us prove that files outside the forward /
         reverse intersection cannot participate in any supported taint path.
         """
+        self._stage2_retention_limit_reached = False
         source_files = {path for path, values in file_sources.items() if values}
         sink_files = {path for path, values in file_sinks.items() if values}
         if not source_files or not sink_files:
             self._global_method_owner = {}
-            return dict(endpoint_code), True
+            self._stage2_functions_by_file = {}
+            self._stage2_calls_by_file = {}
+            return {}, True
 
         parser = self.spec_extractor.ast_parser
         definitions: Dict[str, set[str]] = {}
         calls_by_file: Dict[str, set[str]] = {}
+        functions_by_file: Dict[str, List[Dict[str, Any]]] = {}
+        call_records_by_file: Dict[str, List[Dict[str, Any]]] = {}
         code_cache = dict(endpoint_code)
         index_complete = True
 
+        index_started = time.monotonic()
         for index, path in enumerate(java_files, 1):
             try:
                 code = code_cache.get(path)
                 if code is None:
                     code = self._read_source_file(path)
+                functions = parser.extract_functions(code)
+                call_records = parser.extract_method_calls(code)
+                functions_by_file[path] = functions
+                call_records_by_file[path] = call_records
                 method_names = {
                     str(method.get("name", ""))
-                    for method in parser.extract_functions(code)
+                    for method in functions
                     if method.get("name")
                 }
                 calls = {
                     str(call.get("name", ""))
-                    for call in parser.extract_method_calls(code)
+                    for call in call_records
                     if call.get("name")
                 }
                 calls_by_file[path] = calls
@@ -404,9 +428,14 @@ class SimplePipeline:
                     f"Call-index extraction failed for {path}: "
                     f"{type(error).__name__}: {error}"
                 )
-            if index % 10_000 == 0:
+            if index % 500 == 0 or index == len(java_files):
+                elapsed = time.monotonic() - index_started
+                rate = index / elapsed if elapsed else 0.0
+                remaining = len(java_files) - index
+                eta = remaining / rate if rate else 0.0
                 logger.info(
-                    f"Large-project call index: {index}/{len(java_files)} files"
+                    f"Large-project call index: {index}/{len(java_files)} files "
+                    f"({rate:.1f} files/s, ETA ~{eta:.0f}s)"
                 )
 
         unique_owner = {
@@ -446,7 +475,11 @@ class SimplePipeline:
 
         forward = distances(source_files, forward_graph)
         backward = distances(sink_files, reverse_graph)
-        selected = set(endpoint_code) | (set(forward) & set(backward))
+        # Only files reachable from a source and able to reach a sink can occur
+        # in a path supported by the graph builder. A source-only or sink-only
+        # endpoint file outside this intersection cannot produce a chain; retaining
+        # every endpoint file made exhaustive LLM output explode Stage 2.
+        selected = set(forward) & set(backward)
         ordered = sorted(
             selected,
             key=lambda path: (
@@ -456,14 +489,29 @@ class SimplePipeline:
             ),
         )
         selection_complete = index_complete
-        if len(ordered) > self.MAX_ENDPOINT_GRAPH_FILES:
-            ordered = ordered[: self.MAX_ENDPOINT_GRAPH_FILES]
+        retention_limit = self.config.max_endpoint_graph_files
+        if retention_limit > 0 and len(ordered) > retention_limit:
+            ordered = ordered[:retention_limit]
             selection_complete = False
+            self._stage2_retention_limit_reached = True
             logger.warning(
                 "Taint-reachable graph slice exceeds retention limit: "
                 f"keeping {len(ordered)}/{len(selected)} files"
             )
 
+        # Reuse the expensive AST extraction while building the selected graph.
+        # Keep only retained files so large benchmark cases do not hold index
+        # metadata for thousands of irrelevant files.
+        self._stage2_functions_by_file = {
+            path: functions_by_file[path]
+            for path in ordered
+            if path in functions_by_file
+        }
+        self._stage2_calls_by_file = {
+            path: call_records_by_file[path]
+            for path in ordered
+            if path in call_records_by_file
+        }
         selected_code = {
             path: code_cache[path] if path in code_cache else self._read_source_file(path)
             for path in ordered
@@ -685,17 +733,15 @@ class SimplePipeline:
                     all_sinks.extend(spec.sinks)
                     all_sanitizers.extend(spec.sanitizers)
                     has_endpoint = bool(spec.sources or spec.sinks)
-                    retain_file = not large_project_mode or has_endpoint
-                    if (
-                        retain_file
-                        and large_project_mode
-                        and java_file not in file_code_map
-                        and len(file_code_map) >= self.MAX_ENDPOINT_GRAPH_FILES
-                    ):
-                        resource_limit_reached = True
-                        retain_file = False
-                    if retain_file:
+                    if not large_project_mode:
                         file_code_map[java_file] = code
+                        file_sources[java_file] = list(spec.sources)
+                        file_sinks[java_file] = list(spec.sinks)
+                    elif has_endpoint:
+                        # Keep the complete endpoint inventory, but not source
+                        # text for every endpoint file. The global call index
+                        # selects the exact supported source-to-sink slice and
+                        # reloads code only for that much smaller set.
                         file_sources[java_file] = list(spec.sources)
                         file_sinks[java_file] = list(spec.sinks)
                     if not spec.extraction_complete:
@@ -769,15 +815,10 @@ class SimplePipeline:
 
                 has_endpoint = bool(retry_spec.sources or retry_spec.sinks)
                 if not large_project_mode or has_endpoint:
-                    if (
-                        java_file in file_code_map
-                        or len(file_code_map) < self.MAX_ENDPOINT_GRAPH_FILES
-                    ):
+                    if not large_project_mode:
                         file_code_map[java_file] = code
-                        file_sources[java_file] = list(retry_spec.sources)
-                        file_sinks[java_file] = list(retry_spec.sinks)
-                    else:
-                        resource_limit_reached = True
+                    file_sources[java_file] = list(retry_spec.sources)
+                    file_sinks[java_file] = list(retry_spec.sinks)
                 logger.info(f"Stage 1 retry recovered {java_file}")
 
             # Include irrelevant files' code for graph building (no LLM calls)
@@ -787,7 +828,7 @@ class SimplePipeline:
                     file_sources.setdefault(java_file, [])
                     file_sinks.setdefault(java_file, [])
 
-            graph_selection_complete = not resource_limit_reached
+            graph_selection_complete = True
             if large_project_mode:
                 selected_code, call_slice_complete = self._select_taint_reachable_files(
                     java_files,
@@ -803,7 +844,10 @@ class SimplePipeline:
                     path: file_sinks.get(path, []) for path in file_code_map
                 }
                 graph_selection_complete = (
-                    graph_selection_complete and call_slice_complete
+                    call_slice_complete
+                )
+                resource_limit_reached = bool(
+                    getattr(self, "_stage2_retention_limit_reached", False)
                 )
 
             graph_file_count = len(file_code_map)
@@ -1117,7 +1161,17 @@ class SimplePipeline:
             """Attach source coordinates and keep equal-name endpoints distinct."""
             lines = code.splitlines()
             function_ranges = []
-            for function in self.spec_extractor.ast_parser.extract_functions(code):
+            cached_functions = (
+                self._stage2_functions_by_file.get(fpath)
+                if self._stage2_functions_by_file is not None
+                else None
+            )
+            functions = (
+                cached_functions
+                if cached_functions is not None
+                else self.spec_extractor.ast_parser.extract_functions(code)
+            )
+            for function in functions:
                 start = int(function.get("start_line", 0) or 0)
                 end = int(function.get("end_line", start) or start)
                 function_ranges.append((start, end, function.get("name")))
@@ -1240,6 +1294,7 @@ class SimplePipeline:
             self.config.max_concurrent_files * self.GRAPH_BATCH_MULTIPLIER,
         )
         graph_items = list(file_code_map.items())
+        graph_started = time.monotonic()
         for batch_start in range(0, len(graph_items), graph_batch_size):
             batch = graph_items[batch_start : batch_start + graph_batch_size]
             built_graphs = await asyncio.gather(
@@ -1266,6 +1321,16 @@ class SimplePipeline:
                 merged.add_edges_from(g.edges(data=True))
 
             del built_graphs
+            built_count = min(batch_start + len(batch), len(graph_items))
+            if built_count % 250 == 0 or built_count == len(graph_items):
+                elapsed = time.monotonic() - graph_started
+                rate = built_count / elapsed if elapsed else 0.0
+                remaining = len(graph_items) - built_count
+                eta = remaining / rate if rate else 0.0
+                logger.info(
+                    f"Stage 2 graph build: {built_count}/{len(graph_items)} files "
+                    f"({rate:.1f} files/s, ETA ~{eta:.0f}s)"
+                )
 
         # Inter-file bridges are derived from actual call sites and positional
         # formal parameters. Equal variable names alone are not data flow.
@@ -1274,14 +1339,24 @@ class SimplePipeline:
         class_to_file: Dict[str, str] = {}
         superclass_by_file: Dict[str, Optional[str]] = {}
         if allow_interfile_bridges:
-            for fpath, code in file_code_map.items():
+            for file_index, (fpath, code) in enumerate(file_code_map.items(), 1):
                 classes = ast_parser.extract_classes(code)
                 if classes:
                     class_name = classes[0].get("name")
                     if class_name:
                         class_to_file[class_name] = fpath
                     superclass_by_file[fpath] = classes[0].get("superclass")
-                for method in ast_parser.extract_functions(code):
+                cached_functions = (
+                    self._stage2_functions_by_file.get(fpath)
+                    if self._stage2_functions_by_file is not None
+                    else None
+                )
+                functions = (
+                    cached_functions
+                    if cached_functions is not None
+                    else ast_parser.extract_functions(code)
+                )
+                for method in functions:
                     params: List[str] = []
                     for raw in method.get("parameters", []):
                         cleaned = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", raw)
@@ -1291,19 +1366,44 @@ class SimplePipeline:
                     method_defs.setdefault(method.get("name", ""), []).append(
                         (fpath, params, method.get("class_name"))
                     )
+                if file_index % 500 == 0 or file_index == len(file_code_map):
+                    logger.info(
+                        f"Stage 2 method index: {file_index}/{len(file_code_map)} "
+                        "files"
+                    )
 
         bridge_count = 0
         caller_files = file_code_map.items() if allow_interfile_bridges else ()
-        for caller_path, code in caller_files:
+        for caller_index, (caller_path, code) in enumerate(caller_files, 1):
             caller_prefix = _file_scope(caller_path)
-            for call in ast_parser.extract_method_calls(code):
-                targets = [
-                    target for target in method_defs.get(call["name"], [])
-                    if target[0] != caller_path
-                ]
+            cached_calls = (
+                self._stage2_calls_by_file.get(caller_path)
+                if self._stage2_calls_by_file is not None
+                else None
+            )
+            calls = (
+                cached_calls
+                if cached_calls is not None
+                else ast_parser.extract_method_calls(code)
+            )
+            for call in calls:
+                definitions = method_defs.get(call["name"], [])
                 if self._global_method_owner is not None:
                     owner = self._global_method_owner.get(call["name"])
-                    targets = [target for target in targets if target[0] == owner]
+                    # The large-project call index deliberately supports only
+                    # uniquely owned methods. Skip ambiguous names before
+                    # scanning their potentially thousands of definitions.
+                    if owner is None:
+                        continue
+                    targets = [
+                        target for target in definitions
+                        if target[0] == owner and target[0] != caller_path
+                    ]
+                else:
+                    targets = [
+                        target for target in definitions
+                        if target[0] != caller_path
+                    ]
                 if call.get("receiver") == "super":
                     superclass = superclass_by_file.get(caller_path)
                     super_file = class_to_file.get(superclass or "")
@@ -1358,6 +1458,11 @@ class SimplePipeline:
                         logger.debug(
                             f"Argument bridge: {argument_node} -> {parameter_node}"
                         )
+            if caller_index % 500 == 0 or caller_index == len(file_code_map):
+                logger.info(
+                    f"Stage 2 call bridges: {caller_index}/{len(file_code_map)} "
+                    f"files ({bridge_count} bridges)"
+                )
 
         logger.info(
             f"Scoped graph: {merged.number_of_nodes()} nodes, "
@@ -1402,6 +1507,57 @@ class SimplePipeline:
             allow_interfile_bridges=allow_interfile_bridges,
         )
 
+        # Large-project mode may omit endpoint files that cannot occur on any
+        # call path supported by the graph builder. Do not feed those endpoints
+        # into pathfinding: the old Cartesian source/sink loop spent hours on
+        # objects that had no scoped graph node.
+        scoped_sources = [source for source in all_sources if id(source) in scope_map]
+        scoped_sinks = [sink for sink in all_sinks if id(sink) in scope_map]
+        graph_files = set(file_code_map)
+        scoped_sanitizers = [
+            sanitizer
+            for sanitizer in all_sanitizers
+            if sanitizer.location.file_path in graph_files
+        ]
+
+        # Generated projects can produce million-node identifier graphs even
+        # after file-level slicing. Every valid bounded chain lies in both the
+        # forward source closure and reverse sink closure, so remove all other
+        # nodes before pair discovery without changing supported findings.
+        graph_nodes_before_slice = graph.number_of_nodes()
+        graph_edges_before_slice = graph.number_of_edges()
+        taint_slice_nodes = bounded_taint_slice_nodes(
+            graph,
+            {scope_map[id(source)] for source in scoped_sources},
+            {scope_map[id(sink)] for sink in scoped_sinks},
+            self.config.max_path_length,
+        )
+        if len(taint_slice_nodes) < graph_nodes_before_slice:
+            graph = graph.subgraph(taint_slice_nodes).copy()
+            scoped_sources = [
+                source
+                for source in scoped_sources
+                if scope_map[id(source)] in graph
+            ]
+            scoped_sinks = [
+                sink
+                for sink in scoped_sinks
+                if scope_map[id(sink)] in graph
+            ]
+            logger.info(
+                f"Stage 2 node slice: {graph_nodes_before_slice} -> "
+                f"{graph.number_of_nodes()} nodes, "
+                f"{graph.number_of_edges()} edges"
+            )
+        if (
+            len(scoped_sources) != len(all_sources)
+            or len(scoped_sinks) != len(all_sinks)
+        ):
+            logger.info(
+                f"Stage 2 endpoint scope: {len(scoped_sources)}/{len(all_sources)} "
+                f"sources, {len(scoped_sinks)}/{len(all_sinks)} sinks"
+            )
+
         # Find all chains using selected algorithm
         if self.config.pathfinding_algorithm == "astar":
             if self.config.use_semantic_heuristic:
@@ -1419,10 +1575,10 @@ class SimplePipeline:
             self.path_finder = SimpleBFSPathFinder(graph)
 
         chains = self.path_finder.find_all_chains(
-            sources=all_sources,
-            sinks=all_sinks,
+            sources=scoped_sources,
+            sinks=scoped_sinks,
             max_length=self.config.max_path_length,
-            sanitizers=all_sanitizers,
+            sanitizers=scoped_sanitizers,
             node_id_map=scope_map,
             max_chains=self.config.max_candidate_chains,
         )
@@ -1521,6 +1677,8 @@ class SimplePipeline:
                 for result in verification_evidence
             ),
             "explanations_generated": len(explanations),
+            "graph_nodes_before_taint_slice": graph_nodes_before_slice,
+            "graph_edges_before_taint_slice": graph_edges_before_slice,
             "graph_nodes": graph.number_of_nodes(),
             "graph_edges": graph.number_of_edges(),
             "candidate_chains_truncated": candidate_chains_truncated,
@@ -1558,6 +1716,7 @@ class SimplePipeline:
     ) -> List[TaintChain]:
         """Reject cross-method name collisions unless a class field carries flow."""
         kept: List[TaintChain] = []
+        dropped = 0
         node_id_map = node_id_map or {}
         for chain in chains:
             source_location = chain.source.location
@@ -1580,13 +1739,18 @@ class SimplePipeline:
                 for node in endpoint_nodes
             )
             if same_file and different_functions and not has_field_bridge:
-                logger.info(
+                dropped += 1
+                logger.debug(
                     "Filtered cross-function name collision: "
                     f"{source_location.function_name}:{chain.source.variable_name} -> "
                     f"{sink_location.function_name}:{chain.sink.variable_name}"
                 )
                 continue
             kept.append(chain)
+        if dropped:
+            logger.info(
+                f"Cross-function filter: removed {dropped} name-collision chains"
+            )
         return kept
 
     @staticmethod

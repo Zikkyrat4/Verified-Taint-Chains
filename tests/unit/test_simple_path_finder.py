@@ -1,10 +1,14 @@
 """Unit tests for simple path finder."""
 
+from unittest.mock import patch
+
 import networkx as nx
 
 from src.stage2_path_discovery.simple_path_finder import (
     SimpleGraphBuilder,
     SimpleBFSPathFinder,
+    bounded_endpoint_reachability,
+    bounded_taint_slice_nodes,
 )
 from src.core.models import (
     Source,
@@ -356,6 +360,51 @@ class TestSimpleBFSPathFinderFindAllChains:
 
         assert len(chains) == 0
 
+    def test_find_all_chains_indexes_sinks_once(self) -> None:
+        class CountingSinks(list):
+            def __init__(self, values):
+                super().__init__(values)
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        location = CodeLocation(file_path="Test.java", line_number=1)
+        sources = [
+            Source(
+                location=location,
+                variable_name=f"source_{index}",
+                type="user_input",
+                confidence=0.9,
+                code_snippet="",
+            )
+            for index in range(20)
+        ]
+        sinks = CountingSinks(
+            [
+                Sink(
+                    location=location,
+                    variable_name=f"sink_{index}",
+                    type="sql",
+                    confidence=0.9,
+                    code_snippet="",
+                    vulnerability_type=VulnerabilityType.SQL_INJECTION,
+                )
+                for index in range(20)
+            ]
+        )
+        graph = nx.DiGraph()
+        graph.add_nodes_from(source.variable_name for source in sources)
+        graph.add_nodes_from(sink.variable_name for sink in sinks)
+        graph.add_edge("source_0", "sink_0")
+        sinks.iterations = 0
+
+        chains = SimpleBFSPathFinder(graph).find_all_chains(sources, sinks)
+
+        assert len(chains) == 1
+        assert sinks.iterations == 1
+
     def test_find_all_chains_returns_taint_chain_objects(self) -> None:
         """Test that returned chains are proper TaintChain objects."""
         graph = nx.DiGraph()
@@ -447,6 +496,65 @@ class TestSimpleBFSPathFinderFindAllChains:
         assert finder.reachable_pairs_seen == 2
         assert finder.candidate_pairs_ranked == 2
         assert finder.ranked_out_count == 1
+
+    def test_duplicate_graph_pair_reuses_path_without_dropping_chain(self) -> None:
+        graph = nx.DiGraph([("source", "sink")])
+        location = CodeLocation(file_path="Test.java", line_number=1)
+        source = Source(
+            location=location,
+            variable_name="source",
+            type="user_input",
+            confidence=0.9,
+            code_snippet="source",
+        )
+        sink = Sink(
+            location=location,
+            variable_name="sink",
+            type="sql",
+            confidence=0.9,
+            code_snippet="sink",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+        finder = SimpleBFSPathFinder(graph)
+
+        with patch.object(finder, "find_path", wraps=finder.find_path) as find:
+            chains = finder.find_all_chains([source, source], [sink])
+
+        assert len(chains) == 2
+        assert find.call_count == 1
+
+    def test_zero_candidate_limit_checks_every_reachable_pair(self) -> None:
+        graph = nx.DiGraph([("first", "sink"), ("second", "sink")])
+        location = CodeLocation(file_path="Test.java", line_number=1)
+        sources = [
+            Source(
+                location=location,
+                variable_name=name,
+                type="user_input",
+                confidence=confidence,
+                code_snippet=name,
+            )
+            for name, confidence in (("first", 0.1), ("second", 0.9))
+        ]
+        sink = Sink(
+            location=location,
+            variable_name="sink",
+            type="sql",
+            confidence=0.9,
+            code_snippet="sink",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+
+        finder = SimpleBFSPathFinder(graph)
+        chains = finder.find_all_chains(sources, [sink], max_chains=0)
+
+        assert {chain.source.variable_name for chain in chains} == {
+            "first",
+            "second",
+        }
+        assert finder.limit_exceeded is False
+        assert finder.reachable_pairs_seen == 2
+        assert finder.ranked_out_count == 0
 
 
 class TestCrossMethodFiltering:
@@ -617,6 +725,80 @@ class TestCrossMethodFiltering:
 
 class TestReachabilityPreFilter:
     """Tests for BFS reachability pre-filter in find_all_chains."""
+
+    def test_adaptive_reachability_matches_pairwise_shortest_paths(self) -> None:
+        for source_count, sink_count in ((12, 4), (4, 12)):
+            graph = nx.gnp_random_graph(60, 0.04, seed=source_count, directed=True)
+            source_ids = {str(index) for index in range(source_count)}
+            sink_ids = {
+                str(index) for index in range(60 - sink_count, 60)
+            }
+            graph = nx.relabel_nodes(graph, str)
+            max_length = 6
+            expected = {}
+            for source_id in source_ids:
+                reachable = {
+                    sink_id
+                    for sink_id in sink_ids
+                    if nx.has_path(graph, source_id, sink_id)
+                    and nx.shortest_path_length(graph, source_id, sink_id)
+                    <= max_length
+                }
+                if reachable:
+                    expected[source_id] = reachable
+
+            actual = bounded_endpoint_reachability(
+                graph, source_ids, sink_ids, max_length
+            )
+
+            assert actual == expected
+
+    def test_adaptive_reachability_groups_endpoint_boundaries(self) -> None:
+        graph = nx.DiGraph()
+        for source_id in ("source_1", "source_2"):
+            graph.add_edge(
+                source_id,
+                "input",
+                edge_type="endpoint_binding",
+            )
+        graph.add_edges_from([("input", "copy"), ("copy", "output")])
+        for sink_id in ("sink_1", "sink_2"):
+            graph.add_edge(
+                "output",
+                sink_id,
+                edge_type="endpoint_binding",
+            )
+
+        actual = bounded_endpoint_reachability(
+            graph,
+            {"source_1", "source_2"},
+            {"sink_1", "sink_2"},
+            max_length=4,
+        )
+
+        assert actual == {
+            "source_1": {"sink_1", "sink_2"},
+            "source_2": {"sink_1", "sink_2"},
+        }
+
+    def test_bounded_taint_slice_preserves_paths_and_drops_unrelated_nodes(
+        self,
+    ) -> None:
+        graph = nx.DiGraph()
+        graph.add_edges_from(
+            [
+                ("source", "first"),
+                ("first", "second"),
+                ("second", "sink"),
+                ("unrelated_source", "unrelated_sink"),
+            ]
+        )
+
+        selected = bounded_taint_slice_nodes(
+            graph, {"source"}, {"sink"}, max_length=3
+        )
+
+        assert selected == {"source", "first", "second", "sink"}
 
     def test_prefilter_finds_reachable_chains(self) -> None:
         """Reachable source-sink pairs must still produce chains."""

@@ -33,11 +33,12 @@ from src.evaluation.benchmarks.repository import checkout_revision, validate_rev
 from src.evaluation.engine import analysis_metadata
 from src.pipeline.orchestrator import SimplePipeline
 from src.pipeline.source_discovery import find_java_files, is_test_path
+from src.stage1_llm_inference.ast_parser import JavaASTParser
 from src.utils.logger import get_logger
 
 logger = get_logger()
 SPEC = BENCHMARKS["cwe-bench-java"]
-CHECKPOINT_SCHEMA_VERSION = 7
+CHECKPOINT_SCHEMA_VERSION = 9
 
 
 def _optional_int(value: str | None) -> int:
@@ -337,19 +338,82 @@ def _file_matches(reported: str, expected: str) -> bool:
     return bool(without_repo_prefix) and reported_norm.endswith("/" + without_repo_prefix)
 
 
+def _resolve_oracle_files(
+    expected: str, source_files: Sequence[str]
+) -> tuple[str, ...]:
+    """Resolve an oracle path, preferring its unambiguous full suffix."""
+    expected_norm = expected.replace("\\", "/").lower().lstrip("/")
+    if PurePosixPath(expected_norm).suffix.lower() != ".java":
+        return ()
+
+    normalized = [
+        (str(Path(source).resolve()).replace("\\", "/"), source)
+        for source in source_files
+    ]
+    direct = [
+        resolved
+        for resolved, _source in normalized
+        if resolved.lower() == expected_norm
+        or resolved.lower().endswith("/" + expected_norm)
+    ]
+    if direct:
+        return tuple(sorted(set(direct)))
+
+    parts = PurePosixPath(expected_norm).parts
+    without_repo_prefix = "/".join(parts[1:])
+    if not without_repo_prefix:
+        return ()
+    return tuple(sorted({
+        resolved
+        for resolved, _source in normalized
+        if resolved.lower().endswith("/" + without_repo_prefix)
+    }))
+
+
 def _oracle_file_available(expected: str, source_files: Sequence[str]) -> bool:
     """Return whether a fixed-revision oracle path maps to analyzed Java source."""
-    if PurePosixPath(expected.replace("\\", "/")).suffix.lower() != ".java":
-        return False
-    return any(_file_matches(source_file, expected) for source_file in source_files)
+    return bool(_resolve_oracle_files(expected, source_files))
 
 
 def _finding_nodes(finding: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [finding["source"], *finding.get("path", []), finding["sink"]]
 
 
-def _touches_file(finding: Mapping[str, Any], expected_file: str) -> bool:
-    return any(_file_matches(str(node.get("file", "")), expected_file) for node in _finding_nodes(finding))
+def _finding_paths_outside_sources(
+    findings: Sequence[Mapping[str, Any]], source_files: Sequence[str]
+) -> list[str]:
+    """Return reported node paths that do not belong to this benchmark case."""
+    normalized_sources = {
+        str(Path(path).resolve()).replace("\\", "/") for path in source_files
+    }
+    invalid = {
+        str(node.get("file", "")).replace("\\", "/")
+        for finding in findings
+        for node in _finding_nodes(finding)
+        if not node.get("file")
+        or str(Path(str(node.get("file", ""))).resolve()).replace("\\", "/")
+        not in normalized_sources
+    }
+    return sorted(invalid)
+
+
+def _touches_file(
+    finding: Mapping[str, Any],
+    expected_file: str,
+    resolved_files: Sequence[str] | None = None,
+) -> bool:
+    if resolved_files is None:
+        return any(
+            _file_matches(str(node.get("file", "")), expected_file)
+            for node in _finding_nodes(finding)
+        )
+    allowed = set(resolved_files)
+    return any(
+        str(Path(str(node.get("file", ""))).resolve()).replace("\\", "/")
+        in allowed
+        for node in _finding_nodes(finding)
+        if node.get("file")
+    )
 
 
 def _class_matches(reported: str, expected: str) -> bool:
@@ -360,9 +424,26 @@ def _class_matches(reported: str, expected: str) -> bool:
 
 
 def _touches_scope(
-    finding: Mapping[str, Any], target: FixTarget
+    finding: Mapping[str, Any],
+    target: FixTarget,
+    resolved_scopes: Sequence[tuple[str, int, int]] | None = None,
 ) -> bool:
     if not target.has_method_identity:
+        return False
+    if resolved_scopes is not None:
+        for node in _finding_nodes(finding):
+            if not node.get("file"):
+                continue
+            reported = str(Path(str(node["file"])).resolve()).replace("\\", "/")
+            try:
+                line = int(node.get("line", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if any(
+                reported == expected and start <= line <= end
+                for expected, start, end in resolved_scopes
+            ):
+                return True
         return False
     for node in _finding_nodes(finding):
         if not _file_matches(str(node.get("file", "")), target.file):
@@ -378,16 +459,66 @@ def _touches_scope(
 
 
 def _matches_annotation(
-    finding: Mapping[str, Any], annotation: EndpointAnnotation, tolerance: int = 5
+    finding: Mapping[str, Any],
+    annotation: EndpointAnnotation,
+    tolerance: int = 5,
+    resolved_files: Sequence[str] | None = None,
 ) -> bool:
     source = finding["source"]
     sink = finding["sink"]
+    if resolved_files is None:
+        source_file_matches = _file_matches(
+            str(source.get("file", "")), annotation.file
+        )
+        sink_file_matches = _file_matches(
+            str(sink.get("file", "")), annotation.file
+        )
+    else:
+        allowed = set(resolved_files)
+        source_file_matches = bool(source.get("file")) and (
+            str(Path(str(source["file"])).resolve()).replace("\\", "/") in allowed
+        )
+        sink_file_matches = bool(sink.get("file")) and (
+            str(Path(str(sink["file"])).resolve()).replace("\\", "/") in allowed
+        )
     return (
-        _file_matches(str(source.get("file", "")), annotation.file)
-        and _file_matches(str(sink.get("file", "")), annotation.file)
+        source_file_matches
+        and sink_file_matches
         and abs(int(source.get("line", 0) or 0) - annotation.source_line) <= tolerance
         and abs(int(sink.get("line", 0) or 0) - annotation.sink_line) <= tolerance
     )
+
+
+def _ground_fix_target_scopes(
+    target: FixTarget,
+    resolved_files: Sequence[str],
+    parser: JavaASTParser,
+    functions_by_file: dict[str, list[dict[str, Any]]],
+) -> tuple[tuple[str, int, int], ...]:
+    """Map a fixed-revision method oracle onto real vulnerable-source ranges."""
+    scopes: list[tuple[str, int, int]] = []
+    for source_file in resolved_files:
+        if source_file not in functions_by_file:
+            try:
+                source = Path(source_file).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                functions_by_file[source_file] = parser.extract_functions(source)
+            except OSError:
+                functions_by_file[source_file] = []
+        for function in functions_by_file[source_file]:
+            if function.get("name") != target.method or not _class_matches(
+                str(function.get("class_name", "") or ""), target.class_name
+            ):
+                continue
+            try:
+                start = int(function.get("start_line", 0) or 0)
+                end = int(function.get("end_line", start) or start)
+            except (TypeError, ValueError):
+                continue
+            if start > 0 and end >= start:
+                scopes.append((source_file, start, end))
+    return tuple(scopes)
 
 
 def score_case(
@@ -420,21 +551,60 @@ def score_case(
     oracle_source_checked = source_files is not None
     unavailable_fix_targets = 0
     unavailable_annotations = 0
+    target_scopes: dict[FixTarget, tuple[tuple[str, int, int], ...]] = {}
+    annotation_files: dict[EndpointAnnotation, tuple[str, ...]] = {}
+    oracle_files_by_name: dict[str, tuple[str, ...]] = {}
     if source_files is not None:
+        parser = JavaASTParser()
+        functions_by_file: dict[str, list[dict[str, Any]]] = {}
+        for target in fix_targets:
+            resolved = oracle_files_by_name.setdefault(
+                target.file, _resolve_oracle_files(target.file, source_files)
+            )
+            scopes = _ground_fix_target_scopes(
+                target, resolved, parser, functions_by_file
+            )
+            if scopes:
+                target_scopes[target] = scopes
+        for annotation in annotations:
+            resolved = oracle_files_by_name.setdefault(
+                annotation.file,
+                _resolve_oracle_files(annotation.file, source_files),
+            )
+            if resolved:
+                annotation_files[annotation] = resolved
         available_fix_targets = tuple(
-            target
-            for target in fix_targets
-            if _oracle_file_available(target.file, source_files)
+            target for target in fix_targets if target in target_scopes
         )
         available_annotations = tuple(
-            annotation
-            for annotation in annotations
-            if _oracle_file_available(annotation.file, source_files)
+            annotation for annotation in annotations if annotation in annotation_files
         )
         unavailable_fix_targets = len(fix_targets) - len(available_fix_targets)
         unavailable_annotations = len(annotations) - len(available_annotations)
         fix_targets = available_fix_targets
         annotations = available_annotations
+
+    def touches_target(finding: Mapping[str, Any], target: FixTarget) -> bool:
+        grounded = target_scopes.get(target) if source_files is not None else None
+        return _touches_scope(finding, target, grounded)
+
+    def matches_annotation(
+        finding: Mapping[str, Any], annotation: EndpointAnnotation
+    ) -> bool:
+        grounded = (
+            annotation_files.get(annotation) if source_files is not None else None
+        )
+        return _matches_annotation(finding, annotation, resolved_files=grounded)
+
+    def touches_oracle_file(
+        finding: Mapping[str, Any], expected_file: str
+    ) -> bool:
+        grounded = (
+            oracle_files_by_name.get(expected_file, ())
+            if source_files is not None
+            else None
+        )
+        return _touches_file(finding, expected_file, grounded)
     extraction_errors = dict(extraction_errors or {})
     analysis_errors = list(analysis_errors or ())
     incomplete_reasons = []
@@ -463,13 +633,13 @@ def score_case(
         detected = None
     else:
         detected = any(
-            _touches_scope(finding, target)
+            touches_target(finding, target)
             for finding in same_cwe
             for target in fix_targets
         )
         if not detected and annotations:
             detected = any(
-                _matches_annotation(finding, annotation)
+                matches_annotation(finding, annotation)
                 for finding in same_cwe
                 for annotation in annotations
             )
@@ -482,41 +652,41 @@ def score_case(
             status = "fn"
 
     target_hits = [
-        any(_touches_scope(finding, target) for finding in same_cwe)
+        any(touches_target(finding, target) for finding in same_cwe)
         for target in fix_targets
     ]
     annotation_hits = [
-        any(_matches_annotation(finding, annotation) for finding in same_cwe)
+        any(matches_annotation(finding, annotation) for finding in same_cwe)
         for annotation in annotations
     ]
     target_files = {target.file for target in fix_targets}
     target_files.update(annotation.file for annotation in annotations)
     file_localized = any(
-        _touches_file(finding, target_file)
+        touches_oracle_file(finding, target_file)
         for finding in same_cwe
         for target_file in target_files
     )
     scored_finding_ids = {
         finding["id"]
         for finding in same_cwe
-        if any(_touches_scope(finding, target) for target in fix_targets)
-        or any(_matches_annotation(finding, annotation) for annotation in annotations)
+        if any(touches_target(finding, target) for target in fix_targets)
+        or any(matches_annotation(finding, annotation) for annotation in annotations)
     }
     candidate_detected = any(
-        _touches_scope(finding, target)
+        touches_target(finding, target)
         for finding in candidate_same_cwe
         for target in fix_targets
     ) or any(
-        _matches_annotation(finding, annotation)
+        matches_annotation(finding, annotation)
         for finding in candidate_same_cwe
         for annotation in annotations
     )
     oracle_scope_candidates = [
         finding
         for finding in candidate_pool
-        if any(_touches_scope(finding, target) for target in fix_targets)
+        if any(touches_target(finding, target) for target in fix_targets)
         or any(
-            _matches_annotation(finding, annotation)
+            matches_annotation(finding, annotation)
             for annotation in annotations
         )
     ]
@@ -675,9 +845,9 @@ def _load_checkpoint(
     selected_case_ids: set[int],
     *,
     retry_errors: bool = False,
-) -> tuple[dict[int, dict[str, Any]], str | None, float]:
+) -> tuple[dict[int, dict[str, Any]], str | None, float, list[dict[str, Any]]]:
     if path is None or not path.exists():
-        return {}, None, 0.0
+        return {}, None, 0.0, []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if (
@@ -698,7 +868,7 @@ def _load_checkpoint(
                     f"{path}: {error}"
                 )
             logger.warning(f"Ignoring incompatible CWE-Bench checkpoint at {path}")
-            return {}, None, 0.0
+            return {}, None, 0.0, []
         rows = payload.get("rows")
         if not isinstance(rows, list):
             raise ValueError("rows is not a list")
@@ -710,23 +880,38 @@ def _load_checkpoint(
             if case_id not in selected_case_ids or case_id in seen_case_ids:
                 raise ValueError(f"unexpected or duplicate case id {case_id}")
             seen_case_ids.add(case_id)
-            if retry_errors and row.get("status") == "error":
+            if retry_errors and (
+                row.get("status") == "error"
+                or row.get("analysis_complete", True) is False
+            ):
                 retried_errors += 1
                 continue
             restored[case_id] = row
         started_at = payload.get("started_at")
         duration = max(0.0, float(payload.get("duration_seconds", 0.0)))
+        raw_provenance = payload.get("resume_provenance", [])
+        if not isinstance(raw_provenance, list) or not all(
+            isinstance(item, dict) for item in raw_provenance
+        ):
+            raise ValueError("resume_provenance is not a list of objects")
+        resume_provenance = [dict(item) for item in raw_provenance]
     except (OSError, TypeError, ValueError, json.JSONDecodeError, KeyError) as error:
         logger.warning(f"Ignoring invalid CWE-Bench checkpoint at {path}: {error}")
-        return {}, None, 0.0
+        return {}, None, 0.0, []
     logger.info(
         f"Resuming CWE-Bench from {path}: {len(restored)} completed case(s)"
     )
     if retried_errors:
         logger.info(
-            f"Scheduled {retried_errors} checkpoint error case(s) for retry"
+            f"Scheduled {retried_errors} incomplete/error checkpoint case(s) "
+            "for retry"
         )
-    return restored, str(started_at) if started_at else None, duration
+    return (
+        restored,
+        str(started_at) if started_at else None,
+        duration,
+        resume_provenance,
+    )
 
 
 def _write_checkpoint(
@@ -735,6 +920,8 @@ def _write_checkpoint(
     started_at: str,
     duration_seconds: float,
     rows: Sequence[Mapping[str, Any]],
+    *,
+    resume_provenance: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     if path is None:
         return
@@ -746,6 +933,7 @@ def _write_checkpoint(
             "started_at": started_at,
             "duration_seconds": round(duration_seconds, 3),
             "rows": list(rows),
+            "resume_provenance": list(resume_provenance),
         },
     )
 
@@ -778,6 +966,7 @@ async def run(
     seed: int = 0,
     include_tests: bool = False,
     refresh_specs: bool = False,
+    cache_only: bool = False,
     fail_fast: bool = False,
     retry_errors: bool = False,
     checkpoint_path: Path | None = None,
@@ -820,15 +1009,19 @@ async def run(
         llm_analysis_mode=llm_analysis_mode,
         cache_dir=store_root / "cache" / SPEC.benchmark_id,
         refresh_specs=refresh_specs,
+        cache_only=cache_only,
         max_concurrent_files=max_concurrent_files,
         max_concurrent_functions=max_concurrent_functions,
         max_concurrent_llm_requests=max_concurrent_llm_requests,
     )
     analysis = analysis_metadata(config)
     analysis["evaluation_policy"] = {
+        "benchmark_contract_version": CHECKPOINT_SCHEMA_VERSION,
         "scoring_unit": "target_cve_at_official_fix_scope",
         "target_cwe_required": True,
         "official_fix_class_and_method_required": True,
+        "official_fix_scope_grounding": "vulnerable_source_ast",
+        "oracle_path_resolution": "full_suffix_before_repository_prefix_fallback",
         "fixed_revision_line_fallback": False,
         "curated_endpoint_pairs_secondary": True,
         "unmatched_findings_count_as_fp": False,
@@ -840,7 +1033,12 @@ async def run(
         include_tests=include_tests,
         fail_fast=fail_fast,
     )
-    restored, checkpoint_started_at, accumulated_duration = _load_checkpoint(
+    (
+        restored,
+        checkpoint_started_at,
+        accumulated_duration,
+        resume_provenance,
+    ) = _load_checkpoint(
         checkpoint_path,
         fingerprint,
         {case.case_id for case in cases},
@@ -862,6 +1060,7 @@ async def run(
             started_at,
             accumulated_duration + time.monotonic() - started,
             _merge_checkpoint_rows(cases, restored, rows),
+            resume_provenance=resume_provenance,
         )
 
     # Replace an incompatible checkpoint before the first potentially long case,
@@ -892,7 +1091,7 @@ async def run(
                 result = await pipeline.run_project(java_files, show_progress=False)
                 metrics = result.get("metrics", {})
                 extraction_errors = metrics.get("extraction_errors", {})
-                analysis_errors = metrics.get("analysis_errors", [])
+                analysis_errors = list(metrics.get("analysis_errors", []))
                 findings = confirmed_chain_records(
                     result.get("verified_chains", [])
                 )
@@ -904,10 +1103,21 @@ async def run(
                         *result.get("rejected_chains", []),
                     ]
                 ]
+                invalid_paths = _finding_paths_outside_sources(
+                    candidate_findings, java_files
+                )
+                location_error = None
+                if invalid_paths:
+                    location_error = (
+                        "Pipeline returned chain locations outside the current "
+                        f"case checkout ({len(invalid_paths)} unique path(s))"
+                    )
+                    analysis_errors.append(location_error)
                 rows.append(
                     score_case(
                         case,
                         findings,
+                        error=location_error,
                         files_analyzed=len(java_files),
                         include_tests=include_tests,
                         extraction_errors=extraction_errors,
@@ -989,6 +1199,7 @@ async def run(
                 "cve_hidden_from_checkout_path": True,
                 "public_corpus_pretraining_contamination_possible": True,
             },
+            "checkpoint_resume_provenance": resume_provenance,
         },
         "coverage": {
             "upstream_cases": len(all_cases),

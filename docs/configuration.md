@@ -152,7 +152,8 @@ error и не превращается в отрицательную prediction.
 | `USE_SEMANTIC_HEURISTIC` | Использовать семантическую эвристику в A* | `true`, `false` | `true` |
 | `VTC_USE_CODEBERT` | Загрузить CodeBERT вместо быстрой детерминированной эвристики | `true`, `false` | `false` |
 | `MAX_PATH_LENGTH` | Максимальная длина пути | целое число | `15` |
-| `MAX_CANDIDATE_CHAINS` | Предел сохраняемых кандидатов; переполнение помечается в metrics | целое > 0 | `10000` |
+| `MAX_CANDIDATE_CHAINS` | Опциональный safety limit для кандидатов; `0` проверяет все достижимые пары | целое >= 0 | `0` |
+| `MAX_ENDPOINT_GRAPH_FILES` | Fail-closed лимит файлов в точном Stage 2 call-slice; `0` снимает лимит | целое >= 0 | `10000` |
 | `USE_JOERN` | Использовать Joern для PDG | `true`, `false` | `false` |
 | `LLM_GRAPH_ENRICHMENT_ENABLED` | Добавлять спекулятивные LLM-рёбра поверх AST | `true`, `false` | `false` |
 
@@ -164,8 +165,14 @@ error и не превращается в отрицательную prediction.
 | `SYMBOLIC_TIMEOUT` | Таймаут символьного выполнения (сек.) | целое число | `60` |
 | `VERIFICATION_ENABLED` | Включить верификацию | `true`, `false` | `true` |
 
-`MAX_CANDIDATE_CHAINS` не обрезает результат молча: при превышении анализ
-завершается явной resource-limit ошибкой. В пользовательские findings попадают
+`MAX_CANDIDATE_CHAINS=0` отключает top-k: Stage 2 проверяет все достижимые
+пары source/sink и не ранжирует их по confidence. Положительное значение явно
+включает ограниченный confidence-ranked режим и отражает отсечение в metrics.
+`MAX_ENDPOINT_GRAPH_FILES` не выбирает наиболее вероятные findings: при
+превышении положительного лимита анализ помечается incomplete и не может стать
+FN. Внешние benchmark автоматически используют `0`, потому что скрытое
+усечение call-slice исказило бы recall.
+В пользовательские findings попадают
 только цепочки `verified`. Цепочки `unverifiable` и `false` возвращаются
 отдельно и не учитываются как обнаруженные уязвимости. Внешние benchmark-ы
 требуют `VERIFICATION_ENABLED=true`.

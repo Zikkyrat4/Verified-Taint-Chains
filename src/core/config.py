@@ -42,6 +42,7 @@ CONFIG_SCHEMA: dict[str, frozenset[str]] = {
             "pathfinding_algorithm",
             "max_path_length",
             "max_candidate_chains",
+            "max_endpoint_graph_files",
             "use_joern",
             "use_semantic_heuristic",
             "use_codebert",
@@ -158,7 +159,8 @@ class PipelineConfig:
     ollama_seed: int | None = 42
     ollama_json_format: bool = True
     max_path_length: int = 15
-    max_candidate_chains: int = 10000
+    max_candidate_chains: int = 0
+    max_endpoint_graph_files: int = 10_000
     min_confidence: float = 0.6
     verification_enabled: bool = True
     symbolic_execution_enabled: bool = False
@@ -179,6 +181,7 @@ class PipelineConfig:
     llm_graph_enrichment_confidence: float = 0.7
     cache_enabled: bool = True
     cache_read_enabled: bool = True
+    cache_only: bool = False
     cache_dir: str | None = None
     log_level: str = "INFO"
     log_file: str | None = None
@@ -220,10 +223,18 @@ class PipelineConfig:
             raise ValueError("min_confidence must be between 0.0 and 1.0")
         if self.max_path_length < 1:
             raise ValueError("max_path_length must be at least 1")
-        if self.max_candidate_chains < 1:
-            raise ValueError("max_candidate_chains must be at least 1")
+        if self.max_candidate_chains < 0:
+            raise ValueError("max_candidate_chains must be non-negative")
+        if self.max_endpoint_graph_files < 0:
+            raise ValueError(
+                "max_endpoint_graph_files must be non-negative (0 = unlimited)"
+            )
         if self.pathfinding_algorithm not in ("astar", "bfs"):
             raise ValueError("pathfinding_algorithm must be 'astar' or 'bfs'")
+        if self.cache_only and (not self.cache_enabled or not self.cache_read_enabled):
+            raise ValueError("cache_only requires enabled cache reads")
+        if self.cache_only and self.llm_graph_enrichment_enabled:
+            raise ValueError("cache_only is incompatible with LLM graph enrichment")
         if self.verification_level not in ("cfg", "symbolic", "both"):
             raise ValueError("verification_level must be 'cfg', 'symbolic', or 'both'")
         if self.symbolic_timeout < 1:
@@ -363,7 +374,15 @@ _SETTINGS = (
         "graph",
         "max_candidate_chains",
         ("MAX_CANDIDATE_CHAINS",),
-        10000,
+        0,
+        int,
+    ),
+    _Setting(
+        "max_endpoint_graph_files",
+        "graph",
+        "max_endpoint_graph_files",
+        ("MAX_ENDPOINT_GRAPH_FILES",),
+        10_000,
         int,
     ),
     _Setting("use_joern", "graph", "use_joern", ("USE_JOERN",), False, _parse_bool),
@@ -586,6 +605,7 @@ def config_as_dict(config: PipelineConfig, *, include_sources: bool = False) -> 
             "pathfinding_algorithm": config.pathfinding_algorithm,
             "max_path_length": config.max_path_length,
             "max_candidate_chains": config.max_candidate_chains,
+            "max_endpoint_graph_files": config.max_endpoint_graph_files,
             "use_joern": config.use_joern,
             "use_semantic_heuristic": config.use_semantic_heuristic,
             "use_codebert": config.use_codebert,
@@ -646,7 +666,8 @@ max_concurrent_llm_requests = 5
 [graph]
 pathfinding_algorithm = "astar"
 max_path_length = 15
-max_candidate_chains = 10000
+max_candidate_chains = 0
+max_endpoint_graph_files = 10000
 use_joern = false
 use_semantic_heuristic = true
 use_codebert = false

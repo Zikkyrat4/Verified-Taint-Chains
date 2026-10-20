@@ -21,7 +21,9 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -40,6 +42,25 @@ from src.stage1_llm_inference.spec_cache import (  # noqa: E402
 REAL_WORLD_DIR = ROOT / "tests" / "fixtures" / "real_world"
 EVALUATION_DIR = ROOT / "evaluation"
 DEFAULT_FIXTURES_DIR = REAL_WORLD_DIR / "keycloak"
+
+
+def implementation_digest() -> str:
+    """Fingerprint the loaded Python implementation used by an evaluation.
+
+    Checkpoints can span process restarts. Including all ``src`` modules in
+    their semantic identity prevents rows produced by edited pipeline code
+    from being silently combined with rows from an earlier implementation.
+    """
+    digest = hashlib.sha256()
+    source_root = ROOT / "src"
+    for path in sorted(source_root.rglob("*.py")):
+        relative = path.relative_to(ROOT).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        content = path.read_bytes()
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 def _list_projects() -> List[str]:
@@ -221,6 +242,8 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
     if uses_llm and effective_thinking is None and config.llm_model.lower().startswith("glm-"):
         effective_thinking = "disabled"
     return {
+        "implementation_digest": implementation_digest(),
+        "python_hash_seed": os.environ.get("PYTHONHASHSEED", "random"),
         "config_profile": config.config_profile,
         "backend": config.analysis_backend,
         "llm_analysis_mode": config.llm_analysis_mode if uses_llm else "n/a",
@@ -229,6 +252,7 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
         "min_confidence": config.min_confidence,
         "max_path_length": config.max_path_length,
         "max_candidate_chains": config.max_candidate_chains,
+        "max_endpoint_graph_files": config.max_endpoint_graph_files,
         "pathfinding_algorithm": config.pathfinding_algorithm,
         "verification_enabled": config.verification_enabled,
         "verification_level": config.verification_level,
@@ -252,6 +276,7 @@ def _analysis_metadata(config: Any) -> Dict[str, Any]:
         "fast_prefilter": config.fast_prefilter,
         "cache_enabled": config.cache_enabled,
         "cache_read_enabled": config.cache_read_enabled,
+        "cache_only": config.cache_only,
         "openai_timeout": config.openai_timeout if uses_llm else "n/a",
         "llm_max_retries": config.llm_max_retries if uses_llm else "n/a",
         "llm_max_tokens": config.llm_max_tokens if uses_llm else "n/a",

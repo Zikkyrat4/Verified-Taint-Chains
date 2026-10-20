@@ -9,6 +9,7 @@ from click.testing import CliRunner
 from src.evaluation.benchmarks.catalog import BenchmarkError, case_source_path, normalize_cwe
 from src.evaluation.benchmarks.common import (
     build_pipeline_config,
+    chain_to_record,
     confirmed_chain_records,
 )
 from src.evaluation.benchmarks.cwe_bench_java import (
@@ -16,8 +17,10 @@ from src.evaluation.benchmarks.cwe_bench_java import (
     EndpointAnnotation,
     FixTarget,
     _checkpoint_fingerprint,
+    _finding_paths_outside_sources,
     _load_checkpoint,
     _merge_checkpoint_rows,
+    _resolve_oracle_files,
     _write_checkpoint,
     aggregate_rows,
 )
@@ -43,7 +46,7 @@ from src.evaluation.benchmarks.owasp_java import (
 from src.evaluation.benchmarks.owasp_java import (
     select_cases as select_owasp_cases,
 )
-from src.evaluation.benchmarks.runner import _output_paths
+from src.evaluation.benchmarks.runner import _cwe_report_is_complete, _output_paths
 from src.evaluation.benchmarks.validation import validate_owasp_data
 from src.pipeline.main import cli
 
@@ -130,6 +133,109 @@ def test_benchmark_rejects_non_verified_pipeline_contract() -> None:
         confirmed_chain_records([chain])
 
 
+def test_deserialization_chain_has_canonical_cwe_fallback() -> None:
+    chain = _mock_chain("Deserializer")
+    chain.vulnerability_type.value = "deserialization"
+    chain.sink.cwe_id = None
+
+    assert chain_to_record(chain)["cwe"] == "CWE-502"
+
+
+def test_cwe_benchmark_rejects_locations_from_another_checkout(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "cases/0002/Target.java"
+    stale = tmp_path / "cases/0001/Target.java"
+    current.parent.mkdir(parents=True)
+    current.write_text("class Target {}", encoding="utf-8")
+    finding = _finding(file=str(stale))
+
+    assert _finding_paths_outside_sources([finding], [str(current)]) == [
+        str(stale)
+    ]
+    assert _finding_paths_outside_sources(
+        [_finding(file=str(current))], [str(current)]
+    ) == []
+
+
+def test_cwe_oracle_path_prefers_full_suffix_over_ambiguous_fallback(
+    tmp_path: Path,
+) -> None:
+    direct = tmp_path / "java-sdk/src/main/java/acme/Javascript.java"
+    fallback = (
+        tmp_path
+        / "conductor-clients/java/conductor-java-sdk/sdk/src/main/java/acme/Javascript.java"
+    )
+    direct.parent.mkdir(parents=True)
+    fallback.parent.mkdir(parents=True)
+    direct.write_text("class Javascript {}\n", encoding="utf-8")
+    fallback.write_text("class Javascript {}\n", encoding="utf-8")
+
+    resolved = _resolve_oracle_files(
+        "java-sdk/src/main/java/acme/Javascript.java",
+        (str(fallback), str(direct)),
+    )
+
+    assert resolved == (str(direct.resolve()),)
+
+
+def test_cwe_grounded_scope_does_not_trust_reported_method_metadata(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src/main/java/acme/Target.java"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "class Target {\n"
+        "  void read(String input) { run(input); }\n"
+        "  void other(String input) { run(input); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    case = CweBenchCase(
+        case_id=1,
+        project_slug="case",
+        cve="CVE-2099-0001",
+        cwe="CWE-22",
+        cwe_name="Path Traversal",
+        repository="https://github.com/acme/app",
+        vulnerable_revision="buggy",
+        fixed_revisions=("fixed",),
+        fix_targets=(
+            FixTarget(
+                "src/main/java/acme/Target.java",
+                "read",
+                1,
+                2,
+                "fixed",
+                class_name="Target",
+            ),
+        ),
+    )
+    wrong = _finding(file=str(source), source_line=3, sink_line=3)
+    correct = _finding(file=str(source), source_line=2, sink_line=2)
+
+    assert score_cwe_case(case, [wrong], source_files=(str(source),))["status"] == "fn"
+    assert score_cwe_case(case, [correct], source_files=(str(source),))["status"] == "tp"
+
+    unavailable = CweBenchCase(
+        **{
+            **case.__dict__,
+            "fix_targets": (
+                FixTarget(
+                    "src/main/java/acme/Target.java",
+                    "addedOnlyByFix",
+                    1,
+                    2,
+                    "fixed",
+                    class_name="Target",
+                ),
+            ),
+        }
+    )
+    row = score_cwe_case(unavailable, [], source_files=(str(source),))
+    assert row["status"] == "unscored_oracle_source_unavailable"
+
+
 @patch("src.evaluation.benchmarks.common.load_config_from_env")
 def test_benchmark_requires_verification(mock_load: MagicMock, tmp_path: Path) -> None:
     mock_load.return_value.verification_enabled = False
@@ -149,6 +255,7 @@ def test_benchmark_disables_local_coverage_limits(
 ) -> None:
     config = MagicMock()
     config.verification_enabled = True
+    config.llm_graph_enrichment_enabled = False
     config.max_files = 25
     config.fast_prefilter = True
     mock_load.return_value = config
@@ -161,8 +268,46 @@ def test_benchmark_disables_local_coverage_limits(
     )
 
     assert effective.max_files == 0
+    assert effective.max_endpoint_graph_files == 0
     assert effective.fast_prefilter is False
     assert effective.cache_read_enabled is False
+
+
+@patch("src.evaluation.benchmarks.common.load_config_from_env")
+def test_benchmark_cache_only_requires_llm_cache_reads(
+    mock_load: MagicMock, tmp_path: Path
+) -> None:
+    config = MagicMock()
+    config.verification_enabled = True
+    config.llm_graph_enrichment_enabled = False
+    mock_load.return_value = config
+
+    effective = build_pipeline_config(
+        backend="llm",
+        llm_analysis_mode="exhaustive",
+        cache_dir=tmp_path,
+        refresh_specs=False,
+        cache_only=True,
+    )
+
+    assert effective.cache_read_enabled is True
+    assert effective.cache_only is True
+    with pytest.raises(BenchmarkError, match="mutually exclusive"):
+        build_pipeline_config(
+            backend="llm",
+            llm_analysis_mode="exhaustive",
+            cache_dir=tmp_path,
+            refresh_specs=True,
+            cache_only=True,
+        )
+    with pytest.raises(BenchmarkError, match="llm and hybrid"):
+        build_pipeline_config(
+            backend="static",
+            llm_analysis_mode="exhaustive",
+            cache_dir=tmp_path,
+            refresh_specs=False,
+            cache_only=True,
+        )
 
 
 def test_normalize_cwe_accepts_official_variants() -> None:
@@ -820,13 +965,24 @@ def test_cwe_checkpoint_round_trip_requires_exact_fingerprint(tmp_path: Path) ->
     checkpoint = tmp_path / "run.checkpoint.json"
     row = {"case_id": 1, "status": "fn"}
 
-    _write_checkpoint(checkpoint, fingerprint, "2026-01-01T00:00:00Z", 12.5, [row])
+    resume_provenance = [{"case_count": 1, "reason": "compatible test migration"}]
+    _write_checkpoint(
+        checkpoint,
+        fingerprint,
+        "2026-01-01T00:00:00Z",
+        12.5,
+        [row],
+        resume_provenance=resume_provenance,
+    )
 
-    restored, started_at, duration = _load_checkpoint(checkpoint, fingerprint, {1})
-    incompatible, _, _ = _load_checkpoint(checkpoint, "other", {1})
+    restored, started_at, duration, provenance = _load_checkpoint(
+        checkpoint, fingerprint, {1}
+    )
+    incompatible, _, _, _ = _load_checkpoint(checkpoint, "other", {1})
     assert restored == {1: row}
     assert started_at == "2026-01-01T00:00:00Z"
     assert duration == 12.5
+    assert provenance == resume_provenance
     assert rescheduled_fingerprint == fingerprint
     assert changed_analysis_fingerprint != fingerprint
     assert incompatible == {}
@@ -842,7 +998,7 @@ def test_cwe_checkpoint_can_retry_only_error_rows(tmp_path: Path) -> None:
     ]
     _write_checkpoint(checkpoint, "fingerprint", "2026-01-01T00:00:00Z", 5, rows)
 
-    restored, _, duration = _load_checkpoint(
+    restored, _, duration, _ = _load_checkpoint(
         checkpoint,
         "fingerprint",
         {1, 2, 3},
@@ -851,6 +1007,45 @@ def test_cwe_checkpoint_can_retry_only_error_rows(tmp_path: Path) -> None:
 
     assert set(restored) == {1, 3}
     assert duration == 5
+
+
+def test_cwe_checkpoint_retry_includes_incomplete_tp(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "run.checkpoint.json"
+    rows = [
+        {"case_id": 1, "status": "tp", "analysis_complete": False},
+        {"case_id": 2, "status": "fn", "analysis_complete": True},
+    ]
+    _write_checkpoint(checkpoint, "fingerprint", "2026-01-01T00:00:00Z", 5, rows)
+
+    restored, _, _, _ = _load_checkpoint(
+        checkpoint,
+        "fingerprint",
+        {1, 2},
+        retry_errors=True,
+    )
+
+    assert set(restored) == {2}
+
+
+def test_cwe_checkpoint_is_retained_for_incomplete_report() -> None:
+    assert _cwe_report_is_complete(
+        {
+            "aggregate": {
+                "execution_errors": 0,
+                "incomplete_extraction_projects": 0,
+                "incomplete_analysis_projects": 0,
+            }
+        }
+    )
+    assert not _cwe_report_is_complete(
+        {
+            "aggregate": {
+                "execution_errors": 1,
+                "incomplete_extraction_projects": 0,
+                "incomplete_analysis_projects": 1,
+            }
+        }
+    )
 
 
 def test_cwe_retry_checkpoint_preserves_later_restored_rows() -> None:
@@ -920,7 +1115,7 @@ def test_benchmark_run_forwards_explicit_selection(run_command, tmp_path: Path) 
             "run",
             "owasp-java",
             "--backend",
-            "static",
+            "llm",
             "--cwe",
             "CWE-22",
             "--limit",
@@ -933,6 +1128,7 @@ def test_benchmark_run_forwards_explicit_selection(run_command, tmp_path: Path) 
             "3",
             "--max-concurrent-llm-requests",
             "5",
+            "--cache-only",
             "--data-dir",
             str(tmp_path),
         ],
@@ -941,10 +1137,11 @@ def test_benchmark_run_forwards_explicit_selection(run_command, tmp_path: Path) 
 
     assert result.exit_code == 0
     kwargs = run_command.call_args.kwargs
-    assert kwargs["backend"] == "static"
+    assert kwargs["backend"] == "llm"
     assert kwargs["cwes"] == ("CWE-22",)
     assert kwargs["limit"] == 4
     assert kwargs["seed"] == 7
     assert kwargs["max_concurrent_files"] == 12
     assert kwargs["max_concurrent_functions"] == 3
     assert kwargs["max_concurrent_llm_requests"] == 5
+    assert kwargs["cache_only"] is True

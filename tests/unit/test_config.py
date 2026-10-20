@@ -28,7 +28,8 @@ class TestPipelineConfig:
         assert config.llm_batch_max_chars == 8000
         assert config.llm_truncation_max_tokens == 16000
         assert config.max_concurrent_llm_requests == 5
-        assert config.max_candidate_chains == 10000
+        assert config.max_candidate_chains == 0
+        assert config.max_endpoint_graph_files == 10_000
         assert config.analysis_backend == "llm"
         assert config.llm_analysis_mode == "targeted"
         assert config.cache_read_enabled is True
@@ -86,7 +87,11 @@ class TestPipelineConfig:
 
     def test_config_validation_candidate_limit_is_positive(self) -> None:
         with pytest.raises(ValueError, match="max_candidate_chains"):
-            PipelineConfig(llm_api_key="test", max_candidate_chains=0)
+            PipelineConfig(llm_api_key="test", max_candidate_chains=-1)
+
+    def test_config_validation_endpoint_graph_limit_is_non_negative(self) -> None:
+        with pytest.raises(ValueError, match="max_endpoint_graph_files"):
+            PipelineConfig(llm_api_key="test", max_endpoint_graph_files=-1)
 
     def test_config_validation_invalid_llm_analysis_mode(self) -> None:
         with pytest.raises(ValueError, match="llm_analysis_mode"):
@@ -106,6 +111,14 @@ class TestPipelineConfig:
             PipelineConfig(
                 llm_api_key=None,
                 analysis_backend="static",
+                llm_graph_enrichment_enabled=True,
+            )
+
+    def test_cache_only_rejects_llm_graph_enrichment(self) -> None:
+        with pytest.raises(ValueError, match="cache_only is incompatible"):
+            PipelineConfig(
+                llm_api_key="unused",
+                cache_only=True,
                 llm_graph_enrichment_enabled=True,
             )
 

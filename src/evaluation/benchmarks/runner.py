@@ -18,6 +18,18 @@ from src.evaluation.benchmarks.repository import validate_checkout
 RESULTS_ROOT = ROOT / "evaluation" / "benchmarks"
 
 
+def _cwe_report_is_complete(report: dict[str, Any]) -> bool:
+    aggregate = report.get("aggregate", {})
+    return not any(
+        int(aggregate.get(key, 0) or 0)
+        for key in (
+            "execution_errors",
+            "incomplete_extraction_projects",
+            "incomplete_analysis_projects",
+        )
+    )
+
+
 def _output_paths(
     benchmark_id: str,
     backend: str,
@@ -55,6 +67,7 @@ def run_benchmark_command(
     batch_size: int = 64,
     include_tests: bool = False,
     refresh_specs: bool = False,
+    cache_only: bool = False,
     fail_fast: bool = False,
     retry_errors: bool = False,
     phase_label: str | None = None,
@@ -77,6 +90,7 @@ def run_benchmark_command(
         "limit": limit,
         "seed": seed,
         "refresh_specs": refresh_specs,
+        "cache_only": cache_only,
         "fail_fast": fail_fast,
         "max_concurrent_files": max_concurrent_files,
         "max_concurrent_functions": max_concurrent_functions,
@@ -135,7 +149,7 @@ def run_benchmark_command(
     temporary = markdown_path.with_suffix(markdown_path.suffix + ".tmp")
     temporary.write_text(markdown, encoding="utf-8")
     temporary.replace(markdown_path)
-    if benchmark_id == "cwe-bench-java":
+    if benchmark_id == "cwe-bench-java" and _cwe_report_is_complete(report):
         checkpoint_path.unlink(missing_ok=True)
     print(markdown, end="")
     print(f"[saved] {json_path}")

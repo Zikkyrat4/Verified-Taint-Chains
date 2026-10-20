@@ -1,5 +1,7 @@
 """Tests for A* pathfinding with semantic heuristics."""
 
+from unittest.mock import patch
+
 import pytest
 import numpy as np
 import networkx as nx
@@ -173,6 +175,53 @@ class TestAStarPathFinder:
         chains = finder.find_all_chains([sample_source], [sample_sink])
         assert len(chains) == 0
 
+    def test_find_all_chains_indexes_sinks_once(self):
+        class CountingSinks(list):
+            def __init__(self, values):
+                super().__init__(values)
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        location = CodeLocation(file_path="Test.java", line_number=1)
+        sources = [
+            Source(
+                location=location,
+                variable_name=f"source_{index}",
+                type="user_input",
+                confidence=0.9,
+                code_snippet="",
+            )
+            for index in range(20)
+        ]
+        sinks = CountingSinks(
+            [
+                Sink(
+                    location=location,
+                    variable_name=f"sink_{index}",
+                    type="sql",
+                    vulnerability_type=VulnerabilityType.SQL_INJECTION,
+                    confidence=0.9,
+                    code_snippet="",
+                )
+                for index in range(20)
+            ]
+        )
+        graph = nx.DiGraph()
+        graph.add_nodes_from(source.variable_name for source in sources)
+        graph.add_nodes_from(sink.variable_name for sink in sinks)
+        graph.add_edge("source_0", "sink_0")
+        sinks.iterations = 0
+
+        chains = AStarPathFinder(graph, use_semantic=False).find_all_chains(
+            sources, sinks
+        )
+
+        assert len(chains) == 1
+        assert sinks.iterations == 1
+
     def test_cross_file_bridge_must_belong_to_source_function(self):
         graph = nx.DiGraph()
         graph.add_edge(
@@ -263,6 +312,65 @@ class TestAStarPathFinder:
         assert finder.reachable_pairs_seen == 2
         assert finder.candidate_pairs_ranked == 2
         assert finder.ranked_out_count == 1
+
+    def test_duplicate_graph_pair_reuses_path_without_dropping_chain(self):
+        graph = nx.DiGraph([("source", "sink")])
+        location = CodeLocation(file_path="Test.java", line_number=1)
+        source = Source(
+            location=location,
+            variable_name="source",
+            type="user_input",
+            confidence=0.9,
+            code_snippet="source",
+        )
+        sink = Sink(
+            location=location,
+            variable_name="sink",
+            type="sql",
+            confidence=0.9,
+            code_snippet="sink",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+        finder = AStarPathFinder(graph, use_semantic=False)
+
+        with patch.object(finder, "find_path", wraps=finder.find_path) as find:
+            chains = finder.find_all_chains([source, source], [sink])
+
+        assert len(chains) == 2
+        assert find.call_count == 1
+
+    def test_zero_candidate_limit_checks_every_reachable_pair(self):
+        graph = nx.DiGraph([("first", "sink"), ("second", "sink")])
+        location = CodeLocation(file_path="Test.java", line_number=1)
+        sources = [
+            Source(
+                location=location,
+                variable_name=name,
+                type="user_input",
+                confidence=confidence,
+                code_snippet=name,
+            )
+            for name, confidence in (("first", 0.1), ("second", 0.9))
+        ]
+        sink = Sink(
+            location=location,
+            variable_name="sink",
+            type="sql",
+            confidence=0.9,
+            code_snippet="sink",
+            vulnerability_type=VulnerabilityType.SQL_INJECTION,
+        )
+
+        finder = AStarPathFinder(graph, use_semantic=False)
+        chains = finder.find_all_chains(sources, [sink], max_chains=0)
+
+        assert {chain.source.variable_name for chain in chains} == {
+            "first",
+            "second",
+        }
+        assert finder.limit_exceeded is False
+        assert finder.reachable_pairs_seen == 2
+        assert finder.ranked_out_count == 0
 
     def test_intermediate_node_uses_graph_location(self, sample_source, sample_sink):
         graph = nx.DiGraph()

@@ -55,6 +55,7 @@ class SimpleSpecificationExtractor:
         fast_prefilter: bool = False,
         cache_identity: str = "",
         cache_read_enabled: bool = True,
+        cache_only: bool = False,
     ) -> None:
         """Initialize the specification extractor.
 
@@ -88,7 +89,11 @@ class SimpleSpecificationExtractor:
             raise ValueError(
                 "analysis_backend must be 'llm', 'static', or 'hybrid'"
             )
-        if analysis_backend in ("llm", "hybrid") and llm_client is None:
+        if (
+            analysis_backend in ("llm", "hybrid")
+            and llm_client is None
+            and not cache_only
+        ):
             raise ValueError(f"analysis_backend='{analysis_backend}' requires an LLM client")
         if analysis_mode not in ("targeted", "exhaustive"):
             raise ValueError(
@@ -99,6 +104,7 @@ class SimpleSpecificationExtractor:
         self.fast_prefilter = fast_prefilter
         self.cache_identity = cache_identity
         self.cache_read_enabled = cache_read_enabled
+        self.cache_only = cache_only
 
         logger.debug(
             f"Initialized SimpleSpecificationExtractor with threshold={confidence_threshold}"
@@ -242,6 +248,23 @@ class SimpleSpecificationExtractor:
         if not source_code or not source_code.strip():
             raise ValueError("source_code cannot be empty")
 
+        # Repositories occasionally keep license-header templates with a
+        # ``.java`` suffix. They are non-empty on disk but contain no Java
+        # after comments are removed, so sending them to the prompt builder
+        # raises ``code cannot be empty`` and incorrectly makes the project
+        # extraction incomplete.
+        if not strip_java_comments(source_code).strip():
+            logger.debug(
+                f"Skipping comment-only source file: {file_path or 'inline code'}"
+            )
+            return Specification(
+                sources=[],
+                sinks=[],
+                sanitizers=[],
+                llm_model=model if self.analysis_backend != "static" else "",
+                extraction_backend=self.analysis_backend,
+            )
+
         prompt_redactions = prompt_redactions or {}
         proven_constant_calls = proven_constant_calls or set()
         cache_kwargs = self._cache_kwargs(
@@ -257,11 +280,32 @@ class SimpleSpecificationExtractor:
             and self.spec_cache is not None
             and cache_kwargs is not None
         ):
-            cached = self.spec_cache.get(source_code, **cache_kwargs)
+            # Cache-only benchmark replays can contain six-figure projects.
+            # Keep JSON I/O and Pydantic decoding off the event-loop thread so
+            # the existing per-file semaphore provides real bounded overlap.
+            cached = await asyncio.to_thread(
+                self.spec_cache.get,
+                source_code,
+                **cache_kwargs,
+            )
             if cached is not None:
                 logger.debug(
                     f"Cache hit for {file_path or 'inline code'} "
                     f"(skipping Stage 1 LLM)"
+                )
+                # The cache is content-addressed so identical source files can
+                # share the LLM extraction. Locations are runtime metadata,
+                # however, and must always refer to the file currently being
+                # analyzed rather than the path that originally populated the
+                # cache entry.
+                for endpoint in [
+                    *cached.sources,
+                    *cached.sinks,
+                    *cached.sanitizers,
+                ]:
+                    endpoint.location.file_path = file_path
+                cached = self._drop_out_of_range_endpoints(
+                    cached, source_code, file_path
                 )
                 for source in cached.sources:
                     source.source_category = classify_source(source)
@@ -271,6 +315,12 @@ class SimpleSpecificationExtractor:
                 if len(plausible) != len(cached.sinks):
                     cached = cached.model_copy(update={"sinks": plausible})
                 return cached
+
+        if self.cache_only and self.analysis_backend != "static":
+            raise LLMError(
+                "Stage 1 cache-only miss for "
+                f"{file_path or 'inline code'}; no LLM request was sent"
+            )
 
         # Step 2: targeted-only structural prefilter. Exhaustive mode must keep
         # source-only boundaries even when this file contains no local sink.
@@ -300,6 +350,7 @@ class SimpleSpecificationExtractor:
             prompt_redactions=prompt_redactions,
             proven_constant_calls=proven_constant_calls,
         )
+        spec = self._drop_out_of_range_endpoints(spec, source_code, file_path)
         if (
             spec.extraction_complete
             and self.spec_cache is not None
@@ -309,6 +360,38 @@ class SimpleSpecificationExtractor:
         elif not spec.extraction_complete:
             logger.warning(
                 f"Not caching incomplete extraction for {file_path or 'inline code'}"
+            )
+        return spec
+
+    @staticmethod
+    def _drop_out_of_range_endpoints(
+        spec: Specification, source_code: str, file_path: str
+    ) -> Specification:
+        """Discard model locations that cannot exist in the current file."""
+        line_count = len(source_code.splitlines())
+
+        def valid(endpoint: Source | Sink | Sanitizer) -> bool:
+            return 1 <= endpoint.location.line_number <= line_count
+
+        sources = [endpoint for endpoint in spec.sources if valid(endpoint)]
+        sinks = [endpoint for endpoint in spec.sinks if valid(endpoint)]
+        sanitizers = [endpoint for endpoint in spec.sanitizers if valid(endpoint)]
+        removed = (
+            len(spec.sources) - len(sources)
+            + len(spec.sinks) - len(sinks)
+            + len(spec.sanitizers) - len(sanitizers)
+        )
+        if removed:
+            logger.warning(
+                f"Discarded {removed} endpoint(s) with line numbers outside "
+                f"{file_path or 'inline code'}"
+            )
+            return spec.model_copy(
+                update={
+                    "sources": sources,
+                    "sinks": sinks,
+                    "sanitizers": sanitizers,
+                }
             )
         return spec
 
@@ -467,6 +550,12 @@ class SimpleSpecificationExtractor:
         ) -> Tuple[List[Source], List[Sink], List[Sanitizer], Optional[Exception]]:
             func_name, func_code, line_offset, func_info = entry
             try:
+                prompt_code = prepare_code_for_prompt(func_code)
+                if not prompt_code.strip():
+                    logger.debug(
+                        f"Skipping empty executable scope: {func_name}"
+                    )
+                    return [], [], [], None
                 async with semaphore:
                     with logger.contextualize(
                         target=file_path or "inline-code",
@@ -480,7 +569,7 @@ class SimpleSpecificationExtractor:
                         prompt_function_info = redact_metadata(dict(func_info or {}))
                         prompt_class_info = redact_metadata(dict(class_info or {}))
                         combined_prompt = build_combined_prompt(
-                            code=prepare_code_for_prompt(func_code),
+                            code=prompt_code,
                             function_info=prompt_function_info,
                             class_info=prompt_class_info,
                             imports=[redact(item) for item in imports],
@@ -1117,11 +1206,15 @@ class SimpleSpecificationExtractor:
             return [("__file__", source_code, 0, None)]
 
         source_lines = source_code.splitlines(keepends=True)
+        if not source_lines:
+            return []
         spans: List[Tuple[int, int]] = []
         for _name, func_code, offset, info in functions:
             info = info or {}
             start = max(1, info.get("start_line", offset + 1))
             end = max(start, info.get("end_line", start + func_code.count("\n")))
+            if start > len(source_lines):
+                continue
             spans.append((start, min(len(source_lines), end)))
         spans.sort()
 
@@ -1141,6 +1234,8 @@ class SimpleSpecificationExtractor:
         batches: List[Tuple[str, str, int, Optional[Dict[str, Any]]]] = []
         for index, (start, end) in enumerate(groups, 1):
             code = "".join(source_lines[start - 1:end])
+            if not code.strip():
+                continue
             batches.append((f"__batch_{index}", code, start - 1, None))
         return batches
 
@@ -1160,7 +1255,11 @@ class SimpleSpecificationExtractor:
         latency without changing its size.
         """
         failed_name, failed_code, failed_offset, _failed_info = failed_entry
-        if max_chars <= 1 or not failed_name.startswith("__"):
+        if (
+            max_chars <= 1
+            or not failed_name.startswith("__")
+            or not failed_code.strip()
+        ):
             return [failed_entry]
 
         failed_start = failed_offset + 1
@@ -1179,7 +1278,10 @@ class SimpleSpecificationExtractor:
             split_entries = cls._build_llm_batches(
                 source_code, members, retry_limit
             )
-            if len(split_entries) > 1:
+            if len(split_entries) > 1 and all(
+                entry[1].strip() and len(entry[1]) < len(failed_code)
+                for entry in split_entries
+            ):
                 return split_entries
 
         # Generated parsers occasionally contain a single 10k+ character
@@ -1195,7 +1297,10 @@ class SimpleSpecificationExtractor:
             split_entries = cls._split_source_slice(
                 failed_entry, slice_limit, overlap_lines=8
             )
-            if len(split_entries) > 1:
+            if len(split_entries) > 1 and all(
+                entry[1].strip() and len(entry[1]) < len(failed_code)
+                for entry in split_entries
+            ):
                 return split_entries
 
         return [failed_entry]
@@ -1886,6 +1991,7 @@ class SimpleSpecificationExtractor:
             "sanitizers",
             ("line", "variable", "type"),
             optional=True,
+            skip_invalid=True,
         )
 
     @staticmethod
@@ -1895,6 +2001,7 @@ class SimpleSpecificationExtractor:
         required_fields: Tuple[str, ...],
         *,
         optional: bool = False,
+        skip_invalid: bool = False,
     ) -> List[dict]:
         if not isinstance(response, dict):
             raise ParsingError("Response must be a dictionary")
@@ -1905,9 +2012,16 @@ class SimpleSpecificationExtractor:
         entries = response[key]
         if not isinstance(entries, list):
             raise ParsingError(f"Response field '{key}' must be an array")
+        valid_entries: List[dict] = []
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
-                raise ParsingError(f"{key}[{index}] must be an object")
+                entry_error = f"{key}[{index}] must be an object"
+                if skip_invalid:
+                    logger.debug(
+                        f"Ignoring invalid optional LLM entry: {entry_error}"
+                    )
+                    continue
+                raise ParsingError(entry_error)
             missing = [
                 field
                 for field in required_fields
@@ -1918,18 +2032,29 @@ class SimpleSpecificationExtractor:
                 )
             ]
             if missing:
-                raise ParsingError(
+                entry_error = (
                     f"{key}[{index}] missing required field(s): "
                     f"{', '.join(missing)}"
                 )
+                if skip_invalid:
+                    logger.debug(
+                        f"Ignoring invalid optional LLM entry: {entry_error}"
+                    )
+                    continue
+                raise ParsingError(entry_error)
             try:
                 if int(entry["line"]) < 1:
                     raise ValueError
             except (KeyError, TypeError, ValueError) as error:
-                raise ParsingError(
-                    f"{key}[{index}] has invalid line number"
-                ) from error
-        return entries
+                entry_error = f"{key}[{index}] has invalid line number"
+                if skip_invalid:
+                    logger.debug(
+                        f"Ignoring invalid optional LLM entry: {entry_error}"
+                    )
+                    continue
+                raise ParsingError(entry_error) from error
+            valid_entries.append(entry)
+        return valid_entries
 
     def _parse_llm_sources(
         self, response: dict, file_path: str, line_offset: int = 0,
@@ -2120,6 +2245,7 @@ class SimpleSpecificationExtractor:
             "sanitizers",
             ("line", "variable", "type"),
             optional=True,
+            skip_invalid=True,
         )
         for index, sanitizer_data in enumerate(sanitizer_entries):
             try:
